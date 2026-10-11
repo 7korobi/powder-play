@@ -20,12 +20,13 @@ npm test
 npm run build
 ```
 
-## Cloudflare Pages へのデプロイ
+## Cloudflare Workers へのデプロイ
 
-Cloudflare Pages のビルド設定は次のとおりです。
+Cloudflare Workers のビルド・デプロイ設定は次のとおりです。
 
 - ビルドコマンド: `npm run build`
-- ビルド出力ディレクトリ: `.svelte-kit/cloudflare`
+- デプロイコマンド: `npx wrangler deploy`
+- Worker と静的アセットのパスは [`wrangler.jsonc`](./wrangler.jsonc) で設定します。
 
 ## 操作
 

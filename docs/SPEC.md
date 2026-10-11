@@ -177,7 +177,7 @@ src/lib/perf/        性能計測・解像度選択
 src/routes/          画面・操作 UI（SvelteKit 採用時）
 ```
 
-β v0.2 は SvelteKit 2、TypeScript、Canvas 2D とセルベースのシミュレーションで構成する。Cloudflare Pages の配信用に `@sveltejs/adapter-cloudflare` を使う。
+β v0.2 は SvelteKit 2、TypeScript、Canvas 2D とセルベースのシミュレーションで構成する。Cloudflare Workers への配信用に `@sveltejs/adapter-cloudflare` と [`wrangler.jsonc`](../wrangler.jsonc) を使う。
 
 ## 9. テスト・検証計画
 
