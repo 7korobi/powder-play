@@ -71,3 +71,7 @@ Android Chrome と iOS Safari のセンサー権限、複数指操作、画面�
 WebGPU 非対応のブラウザーでは利用できません。通常のアプリ画面 `/` は従来の
 シミュレーションを引き続き使用します。実装状況と次の判定ゲートは
 [2D GPU MLS-MPM ロードマップ](./docs/ROADMAP-MLS-MPM.md) を参照してください。
+
+`/labs/mpm/kernels` は Gate 1 の数値実験画面です。単一材料の Neo-Hookean 弾性 MLS-MPM
+を GPU で実行し、初回の1ステップを CPU reference と照合します。水の構成則や既存の
+粒子操作との統合はまだ対象外です。

@@ -556,8 +556,9 @@
 				<div class="truth-note">
 					<strong>重要: 物理演算はまだ MLS-MPM ではありません。</strong>
 					<span>
-						ここで確認するのは操作経路の PoC です。流体圧力やゲルの弾性を含む MLS-MPM
-						solver は未実装です。
+						この画面は操作経路の PoC です。数値カーネルは
+						<a href="/labs/mpm/kernels">Gate 1 GPU MLS-MPM 実験</a>
+						で別途検証します。
 					</span>
 				</div>
 			</div>

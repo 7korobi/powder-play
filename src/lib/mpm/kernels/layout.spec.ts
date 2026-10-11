@@ -1,0 +1,191 @@
+import { describe, expect, it } from 'vitest';
+import type { MpmParticle } from '../reference/solver.js';
+import {
+	calculateMpmMlsGpuBufferLayout,
+	packMpmMlsGpuStepParameters,
+	validateMpmMlsGpuInput,
+	type MpmMlsGpuConfig,
+	type MpmMlsGpuDeviceLimits
+} from './layout.js';
+
+const LIMITS: MpmMlsGpuDeviceLimits = {
+	maxBufferSize: 256 * 1024 * 1024,
+	maxStorageBufferBindingSize: 128 * 1024 * 1024,
+	maxUniformBufferBindingSize: 64 * 1024,
+	maxComputeWorkgroupsPerDimension: 65_535,
+	maxStorageBuffersPerShaderStage: 8
+};
+
+const ZERO_MATRIX = { m00: 0, m01: 0, m10: 0, m11: 0 };
+const IDENTITY = { m00: 1, m01: 0, m10: 0, m11: 1 };
+
+function makeConfig(overrides: Partial<MpmMlsGpuConfig> = {}): MpmMlsGpuConfig {
+	return {
+		grid: { cellsX: 16, cellsY: 8, cellSize: 1 },
+		particleMass: 0.1,
+		particleVolume: 0.01,
+		material: { lambda: 20, mu: 10 },
+		...overrides
+	};
+}
+
+function makeParticle(overrides: Partial<MpmParticle> = {}): MpmParticle {
+	return {
+		position: { x: 8, y: 4 },
+		velocity: { x: 0, y: 0 },
+		C: ZERO_MATRIX,
+		F: IDENTITY,
+		...overrides
+	};
+}
+
+describe('GPU MLS-MPM input and buffer layout', () => {
+	it('validates and packs the complete particle state, including both domain edges', () => {
+		const state = validateMpmMlsGpuInput(
+			[
+				makeParticle({ position: { x: 0, y: 0 } }),
+				makeParticle({ position: { x: 16, y: 8 } })
+			],
+			makeConfig()
+		);
+
+		expect(Array.from(state.packedParticles.slice(0, 12))).toEqual([
+			0, 0, 0, 0,
+			0, 0, 0, 0,
+			1, 0, 0, 1
+		]);
+		expect(state.particleCount).toBe(2);
+		expect(state.domainWidth).toBe(16);
+		expect(state.domainHeight).toBe(8);
+		expect(state.domainWidthF32).toBe(16);
+		expect(state.domainHeightF32).toBe(8);
+	});
+
+	it('reserves a one-node halo around the physical grid and sizes all buffers', () => {
+		const state = validateMpmMlsGpuInput([makeParticle()], makeConfig());
+		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
+
+		expect(layout).toEqual({
+			nodeWidth: 19,
+			nodeHeight: 11,
+			nodeCount: 209,
+			pairCount: 9,
+			particleStateBytes: 48,
+			particleBufferBytes: 48,
+			bucketHeadBytes: 836,
+			bucketNextBytes: 36,
+			gridStateBytes: 5016,
+			readbackBytes: 52
+		});
+	});
+
+	it('keeps empty-particle allocations valid without dispatching particle buffers of size zero', () => {
+		const state = validateMpmMlsGpuInput([], makeConfig());
+		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
+
+		expect(layout.particleStateBytes).toBe(0);
+		expect(layout.particleBufferBytes).toBe(48);
+		expect(layout.bucketNextBytes).toBe(4);
+		expect(layout.readbackBytes).toBe(4);
+	});
+
+	it('rejects invalid physical parameters and particle states rather than repairing them', () => {
+		expect(() =>
+			validateMpmMlsGpuInput([], makeConfig({ grid: { cellsX: 0, cellsY: 8, cellSize: 1 } }))
+		).toThrow(/cellsX/);
+		expect(() =>
+			validateMpmMlsGpuInput([], makeConfig({ particleMass: 0 }))
+		).toThrow(/particleMass/);
+		expect(() =>
+			validateMpmMlsGpuInput(
+				[],
+				makeConfig({ grid: { cellsX: 16, cellsY: 8, cellSize: 1e-50 } })
+			)
+		).toThrow(/float32 range/);
+		expect(() =>
+			validateMpmMlsGpuInput(
+				[makeParticle({ position: { x: 16.01, y: 4 } })],
+				makeConfig()
+			)
+		).toThrow(/grid domain/);
+		expect(() =>
+			validateMpmMlsGpuInput(
+				[makeParticle({ F: { m00: -1, m01: 0, m10: 0, m11: 1 } })],
+				makeConfig()
+			)
+		).toThrow(/determinant/);
+		expect(() =>
+			validateMpmMlsGpuInput(
+				[makeParticle({ velocity: { x: Number.MAX_VALUE, y: 0 } })],
+				makeConfig()
+			)
+		).toThrow(/float32 range/);
+		expect(() =>
+			validateMpmMlsGpuInput(
+				[makeParticle({ C: { ...ZERO_MATRIX, m00: 1e-50 } })],
+				makeConfig()
+			)
+		).toThrow(/underflows/);
+	});
+
+	it('rejects device-limit violations and signed linked-list index overflow', () => {
+		const state = validateMpmMlsGpuInput([makeParticle()], makeConfig());
+		expect(() =>
+			calculateMpmMlsGpuBufferLayout(state, {
+				...LIMITS,
+				maxComputeWorkgroupsPerDimension: 1
+			})
+		).toThrow(/maxComputeWorkgroupsPerDimension/);
+		expect(() =>
+			calculateMpmMlsGpuBufferLayout(state, {
+				...LIMITS,
+				maxStorageBufferBindingSize: 100
+			})
+		).toThrow(/maxStorageBufferBindingSize/);
+
+		expect(() =>
+			calculateMpmMlsGpuBufferLayout(
+				{ ...state, particleCount: Math.floor(0x7fff_ffff / 9) + 1 },
+				LIMITS
+			)
+		).toThrow(/linked-list index range/);
+	});
+
+	it('packs the reference parameters and rejects invalid step inputs', () => {
+		const config = makeConfig({
+			grid: { cellsX: 2, cellsY: 3, cellSize: 0.5 },
+			particleMass: 0.2,
+			particleVolume: 0.01,
+			material: { lambda: 20, mu: 10 }
+		});
+		const state = validateMpmMlsGpuInput(
+			[makeParticle({ position: { x: 0.5, y: 0.75 } })],
+			config
+		);
+		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
+		const parameters = packMpmMlsGpuStepParameters(state, layout, 0.001, {
+			x: 1,
+			y: -2
+		});
+
+		expect(Array.from(new Uint32Array(parameters, 0, 8))).toEqual([
+			2, 3, 5, 6,
+			1, 30, 9, 0
+		]);
+		const floats = new Float32Array(parameters, 32, 12);
+		expect(Array.from(floats.slice(0, 4))).toEqual([
+			0.5,
+			Math.fround(0.2),
+			Math.fround(0.01),
+			Math.fround(0.001)
+		]);
+		expect(Array.from(floats.slice(4, 8))).toEqual([20, 10, Math.fround(-0.00016), 16]);
+		expect(Array.from(floats.slice(8))).toEqual([1, -2, 1, 1.5]);
+
+		expect(() => packMpmMlsGpuStepParameters(state, layout, 0, { x: 0, y: 0 }))
+			.toThrow(/dt/);
+		expect(() =>
+			packMpmMlsGpuStepParameters(state, layout, 0.001, { x: 0, y: Number.NaN })
+		).toThrow(/gravity.y/);
+	});
+});

@@ -2,14 +2,15 @@
 
 更新日: 2026-10-12
 
-状態: Gate 0 の GPU 操作 PoC と、Gate 1 用の CPU 数値 reference を実装済み。
-WebGPU 実機確認と GPU MLS-MPM kernel は未完了。既存の β v0.2 は維持する。
+状態: Gate 0 の GPU 操作ラボはユーザーから稼働確認の報告あり。Gate 1 の CPU 数値
+reference と単一材料 GPU MLS-MPM kernel を実装済み。GPU kernel の実機実行・数値比較・
+持続性能確認は未完了。既存の β v0.2 は維持する。
 
 ## 現在の実装状況
 
-- **Gate 0**: `/labs/mpm` に GPU 粒子描画、要求時ピッキング、ドラッグ、複製を実装。粒子位置・速度は GPU buffer を正本とし、毎フレーム全量 readback はしない。WebGPU 実機での shader compile・表示・操作は未確認。
-- **Gate 1 reference**: `src/lib/mpm/reference/` に CPU 上の単一材料・Neo-Hookean 弾性 MLS-MPM 1 step を実装。GPU kernel でも水の構成則でもなく、検証用 reference の初期段階。
-- **未実装**: GPU 上の P2G / grid update / G2P、液体モデル、ゼリー・塑性、水・油界面、粉体、実機持続試験。
+- **Gate 0**: `/labs/mpm` に GPU 粒子描画、要求時ピッキング、ドラッグ、複製を実装。粒子位置・速度は GPU buffer を正本とし、毎フレーム全量 readback はしない。ユーザーからラボが動作したとの報告あり。長時間・性能測定は未確認。
+- **Gate 1**: `src/lib/mpm/reference/` に CPU 上の単一材料・Neo-Hookean 弾性 MLS-MPM 1 step、`src/lib/mpm/kernels/` に GPU 上の P2G / grid update / G2P と GPU 描画を実装。`/labs/mpm/kernels` で初回 step の CPU reference 比較を行う。GPU shader compile・数値差・挙動は実機未確認。
+- **未実装**: 液体モデル、ゼリー・塑性、水・油界面、粉体、GPU kernel の実機検証と持続試験。
 - **統合方針**: 実験画面は `/labs/mpm` に隔離し、通常画面 `/` の β v0.2 と既存のクラッシュ対策を置き換えない。
 
 ## 1. 目的と前提
@@ -77,6 +78,11 @@ MLS-MPM の完全な実装より先に行う。合成粒子データを GPU buff
 - WGSL の P2G 集約方法を早期に決める。WGSL の標準 atomic は整数型であるため、固定小数点 atomics と gather 方式などを比較し、精度・オーバーフロー・性能を確認する。
 - CPU の小規模 reference implementation と比較し、粒子数、境界、異常値をテストする。
 - 水一種類で、傾き重力による移動、壁への衝突、停止・再開を確認する。
+
+**実装済みの検証画面**: `/labs/mpm/kernels` で単一材料の Neo-Hookean 弾性モデルを実行し、
+初回1ステップを CPU reference と照合する。
+この画面を WebGPU 対応端末で開き、CPU/GPU 誤差、壁、停止・再開、数値状態を確認する。
+画面が表示されるだけでは Gate 1 の合格とはせず、実機での数値結果を記録する。
 
 **合格条件**
 
