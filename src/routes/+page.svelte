@@ -26,7 +26,12 @@
 		screenAccelerationForce,
 		screenGravityFromAcceleration
 	} from '#lib/input/sensors.js';
-	import { chooseInitialGridSize, AdaptiveResolutionController, type GridSize } from '#lib/perf/resolution.js';
+	import {
+		chooseInitialGridSize,
+		AdaptiveResolutionController,
+		isRenderFrameDue,
+		type GridSize
+	} from '#lib/perf/resolution.js';
 	import { MATERIAL, materialRegistry } from '#lib/sim/materials.js';
 	import {
 		createFlowStroke,
@@ -45,7 +50,8 @@
 		type Vector
 	} from '#lib/sim/world.js';
 
-	const FIXED_STEP_MS = 1000 / 30;
+	const TARGET_FPS = 30;
+	const FIXED_STEP_MS = 1000 / TARGET_FPS;
 	const PLACE_INTERVAL_MS = 120;
 	const MAX_FLOW_STROKES = 6;
 	const VIEWPORT_ASPECT_TOLERANCE = 0.02;
@@ -843,7 +849,7 @@
 			return;
 		}
 
-		const resolution = new AdaptiveResolutionController(30);
+		const resolution = new AdaptiveResolutionController(TARGET_FPS);
 		const palette = new Uint8ClampedArray(256 * 4);
 		const paletteReady = new Uint8Array(256);
 		const particleRadii = new Float32Array(256).fill(-1);
@@ -855,7 +861,7 @@
 		let bufferImage: ImageData | null = null;
 		let animationFrame = 0;
 		let measurementFrame = 0;
-		let previousFrameTime = 0;
+		let previousFrameTime: number | null = null;
 		let lastFpsUpdate = 0;
 		let frameCount = 0;
 		let accumulator = 0;
@@ -929,9 +935,13 @@
 					return;
 				}
 			}
+			if (!isRenderFrameDue(time, previousFrameTime, TARGET_FPS)) {
+				animationFrame = window.requestAnimationFrame(render);
+				return;
+			}
 			const frameStarted = performance.now();
-			if (previousFrameTime === 0) previousFrameTime = time;
-			const elapsed = Math.min(100, time - previousFrameTime);
+			const elapsed =
+				previousFrameTime === null ? 0 : Math.min(100, time - previousFrameTime);
 			previousFrameTime = time;
 			frameCount++;
 			if (!isPaused) {

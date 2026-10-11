@@ -5,6 +5,25 @@ export interface GridSize {
 
 const MIN_CELLS = 6_000;
 const MAX_CELLS = 60_000;
+const FRAME_TIME_TOLERANCE_MS = 0.5;
+
+export function isRenderFrameDue(
+	timestamp: number,
+	lastRenderedAt: number | null,
+	targetFps: number
+): boolean {
+	if (!Number.isFinite(timestamp)) throw new RangeError('Frame timestamps must be finite.');
+	if (lastRenderedAt !== null && !Number.isFinite(lastRenderedAt)) {
+		throw new RangeError('The previous frame timestamp must be finite.');
+	}
+	if (!Number.isFinite(targetFps) || targetFps <= 0) {
+		throw new RangeError('Target fps must be a positive number.');
+	}
+	return (
+		lastRenderedAt === null ||
+		timestamp - lastRenderedAt >= 1000 / targetFps - FRAME_TIME_TOLERANCE_MS
+	);
+}
 
 export function chooseInitialGridSize(
 	viewportWidth: number,

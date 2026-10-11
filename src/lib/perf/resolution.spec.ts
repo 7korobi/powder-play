@@ -2,8 +2,28 @@ import { describe, expect, it } from 'vitest';
 import {
 	AdaptiveResolutionController,
 	chooseInitialGridSize,
+	isRenderFrameDue,
 	type GridSize
 } from './resolution';
+
+describe('render frame pacing', () => {
+	it.each([60, 120])(
+		'limits a %i Hz callback stream to 30 rendered frames per second',
+		(refreshRate) => {
+			let lastRenderedAt: number | null = null;
+			let renderedFrames = 0;
+
+			for (let frame = 0; frame < refreshRate; frame++) {
+				const timestamp = (frame * 1000) / refreshRate;
+				if (!isRenderFrameDue(timestamp, lastRenderedAt, 30)) continue;
+				renderedFrames++;
+				lastRenderedAt = timestamp;
+			}
+
+			expect(renderedFrames).toBe(30);
+		}
+	);
+});
 
 describe('adaptive resolution', () => {
 	it('chooses an initial grid from viewport shape and available cores', () => {
