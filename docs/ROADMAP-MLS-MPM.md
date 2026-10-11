@@ -3,16 +3,18 @@
 更新日: 2026-10-12
 
 状態: Gate 0 の GPU 操作ラボはユーザーから稼働確認の報告あり。Gate 1 の CPU 数値
-reference と単一材料 GPU MLS-MPM kernel を実装済み。Gate 2 の GPU 選択・局所力ドラッグ・
-オブジェクト複製を `/labs/mpm/kernels` に統合する。Gate 1/2 とも GPU 実機での shader
-compile、数値・操作確認、持続性能確認は未完了。既存の β v0.2 は維持する。
+reference と単一材料 GPU MLS-MPM kernel を実装済みだが、実機での shader compile と
+数値検証は未完了。Gate 2 の GPU 選択・局所力ドラッグ・オブジェクト複製は
+`/labs/mpm/kernels` に統合し、ユーザーから基本操作の動作確認あり。長時間操作、容量境界、
+readback、30 fps の確認は残る。既存の β v0.2 は維持する。
 
 ## 現在の実装状況
 
 - **Gate 0**: `/labs/mpm` に GPU 粒子描画、要求時ピッキング、ドラッグ、複製を実装。粒子位置・速度は GPU buffer を正本とし、毎フレーム全量 readback はしない。ユーザーからラボが動作したとの報告あり。長時間・性能測定は未確認。
 - **Gate 1**: `src/lib/mpm/reference/` に CPU 上の単一材料・Neo-Hookean 弾性 MLS-MPM 1 step、`src/lib/mpm/kernels/` に GPU 上の P2G / grid update / G2P と GPU 描画を実装。`/labs/mpm/kernels` で初回 step の CPU reference 比較を行う。GPU shader compile・数値差・挙動は実機未確認。
-- **Gate 2**: `/labs/mpm/kernels` に Gate 0 の操作を統合する。選択時だけ16 byteのGPU結果を読み戻し、ドラッグはgrid上の減衰付き局所力、複製は連続した `objectId` 範囲をGPU内でコピーする。粒子と ID buffer は初期化時に固定容量を確保し、容量超過は明示的に拒否する。操作・キャンセル・数値は実機未確認。
-- **未実装**: 液体モデル、ゼリー・塑性、水・油界面、粉体、GPU kernel の実機検証と持続試験。
+- **Gate 2**: `/labs/mpm/kernels` に Gate 0 の操作を統合する。選択時だけ16 byteのGPU結果を読み戻し、ドラッグはgrid上の減衰付き局所力、複製は連続した `objectId` 範囲をGPU内でコピーする。粒子と ID buffer は初期化時に固定容量を確保し、容量超過は明示的に拒否する。基本操作はユーザー確認済み。長時間操作、容量境界、readback、数値安定性、性能は未確認。
+- **未実装**: 液体モデル、ゼリー・塑性、水・油界面、粉体。
+- **未確認**: Gate 1 のGPU shader compile・数値検証、Gate 2 の長時間・容量境界・readback・性能試験。
 - **統合方針**: 実験画面は `/labs/mpm` に隔離し、通常画面 `/` の β v0.2 と既存のクラッシュ対策を置き換えない。
 
 ## 1. 目的と前提
@@ -104,8 +106,8 @@ MLS-MPM の完全な実装より先に行う。合成粒子データを GPU buff
 **実装状況**: 単一材料の弾性クラスターを対象に、GPU上の最近傍選択、grid上の局所力ドラッグ、
 `objectId` グループのGPU複製を実装する。複製時のbuffer再確保は行わず、初期化時の固定容量と
 明示的な上限通知を使う。ポインターキャンセル、ページ非表示、GPU device loss でドラッグを
-終了する。これは操作統合のPoCであり、水の構成則・選択オブジェクトだけへの力の限定・実機での
-30 fps達成を証明するものではない。
+終了する。基本操作が動作することはユーザー確認済み。これは操作統合のPoCであり、水の構成則・
+選択オブジェクトだけへの力の限定・長時間安定性・実機での30 fps達成を証明するものではない。
 
 **実機合格条件**
 

@@ -72,5 +72,6 @@ Android Chrome と iOS Safari のセンサー権限、複数指操作、画面�
 通常のアプリ画面 `/` は従来のシミュレーションを引き続き使用します。実装状況と次の判定ゲートは
 [2D GPU MLS-MPM ロードマップ](./docs/ROADMAP-MLS-MPM.md) を参照してください。
 
-Gate 2のドラッグは水の物理モデルではなくgrid上の局所力です。実機でのshader compile、
-CPU/GPU数値比較、操作の安定性や30 fpsは別途検証が必要です。
+Gate 2の基本操作はユーザーから動作確認の報告があります。ドラッグは水の物理モデルではなく
+grid上の局所力です。Gate 1のshader compileとCPU/GPU数値比較、Gate 2の長時間安定性・容量境界・
+30 fpsは別途検証が必要です。
