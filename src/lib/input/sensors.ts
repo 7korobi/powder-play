@@ -1,6 +1,7 @@
 import type { Vector } from '../sim/world';
 
 export const STANDARD_GRAVITY = 9.81;
+const GRAVITY_NOISE_THRESHOLD = 0.025;
 
 export function screenGravityFromAcceleration(
 	ax: number | null,
@@ -8,11 +9,15 @@ export function screenGravityFromAcceleration(
 	orientationAngle: number
 ): Vector {
 	if (ax === null || ay === null || !Number.isFinite(ax) || !Number.isFinite(ay)) {
-		return { x: 0, y: 1 };
+		return { x: 0, y: 0 };
 	}
 	const vector = rotateToScreen(-ax, -ay, orientationAngle);
 	const gravity = { x: vector.x / STANDARD_GRAVITY, y: vector.y / STANDARD_GRAVITY };
-	return Math.hypot(gravity.x, gravity.y) < 0.12 ? { x: 0, y: 1 } : gravity;
+	const magnitude = Math.hypot(gravity.x, gravity.y);
+	if (magnitude < GRAVITY_NOISE_THRESHOLD) return { x: 0, y: 0 };
+
+	const scale = Math.min(1, magnitude) / magnitude;
+	return { x: gravity.x * scale, y: gravity.y * scale };
 }
 
 export function screenAccelerationForce(

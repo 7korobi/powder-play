@@ -8,6 +8,8 @@ export interface MaterialPlugin {
 	density: number;
 	color: Rgba;
 	repulsion?: number;
+	packingDensity?: number;
+	particleRadius?: number;
 }
 
 export class MaterialRegistry {
@@ -38,6 +40,22 @@ export class MaterialRegistry {
 			(!Number.isFinite(plugin.repulsion) || plugin.repulsion < 0 || plugin.repulsion > 1)
 		) {
 			throw new RangeError('Material repulsion must be between 0 and 1.');
+		}
+		if (
+			plugin.packingDensity !== undefined &&
+			(!Number.isFinite(plugin.packingDensity) ||
+				plugin.packingDensity < 0 ||
+				plugin.packingDensity > 1)
+		) {
+			throw new RangeError('Material packing density must be between 0 and 1.');
+		}
+		if (
+			plugin.particleRadius !== undefined &&
+			(!Number.isFinite(plugin.particleRadius) ||
+				plugin.particleRadius <= 0 ||
+				plugin.particleRadius > 0.5)
+		) {
+			throw new RangeError('Material particle radius must be greater than 0 and at most 0.5.');
 		}
 
 		this.definitions.set(plugin.id, Object.freeze({ ...plugin, color: [...plugin.color] as Rgba }));
@@ -76,13 +94,17 @@ export const materialRegistry = new MaterialRegistry([
 		name: '水',
 		phase: 'liquid',
 		density: 2,
-		color: [28, 111, 238, 26]
+		color: [28, 111, 238, 26],
+		packingDensity: 0.68,
+		particleRadius: 0.45
 	},
 	{
 		id: MATERIAL.powder,
 		name: '粉',
 		phase: 'granular',
 		density: 1,
-		color: [210, 220, 230, 255]
+		color: [210, 220, 230, 255],
+		packingDensity: 0.42,
+		particleRadius: 0.38
 	}
 ]);

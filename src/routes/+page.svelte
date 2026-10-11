@@ -12,7 +12,7 @@
 		type Camera,
 		type CameraMode,
 		type ViewportSize
-	} from '$lib/sim/camera';
+	} from '#lib/sim/camera.js';
 	import {
 		classifyTwoFingerGesture,
 		modeForDialRotation,
@@ -20,14 +20,14 @@
 		shortestAngleDelta,
 		type GestureKind,
 		type InteractionMode
-	} from '$lib/input/gestures';
+	} from '#lib/input/gestures.js';
 	import {
 		blendVector,
 		screenAccelerationForce,
 		screenGravityFromAcceleration
-	} from '$lib/input/sensors';
-	import { chooseInitialGridSize, AdaptiveResolutionController, type GridSize } from '$lib/perf/resolution';
-	import { MATERIAL, materialRegistry } from '$lib/sim/materials';
+	} from '#lib/input/sensors.js';
+	import { chooseInitialGridSize, AdaptiveResolutionController, type GridSize } from '#lib/perf/resolution.js';
+	import { MATERIAL, materialRegistry } from '#lib/sim/materials.js';
 	import {
 		createFlowStroke,
 		createInitialWorld,
@@ -43,11 +43,12 @@
 		type SimulationForces,
 		type SimulationWorld,
 		type Vector
-	} from '$lib/sim/world';
+	} from '#lib/sim/world.js';
 
 	const FIXED_STEP_MS = 1000 / 30;
 	const PLACE_INTERVAL_MS = 120;
 	const MAX_FLOW_STROKES = 6;
+	const VIEWPORT_ASPECT_TOLERANCE = 0.02;
 
 	const modes: {
 		id: InteractionMode;
@@ -131,6 +132,7 @@
 	let gesture: TwoFingerGesture | null = null;
 	let initialOrientation = '';
 	let sensorGravity: Vector = { x: 0, y: 1 };
+	let hasSensorGravity = false;
 	let gravityKeys = new Set<string>();
 	let pointerPositions = new Map<number, PointerPoint>();
 	let ignoredPointers = new Set<number>();
@@ -516,17 +518,7 @@
 		}
 	}
 
-	async function toggleSensors(): Promise<void> {
-		if (sensorEnabled) {
-			window.removeEventListener('devicemotion', handleDeviceMotion);
-			const orientation = window.screen.orientation as ScreenOrientation & { unlock?: () => void };
-			orientation?.unlock?.();
-			sensorEnabled = false;
-			forces = { ...forces, acceleration: { x: 0, y: 0 }, rotationRate: 0 };
-			updateGravityFromKeyboard();
-			sensorStatus = 'センサーを停止しました。矢印キーで操作できます。';
-			return;
-		}
+	async function enableSensors(userGesture: boolean): Promise<void> {
 		if (!window.isSecureContext) {
 			sensorStatus = 'センサーには HTTPS または localhost が必要です。矢印キーで操作できます。';
 			return;
@@ -540,11 +532,16 @@
 			sensorStatus = 'このブラウザーはモーションセンサーに対応していません。';
 			return;
 		}
+		const requestPermission = MotionEventConstructor.requestPermission;
+		if (requestPermission && !userGesture) {
+			sensorStatus = 'センサーを使うには、ボタンをタップして許可してください。矢印キーでも操作できます。';
+			return;
+		}
 
 		try {
 			const permissionRequest =
-				typeof MotionEventConstructor.requestPermission === 'function'
-					? MotionEventConstructor.requestPermission()
+				requestPermission
+					? requestPermission.call(MotionEventConstructor)
 					: Promise.resolve('granted' as const);
 			const orientationRequest = requestOrientationLock();
 			const [permissionResult, orientationResult] = await Promise.allSettled([
@@ -569,17 +566,36 @@
 			const lockResult =
 				orientationResult.status === 'fulfilled' ? orientationResult.value : 'failed';
 			window.addEventListener('devicemotion', handleDeviceMotion);
+			sensorGravity = { x: 0, y: 0 };
+			hasSensorGravity = false;
+			if (gravityKeys.size === 0) forces = { ...forces, gravity: sensorGravity };
 			sensorEnabled = true;
+			const startMessage = userGesture ? 'センサーを使用中。' : 'センサーを自動開始しました。';
 			sensorStatus =
 				lockResult === 'locked'
-					? '傾き・加速度・回転センサーを使用中。画面向きを固定しました。'
+					? `${startMessage}画面向きを固定しました。`
 					: lockResult === 'failed'
-						? 'センサーを使用中。向きを固定できないため、変更時は一時停止します。'
-						: 'センサーを使用中。向き固定は非対応のため、変更時は一時停止します。';
+						? `${startMessage}向きを固定できないため、変更時は一時停止します。`
+						: `${startMessage}向き固定は非対応のため、変更時は一時停止します。`;
 		} catch (error) {
 			console.error('Could not enable device-motion sensors.', error);
 			sensorStatus = 'センサーの許可に失敗しました。ブラウザー設定を確認してください。';
 		}
+	}
+
+	async function toggleSensors(): Promise<void> {
+		if (sensorEnabled) {
+			window.removeEventListener('devicemotion', handleDeviceMotion);
+			const orientation = window.screen.orientation as ScreenOrientation & { unlock?: () => void };
+			orientation?.unlock?.();
+			sensorEnabled = false;
+			hasSensorGravity = false;
+			forces = { ...forces, acceleration: { x: 0, y: 0 }, rotationRate: 0 };
+			updateGravityFromKeyboard();
+			sensorStatus = 'センサーを停止しました。矢印キーで操作できます。';
+			return;
+		}
+		await enableSensors(true);
 	}
 
 	function handleDeviceMotion(event: DeviceMotionEvent): void {
@@ -587,7 +603,10 @@
 		const acceleration = event.accelerationIncludingGravity;
 		if (acceleration && acceleration.x !== null && acceleration.y !== null) {
 			const nextGravity = screenGravityFromAcceleration(acceleration.x, acceleration.y, angle);
-			sensorGravity = blendVector(sensorGravity, nextGravity, 0.18);
+			sensorGravity = hasSensorGravity
+				? blendVector(sensorGravity, nextGravity, 0.18)
+				: nextGravity;
+			hasSensorGravity = true;
 			if (gravityKeys.size === 0) forces = { ...forces, gravity: sensorGravity };
 		}
 		const linear = event.acceleration;
@@ -667,7 +686,8 @@
 		currentFlows: readonly FlowStroke[],
 		currentDraft: readonly Point[],
 		palette: Uint8ClampedArray,
-		paletteReady: Uint8Array
+		paletteReady: Uint8Array,
+		particleRadii: Float32Array
 	): void {
 		const rect = canvas.getBoundingClientRect();
 		if (rect.width <= 0 || rect.height <= 0) return;
@@ -681,14 +701,34 @@
 		context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
 		context.clearRect(0, 0, rect.width, rect.height);
 
+		const particlePaths = new Map<number, Path2D>();
 		for (let index = 0; index < currentWorld.cells.length; index++) {
 			const material = currentWorld.cells[index];
 			if (paletteReady[material] === 0) {
-				palette.set(materialRegistry.get(material).color, material * 4);
+				const plugin = materialRegistry.get(material);
+				palette.set(plugin.color, material * 4);
+				particleRadii[material] = plugin.particleRadius ?? -1;
 				paletteReady[material] = 1;
 			}
 			const colorOffset = material * 4;
 			const pixelOffset = index * 4;
+			const radius = particleRadii[material];
+			if (radius >= 0) {
+				image.data[pixelOffset] = 0;
+				image.data[pixelOffset + 1] = 0;
+				image.data[pixelOffset + 2] = 0;
+				image.data[pixelOffset + 3] = 0;
+				let path = particlePaths.get(material);
+				if (!path) {
+					path = new Path2D();
+					particlePaths.set(material, path);
+				}
+				const x = index % currentWorld.width;
+				const y = Math.floor(index / currentWorld.width);
+				path.moveTo(x + 0.5 + radius, y + 0.5);
+				path.arc(x + 0.5, y + 0.5, radius, 0, Math.PI * 2);
+				continue;
+			}
 			image.data[pixelOffset] = palette[colorOffset];
 			image.data[pixelOffset + 1] = palette[colorOffset + 1];
 			image.data[pixelOffset + 2] = palette[colorOffset + 2];
@@ -701,6 +741,20 @@
 		const top = rect.height / 2 - currentCamera.centerY * scale;
 		context.imageSmoothingEnabled = false;
 		context.drawImage(buffer, left, top, currentWorld.width * scale, currentWorld.height * scale);
+
+		if (particlePaths.size > 0) {
+			context.save();
+			context.translate(left, top);
+			context.scale(scale, scale);
+			for (const [material, path] of particlePaths) {
+				const colorOffset = material * 4;
+				context.fillStyle = `rgba(${palette[colorOffset]}, ${palette[colorOffset + 1]}, ${
+					palette[colorOffset + 2]
+				}, ${palette[colorOffset + 3] / 255})`;
+				context.fill(path);
+			}
+			context.restore();
+		}
 
 		context.save();
 		context.fillStyle = 'rgba(255, 204, 91, 0.30)';
@@ -767,14 +821,6 @@
 	}
 
 	onMount(() => {
-		const bounds = canvasElement.getBoundingClientRect();
-		gridSize = chooseInitialGridSize(
-			bounds.width || 390,
-			bounds.height || 844,
-			navigator.hardwareConcurrency || 4
-		);
-		world = createInitialWorld(gridSize.width, gridSize.height);
-		camera = createCamera(world.width, world.height, viewMode);
 		initialOrientation = orientationType();
 
 		const context = canvasElement.getContext('2d', { alpha: true });
@@ -788,8 +834,10 @@
 		const resolution = new AdaptiveResolutionController(30);
 		const palette = new Uint8ClampedArray(256 * 4);
 		const paletteReady = new Uint8Array(256);
-		let bufferImage = bufferContext.createImageData(world.width, world.height);
+		const particleRadii = new Float32Array(256).fill(-1);
+		let bufferImage: ImageData | null = null;
 		let animationFrame = 0;
+		let measurementFrame = 0;
 		let previousFrameTime = 0;
 		let lastFpsUpdate = 0;
 		let frameCount = 0;
@@ -801,7 +849,11 @@
 
 		const resizeCanvasBuffer = (): void => {
 			if (!world) return;
-			if (buffer.width !== world.width || buffer.height !== world.height) {
+			if (
+				!bufferImage ||
+				buffer.width !== world.width ||
+				buffer.height !== world.height
+			) {
 				buffer.width = world.width;
 				buffer.height = world.height;
 				bufferImage = bufferContext.createImageData(world.width, world.height);
@@ -829,8 +881,37 @@
 			resizeCanvasBuffer();
 		};
 
+		const syncWorldToCanvas = (): void => {
+			const bounds = canvasElement.getBoundingClientRect();
+			if (bounds.width <= 0 || bounds.height <= 0) return;
+			const nextSize = chooseInitialGridSize(
+				bounds.width,
+				bounds.height,
+				navigator.hardwareConcurrency || 4
+			);
+			if (!world) {
+				gridSize = nextSize;
+				world = createInitialWorld(nextSize.width, nextSize.height);
+				camera = createCamera(world.width, world.height, viewMode);
+				resizeCanvasBuffer();
+				return;
+			}
+			if (orientationMismatch) return;
+
+			const viewportAspect = bounds.width / bounds.height;
+			const worldAspect = world.width / world.height;
+			if (Math.abs(viewportAspect / worldAspect - 1) <= VIEWPORT_ASPECT_TOLERANCE) return;
+			changeResolution(nextSize);
+		};
+
 		const render = (time: number): void => {
-			if (!world) return;
+			if (!world || !bufferImage) {
+				syncWorldToCanvas();
+				if (!world || !bufferImage) {
+					animationFrame = window.requestAnimationFrame(render);
+					return;
+				}
+			}
 			const frameStarted = performance.now();
 			if (previousFrameTime === 0) previousFrameTime = time;
 			const elapsed = Math.min(100, time - previousFrameTime);
@@ -866,7 +947,8 @@
 				flows,
 				flowDraft,
 				palette,
-				paletteReady
+				paletteReady,
+				particleRadii
 			);
 			if (!isPaused) {
 				const nextSize = resolution.observe(performance.now() - frameStarted, {
@@ -878,18 +960,34 @@
 			animationFrame = window.requestAnimationFrame(render);
 		};
 
-		initialOrientation = orientationType();
 		window.addEventListener('resize', checkOrientation);
 		window.screen.orientation?.addEventListener('change', checkOrientation);
+		window.addEventListener('resize', syncWorldToCanvas);
+		window.visualViewport?.addEventListener('resize', syncWorldToCanvas);
+		const resizeObserver =
+			typeof ResizeObserver === 'undefined'
+				? null
+				: new ResizeObserver(syncWorldToCanvas);
+		resizeObserver?.observe(canvasElement);
+		syncWorldToCanvas();
+		measurementFrame = window.requestAnimationFrame(() => {
+			measurementFrame = 0;
+			syncWorldToCanvas();
+		});
 		window.addEventListener('keydown', keyboardDown);
 		window.addEventListener('keyup', keyboardUp);
 		window.addEventListener('blur', clearGravityKeys);
 		animationFrame = window.requestAnimationFrame(render);
+		void enableSensors(false);
 
 		return () => {
 			window.cancelAnimationFrame(animationFrame);
+			if (measurementFrame !== 0) window.cancelAnimationFrame(measurementFrame);
+			resizeObserver?.disconnect();
 			window.removeEventListener('resize', checkOrientation);
 			window.screen.orientation?.removeEventListener('change', checkOrientation);
+			window.removeEventListener('resize', syncWorldToCanvas);
+			window.visualViewport?.removeEventListener('resize', syncWorldToCanvas);
 			window.removeEventListener('keydown', keyboardDown);
 			window.removeEventListener('keyup', keyboardUp);
 			window.removeEventListener('blur', clearGravityKeys);

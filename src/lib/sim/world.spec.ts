@@ -41,6 +41,74 @@ describe('world initialization and movement', () => {
 		expect(world.get(1, 3)).toBe(MATERIAL.water);
 	});
 
+	it('scales gravity movement with the measured tilt magnitude', () => {
+		const weakWorld = new SimulationWorld(3, 4);
+		weakWorld.set(1, 1, MATERIAL.powder);
+		stepWorld(weakWorld, { ...defaultForces, gravity: { x: 0, y: 0.25 } }, [], () => 0.5);
+		expect(weakWorld.get(1, 1)).toBe(MATERIAL.powder);
+
+		const strongWorld = new SimulationWorld(3, 4);
+		strongWorld.set(1, 1, MATERIAL.powder);
+		stepWorld(strongWorld, defaultForces, [], () => 0.5);
+		expect(strongWorld.get(1, 2)).toBe(MATERIAL.powder);
+	});
+
+	it('interpolates gravity between adjacent grid directions', () => {
+		const registry = new MaterialRegistry([
+			{
+				id: MATERIAL.air,
+				name: 'air',
+				phase: 'gas',
+				density: 0,
+				color: [0, 0, 0, 0]
+			},
+			{
+				id: MATERIAL.powder,
+				name: 'powder',
+				phase: 'granular',
+				density: 1,
+				color: [210, 220, 230, 255]
+			}
+		]);
+		const moveOneParticle = (gravity: { x: number; y: number }): SimulationWorld => {
+			const world = new SimulationWorld(4, 4);
+			world.set(1, 1, MATERIAL.powder);
+			stepWorld(world, { ...defaultForces, gravity }, [], () => 0, registry);
+			return world;
+		};
+
+		const verticalWorld = moveOneParticle({ x: 0, y: 1 });
+		const tiltedWorld = moveOneParticle({ x: 0.05, y: 1 });
+		expect(verticalWorld.get(1, 2)).toBe(MATERIAL.powder);
+		expect(tiltedWorld.get(2, 2)).toBe(MATERIAL.powder);
+	});
+
+	it('spreads over-packed particles into nearby air while conserving their count', () => {
+		const world = new SimulationWorld(7, 7);
+		for (let y = 2; y <= 4; y++) {
+			for (let x = 2; x <= 4; x++) world.set(x, y, MATERIAL.powder);
+		}
+
+		stepWorld(
+			world,
+			{ ...defaultForces, gravity: { x: 0, y: 0 } },
+			[],
+			() => 0
+		);
+
+		const powderCells = [...world.cells]
+			.map((material, index) => (material === MATERIAL.powder ? index : -1))
+			.filter((index) => index >= 0);
+		expect(powderCells).toHaveLength(9);
+		expect(
+			powderCells.some((index) => {
+				const x = index % world.width;
+				const y = Math.floor(index / world.width);
+				return x < 2 || x > 4 || y < 2 || y > 4;
+			})
+		).toBe(true);
+	});
+
 	it('allows denser water to displace powder upward', () => {
 		const registry = new MaterialRegistry([
 			...[

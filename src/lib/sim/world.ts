@@ -29,6 +29,18 @@ const NEIGHBORS: readonly Vector[] = [
 	{ x: 0, y: 1 },
 	{ x: -1, y: 0 }
 ];
+const DIRECTIONS: readonly Vector[] = [
+	{ x: 0, y: -1 },
+	{ x: 1, y: -1 },
+	{ x: 1, y: 0 },
+	{ x: 1, y: 1 },
+	{ x: 0, y: 1 },
+	{ x: -1, y: 1 },
+	{ x: -1, y: 0 },
+	{ x: -1, y: -1 }
+];
+const PACKING_RADIUS = 2;
+const PACKING_RESPONSE = 0.55;
 
 export class SimulationWorld {
 	readonly cells: Uint8Array;
@@ -259,13 +271,25 @@ export function stepWorld(
 	applyLinearAcceleration(world, forces.acceleration, random, registry, protectedCells);
 	applyRotation(world, forces.rotationRate, random, registry, protectedCells);
 
-	const gravity = usableGravity(forces.gravity);
-	const downhill = orderedDirections(gravity);
-	const uphill = orderedDirections({ x: -gravity.x, y: -gravity.y });
+	const gravityMagnitude = Math.hypot(forces.gravity.x, forces.gravity.y);
+	const gravityStrength = Number.isFinite(gravityMagnitude) ? Math.min(1, gravityMagnitude) : 0;
+	const gravityDirection =
+		gravityStrength > 0
+			? { x: forces.gravity.x / gravityMagnitude, y: forces.gravity.y / gravityMagnitude }
+			: { x: 0, y: 0 };
+	const downhill = orderedDirections(gravityDirection);
+	const uphill = orderedDirections({ x: -gravityDirection.x, y: -gravityDirection.y });
 	const xStart =
-		gravity.x > 0.05 ? world.width - 1 : gravity.x < -0.05 ? 0 : world.tick % 2 ? 0 : world.width - 1;
+		gravityDirection.x > 0
+			? world.width - 1
+			: gravityDirection.x < 0
+				? 0
+				: world.tick % 2
+					? 0
+					: world.width - 1;
 	const xStep = xStart === 0 ? 1 : -1;
-	const yStart = gravity.y > 0.05 ? world.height - 1 : gravity.y < -0.05 ? 0 : world.height - 1;
+	const yStart =
+		gravityDirection.y > 0 ? world.height - 1 : gravityDirection.y < 0 ? 0 : world.height - 1;
 	const yStep = yStart === 0 ? 1 : -1;
 
 	for (let y = yStart; y >= 0 && y < world.height; y += yStep) {
@@ -276,36 +300,64 @@ export function stepWorld(
 			if (plugin.phase === 'solid') continue;
 			if (plugin.phase === 'gas') {
 				if (tryGasRepulsion(world, x, y, plugin, random, registry, protectedCells)) continue;
-				tryMoveInDirections(world, x, y, uphill, plugin, registry, protectedCells);
+				if (gravityStrength > 0 && random() < gravityStrength) {
+					tryMoveInGravity(
+						world,
+						x,
+						y,
+						uphill,
+						{ x: -gravityDirection.x, y: -gravityDirection.y },
+						random,
+						plugin,
+						registry,
+						protectedCells
+					);
+				}
 				continue;
 			}
 
-			if (tryMoveInDirections(world, x, y, downhill, plugin, registry, protectedCells)) continue;
+			if (
+				plugin.packingDensity !== undefined &&
+				tryPackingRepulsion(world, x, y, plugin, random, registry, protectedCells)
+			) {
+				continue;
+			}
+			if (
+				gravityStrength > 0 &&
+				random() < gravityStrength &&
+				tryMoveInGravity(
+					world,
+					x,
+					y,
+					downhill,
+					gravityDirection,
+					random,
+					plugin,
+					registry,
+					protectedCells
+				)
+			) {
+				continue;
+			}
 			if (plugin.phase === 'liquid') {
-				tryMoveSideways(world, x, y, gravity, plugin, random, registry, protectedCells);
+				tryMoveSideways(
+					world,
+					x,
+					y,
+					gravityDirection,
+					gravityStrength,
+					plugin,
+					random,
+					registry,
+					protectedCells
+				);
 			}
 		}
 	}
 }
 
-function usableGravity(gravity: Vector): Vector {
-	const magnitude = Math.hypot(gravity.x, gravity.y);
-	if (!Number.isFinite(magnitude) || magnitude < 0.05) return { x: 0, y: 1 };
-	return { x: gravity.x / magnitude, y: gravity.y / magnitude };
-}
-
 function orderedDirections(vector: Vector): Vector[] {
-	const directions: Vector[] = [
-		{ x: 0, y: -1 },
-		{ x: 1, y: -1 },
-		{ x: 1, y: 0 },
-		{ x: 1, y: 1 },
-		{ x: 0, y: 1 },
-		{ x: -1, y: 1 },
-		{ x: -1, y: 0 },
-		{ x: -1, y: -1 }
-	];
-	return directions
+	return DIRECTIONS
 		.map((direction) => ({
 			direction,
 			score:
@@ -315,6 +367,54 @@ function orderedDirections(vector: Vector): Vector[] {
 		.filter(({ score }) => score > 0.05)
 		.sort((left, right) => right.score - left.score)
 		.map(({ direction }) => direction);
+}
+
+function tryMoveInGravity(
+	world: SimulationWorld,
+	x: number,
+	y: number,
+	directions: readonly Vector[],
+	gravity: Vector,
+	random: () => number,
+	plugin: MaterialPlugin,
+	registry: MaterialRegistry,
+	protectedCells: ReadonlySet<number>
+): boolean {
+	const sourceIndex = y * world.width + x;
+	if (world.lastMoved[sourceIndex] === world.tick || protectedCells.has(sourceIndex)) return false;
+	if (directions.length === 0) return false;
+
+	const preferred = interpolatedDirection(directions, gravity, random);
+
+	if (tryMoveToDirection(world, x, y, sourceIndex, preferred, plugin, registry, protectedCells)) {
+		return true;
+	}
+	for (const direction of directions) {
+		if (
+			direction !== preferred &&
+			tryMoveToDirection(world, x, y, sourceIndex, direction, plugin, registry, protectedCells)
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function interpolatedDirection(
+	directions: readonly Vector[],
+	vector: Vector,
+	random: () => number
+): Vector {
+	const first = directions[0];
+	if (directions.length < 2) return first;
+
+	const second = directions[1];
+	const determinant = first.x * second.y - first.y * second.x;
+	if (determinant === 0) return first;
+	const firstWeight = Math.max(0, (vector.x * second.y - vector.y * second.x) / determinant);
+	const secondWeight = Math.max(0, (first.x * vector.y - first.y * vector.x) / determinant);
+	const weightTotal = firstWeight + secondWeight;
+	return weightTotal > 0 && random() < secondWeight / weightTotal ? second : first;
 }
 
 function tryMoveInDirections(
@@ -329,25 +429,108 @@ function tryMoveInDirections(
 	const sourceIndex = y * world.width + x;
 	if (world.lastMoved[sourceIndex] === world.tick || protectedCells.has(sourceIndex)) return false;
 	for (const direction of directions) {
+		if (tryMoveToDirection(world, x, y, sourceIndex, direction, plugin, registry, protectedCells)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function tryMoveToDirection(
+	world: SimulationWorld,
+	x: number,
+	y: number,
+	sourceIndex: number,
+	direction: Vector,
+	plugin: MaterialPlugin,
+	registry: MaterialRegistry,
+	protectedCells: ReadonlySet<number>
+): boolean {
+	const targetX = x + direction.x;
+	const targetY = y + direction.y;
+	if (!world.contains(targetX, targetY)) return false;
+	const targetIndex = targetY * world.width + targetX;
+	if (world.lastMoved[targetIndex] === world.tick || protectedCells.has(targetIndex)) return false;
+	const target = registry.get(world.cells[targetIndex]);
+	const canMove =
+		plugin.phase === 'gas'
+			? target.phase === 'liquid' && target.density > plugin.density
+			: plugin.phase === 'liquid'
+				? target.density < plugin.density
+				: plugin.phase === 'granular'
+					? target.phase === 'gas'
+					: false;
+	if (!canMove) return false;
+	swapCells(world, sourceIndex, targetIndex);
+	return true;
+}
+
+function tryPackingRepulsion(
+	world: SimulationWorld,
+	x: number,
+	y: number,
+	plugin: MaterialPlugin,
+	random: () => number,
+	registry: MaterialRegistry,
+	protectedCells: ReadonlySet<number>
+): boolean {
+	const sourceIndex = y * world.width + x;
+	if (world.lastMoved[sourceIndex] === world.tick || protectedCells.has(sourceIndex)) return false;
+
+	let occupiedCells = 0;
+	let sampleCells = 0;
+	let pressureX = 0;
+	let pressureY = 0;
+	for (let offsetY = -PACKING_RADIUS; offsetY <= PACKING_RADIUS; offsetY++) {
+		for (let offsetX = -PACKING_RADIUS; offsetX <= PACKING_RADIUS; offsetX++) {
+			const distanceSquared = offsetX * offsetX + offsetY * offsetY;
+			if (distanceSquared > PACKING_RADIUS * PACKING_RADIUS) continue;
+			const neighborX = x + offsetX;
+			const neighborY = y + offsetY;
+			if (!world.contains(neighborX, neighborY)) continue;
+			sampleCells++;
+			const neighborIndex = neighborY * world.width + neighborX;
+			const neighbor = registry.get(world.cells[neighborIndex]);
+			if (neighbor.phase !== 'liquid' && neighbor.phase !== 'granular') continue;
+			occupiedCells++;
+			if (distanceSquared > 0) {
+				pressureX -= offsetX / distanceSquared;
+				pressureY -= offsetY / distanceSquared;
+			}
+		}
+	}
+
+	const localDensity = occupiedCells / sampleCells;
+	const targetDensity = plugin.packingDensity;
+	if (targetDensity === undefined || localDensity <= targetDensity) return false;
+	const excess = (localDensity - targetDensity) / (1 - targetDensity);
+	if (random() >= Math.min(1, excess) * PACKING_RESPONSE) return false;
+
+	let targetIndex = -1;
+	let bestAlignment = -Infinity;
+	let candidateCount = 0;
+	for (const direction of DIRECTIONS) {
 		const targetX = x + direction.x;
 		const targetY = y + direction.y;
 		if (!world.contains(targetX, targetY)) continue;
-		const targetIndex = targetY * world.width + targetX;
-		if (world.lastMoved[targetIndex] === world.tick || protectedCells.has(targetIndex)) continue;
-		const target = registry.get(world.cells[targetIndex]);
-		const canMove =
-			plugin.phase === 'gas'
-				? target.phase === 'liquid' && target.density > plugin.density
-				: plugin.phase === 'liquid'
-					? target.density < plugin.density
-					: plugin.phase === 'granular'
-						? target.phase === 'gas'
-						: false;
-		if (!canMove) continue;
-		swapCells(world, sourceIndex, targetIndex);
-		return true;
+		const index = targetY * world.width + targetX;
+		if (world.lastMoved[index] === world.tick || protectedCells.has(index)) continue;
+		if (registry.get(world.cells[index]).phase !== 'gas') continue;
+
+		const alignment = direction.x * pressureX + direction.y * pressureY;
+		if (alignment > bestAlignment + 1e-6) {
+			targetIndex = index;
+			bestAlignment = alignment;
+			candidateCount = 1;
+		} else if (Math.abs(alignment - bestAlignment) <= 1e-6) {
+			candidateCount++;
+			if (random() < 1 / candidateCount) targetIndex = index;
+		}
 	}
-	return false;
+
+	if (targetIndex < 0) return false;
+	swapCells(world, sourceIndex, targetIndex);
+	return true;
 }
 
 function tryGasRepulsion(
@@ -382,26 +565,32 @@ function tryMoveSideways(
 	x: number,
 	y: number,
 	gravity: Vector,
+	gravityStrength: number,
 	plugin: MaterialPlugin,
 	random: () => number,
 	registry: MaterialRegistry,
 	protectedCells: ReadonlySet<number>
 ): boolean {
-	if (random() >= 0.24) return false;
-	const perpendicular = quantizedPerpendicular(gravity);
-	if (perpendicular.x === 0 && perpendicular.y === 0) return false;
-	const first = random() < 0.5 ? perpendicular : { x: -perpendicular.x, y: -perpendicular.y };
-	const second = { x: -first.x, y: -first.y };
-	return tryMoveInDirections(world, x, y, [first, second], plugin, registry, protectedCells);
-}
-
-function quantizedPerpendicular(gravity: Vector): Vector {
-	const x = -gravity.y;
-	const y = gravity.x;
-	return {
-		x: Math.abs(x) < 0.25 ? 0 : Math.sign(x),
-		y: Math.abs(y) < 0.25 ? 0 : Math.sign(y)
-	};
+	if (random() >= 0.24 * gravityStrength) return false;
+	const sign = random() < 0.5 ? 1 : -1;
+	const direction = { x: -gravity.y * sign, y: gravity.x * sign };
+	const directions = orderedDirections(direction);
+	const preferred = interpolatedDirection(directions, direction, random);
+	const sourceIndex = y * world.width + x;
+	if (world.lastMoved[sourceIndex] === world.tick || protectedCells.has(sourceIndex)) return false;
+	if (tryMoveToDirection(world, x, y, sourceIndex, preferred, plugin, registry, protectedCells)) {
+		return true;
+	}
+	return tryMoveToDirection(
+		world,
+		x,
+		y,
+		sourceIndex,
+		{ x: -preferred.x, y: -preferred.y },
+		plugin,
+		registry,
+		protectedCells
+	);
 }
 
 function applyFlow(

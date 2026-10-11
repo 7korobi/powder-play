@@ -3,19 +3,22 @@
 	"private": true,
 	"version": "0.2.0",
 	"type": "module",
+	"engines": {
+		"node": ">=22.17.0"
+	},
 	"scripts": {
 		"dev": "vite dev",
 		"build": "vite build",
 		"preview": "vite preview",
-		"prepare": "svelte-kit sync || echo ''",
+		"prepare": "svelte-kit sync",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"test:unit": "vitest",
 		"test": "npm run test:unit -- --run"
 	},
 	"devDependencies": {
-		"@sveltejs/adapter-cloudflare": "^7.0.0",
-		"@sveltejs/kit": "^2.70.3",
+		"@sveltejs/adapter-cloudflare": "^8.0.0",
+		"@sveltejs/kit": "^3.0.1",
 		"@sveltejs/vite-plugin-svelte": "^7.2.0",
 		"@types/node": "^22.20.5",
 		"svelte": "^5.57.1",

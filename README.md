@@ -5,7 +5,7 @@
 
 ## 起動
 
-Node.js 22.12 以降と npm を使います。
+Node.js 22.17 以降と npm を使います。
 
 ```sh
 npm install

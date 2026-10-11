@@ -18,9 +18,20 @@ describe('device motion mapping', () => {
 		expect(gravity.y).toBeCloseTo(1);
 	});
 
-	it('falls back to screen-down when the device has no in-plane gravity', () => {
-		expect(screenGravityFromAcceleration(0, 0, 0)).toEqual({ x: 0, y: 1 });
-		expect(screenGravityFromAcceleration(null, null, 0)).toEqual({ x: 0, y: 1 });
+	it('preserves tilt magnitude so small tilt produces proportionally weak gravity', () => {
+		expect(screenGravityFromAcceleration(0, STANDARD_GRAVITY * 0.25, 0)).toEqual({
+			x: 0,
+			y: 0.25
+		});
+		expect(screenGravityFromAcceleration(0, STANDARD_GRAVITY * 2, 0)).toEqual({
+			x: 0,
+			y: 1
+		});
+	});
+
+	it('uses near-zero gravity when the device has no in-plane gravity', () => {
+		expect(screenGravityFromAcceleration(0, 0, 0)).toEqual({ x: 0, y: 0 });
+		expect(screenGravityFromAcceleration(null, null, 0)).toEqual({ x: 0, y: 0 });
 	});
 
 	it('maps linear acceleration into a bounded inertial force', () => {

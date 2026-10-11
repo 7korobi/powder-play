@@ -16,6 +16,16 @@ describe('adaptive resolution', () => {
 		expect(desktop.width * desktop.height).toBeGreaterThan(phone.width * phone.height);
 	});
 
+	it('matches the measured viewport aspect when choosing a grid', () => {
+		const viewport = { width: 844, height: 390 };
+		const grid = chooseInitialGridSize(viewport.width, viewport.height, 4);
+
+		expect(
+			Math.abs(grid.width / grid.height - viewport.width / viewport.height) /
+				(viewport.width / viewport.height)
+		).toBeLessThan(0.01);
+	});
+
 	it('reduces the grid when measured frame work exceeds the 30 fps budget', () => {
 		const controller = new AdaptiveResolutionController(30);
 		const current = { width: 160, height: 200 };
