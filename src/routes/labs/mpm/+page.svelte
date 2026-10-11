@@ -556,9 +556,9 @@
 				<div class="truth-note">
 					<strong>重要: 物理演算はまだ MLS-MPM ではありません。</strong>
 					<span>
-						この画面は操作経路の PoC です。数値カーネルは
-						<a href="/labs/mpm/kernels">Gate 1 GPU MLS-MPM 実験</a>
-						で別途検証します。
+						この画面は操作経路の PoC です。MLS-MPM の物理カーネルと操作統合は
+						<a href="/labs/mpm/kernels">Gate 1/2 GPU MLS-MPM 操作ラボ</a>
+						で検証します。
 					</span>
 					<span>
 						Gate 0 の操作を統合した
