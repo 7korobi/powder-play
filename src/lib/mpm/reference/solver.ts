@@ -1,3 +1,9 @@
+import {
+	normalizeMpmConstitutiveModel,
+	SNOW_PLASTICITY,
+	type MpmConstitutiveModel
+} from '../materials.js';
+
 export interface MpmVector2 {
 	readonly x: number;
 	readonly y: number;
@@ -16,6 +22,8 @@ export interface MpmParticle {
 	readonly C: MpmMatrix2;
 	readonly F: MpmMatrix2;
 	readonly objectId?: number;
+	readonly plasticVolume?: number;
+	readonly material?: MpmMaterialParameters;
 }
 
 export interface MpmGridParameters {
@@ -27,6 +35,7 @@ export interface MpmGridParameters {
 export interface MpmMaterialParameters {
 	readonly lambda: number;
 	readonly mu: number;
+	readonly model?: MpmConstitutiveModel;
 }
 
 export interface MpmStepConfig {
@@ -84,6 +93,16 @@ interface ParticleStencil {
 	readonly weightsY: readonly [number, number, number];
 }
 
+interface Decomposition2 {
+	readonly sigma1: number;
+	readonly sigma2: number;
+	readonly u1: MpmVector2;
+	readonly u2: MpmVector2;
+	readonly v1: MpmVector2;
+	readonly v2: MpmVector2;
+	readonly rotation: MpmMatrix2;
+}
+
 const IDENTITY: MpmMatrix2 = { m00: 1, m01: 0, m10: 0, m11: 1 };
 
 export function stepMpm(
@@ -101,8 +120,13 @@ export function stepMpm(
 
 	for (const particle of particles) {
 		const stencil = particleStencil(particle.position, dx);
-		const firstPiola = neoHookeanFirstPiola(particle.F, validated.material);
-		const stressTimesFt = multiplyMatrices(firstPiola, transposeMatrix(particle.F));
+		const material = particleMaterial(particle, validated.material);
+		const plasticVolume = particle.plasticVolume ?? 1;
+		const stressTimesFt = constitutiveStressTimesFt(
+			particle.F,
+			plasticVolume,
+			material
+		);
 		const affine = addMatrices(
 			scaleMatrix(particle.C, validated.particleMass),
 			scaleMatrix(stressTimesFt, validated.stressScale)
@@ -187,6 +211,8 @@ export function stepMpm(
 
 	const outputParticles = particles.map((particle) => {
 		const stencil = particleStencil(particle.position, dx);
+		const material = particleMaterial(particle, validated.material);
+		const plasticVolume = particle.plasticVolume ?? 1;
 		let velocityX = 0;
 		let velocityY = 0;
 		let c00 = 0;
@@ -221,7 +247,7 @@ export function stepMpm(
 			m10: c10 * validated.gradientScale,
 			m11: c11 * validated.gradientScale
 		};
-		const F = multiplyMatrices(
+		const trialF = multiplyMatrices(
 			{
 				m00: 1 + validated.dt * C.m00,
 				m01: validated.dt * C.m01,
@@ -233,10 +259,17 @@ export function stepMpm(
 		assertComputedFinite(velocityX, 'particle velocity');
 		assertComputedFinite(velocityY, 'particle velocity');
 		assertComputedMatrixFinite(C, 'particle affine velocity');
-		assertComputedMatrixFinite(F, 'deformation gradient');
-		const jacobian = determinant(F);
+		assertComputedMatrixFinite(trialF, 'deformation gradient');
+		const jacobian = determinant(trialF);
 		if (!Number.isFinite(jacobian) || jacobian <= 0) {
 			throw new RangeError('step would produce a non-positive deformation determinant');
+		}
+		let F = trialF;
+		let nextPlasticVolume = plasticVolume;
+		if (material.model === 'snow') {
+			const projected = projectSnowDeformation(trialF, plasticVolume);
+			F = projected.deformation;
+			nextPlasticVolume = projected.plasticVolume;
 		}
 
 		const nextX = particle.position.x + validated.dt * velocityX;
@@ -250,7 +283,10 @@ export function stepMpm(
 			position: { x: boundedX.position, y: boundedY.position },
 			velocity: { x: boundedX.velocity, y: boundedY.velocity },
 			C,
-			F
+			F,
+			objectId: particle.objectId,
+			plasticVolume: nextPlasticVolume,
+			material
 		};
 	});
 
@@ -281,9 +317,8 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 	}
 	const raw = config as unknown as Record<string, unknown>;
 	const grid = raw.grid;
-	const material = raw.material;
 	if (!isRecord(grid)) throw new TypeError('grid must be an object');
-	if (!isRecord(material)) throw new TypeError('material must be an object');
+	const material = validateMaterial(raw.material, 'material');
 
 	const dt = raw.dt;
 	const cellsX = grid.cellsX;
@@ -349,7 +384,7 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 		grid: { cellsX, cellsY, cellSize },
 		particleMass,
 		particleVolume,
-		material: { lambda, mu },
+		material,
 		gravity: { x: gravity.x, y: gravity.y },
 		domainWidth,
 		domainHeight,
@@ -374,6 +409,20 @@ function validateParticles(
 		assertMatrix(value.F, `particles[${index}].F`);
 
 		const particle = value as unknown as MpmParticle;
+		if (value.material !== undefined) {
+			validateMaterial(value.material, `particles[${index}].material`);
+		}
+		if (value.plasticVolume !== undefined) {
+			assertFiniteNumber(value.plasticVolume, `particles[${index}].plasticVolume`);
+			if (
+				value.plasticVolume < SNOW_PLASTICITY.minPlasticVolume ||
+				value.plasticVolume > SNOW_PLASTICITY.maxPlasticVolume
+			) {
+				throw new RangeError(
+					`particles[${index}].plasticVolume must be between ${SNOW_PLASTICITY.minPlasticVolume} and ${SNOW_PLASTICITY.maxPlasticVolume}`
+				);
+			}
+		}
 		if (
 			particle.position.x < 0 ||
 			particle.position.x > config.domainWidth ||
@@ -439,6 +488,151 @@ function neoHookeanFirstPiola(
 	};
 	assertComputedMatrixFinite(P, 'first Piola stress');
 	return P;
+}
+
+function validateMaterial(value: unknown, name: string): MpmMaterialParameters {
+	if (!isRecord(value)) throw new TypeError(`${name} must be an object`);
+	const lambda = value.lambda;
+	const mu = value.mu;
+	assertFiniteNumber(lambda, `${name}.lambda`);
+	assertFiniteNumber(mu, `${name}.mu`);
+	if (lambda < 0) throw new RangeError(`${name}.lambda must be non-negative`);
+	if (mu <= 0) throw new RangeError(`${name}.mu must be greater than zero`);
+	if (!Number.isFinite(lambda + 2 * mu)) {
+		throw new RangeError(`${name} parameters are outside the supported numeric range`);
+	}
+	const model = normalizeMpmConstitutiveModel(value.model, `${name}.model`);
+	return { lambda, mu, model };
+}
+
+function particleMaterial(
+	particle: MpmParticle,
+	defaultMaterial: MpmMaterialParameters
+): MpmMaterialParameters {
+	return particle.material === undefined
+		? defaultMaterial
+		: validateMaterial(particle.material, 'particle material');
+}
+
+function constitutiveStressTimesFt(
+	F: MpmMatrix2,
+	plasticVolume: number,
+	material: MpmMaterialParameters
+): MpmMatrix2 {
+	if (material.model === 'snow') {
+		const decomposition = decompose2x2(F);
+		const hardeningExponent = Math.max(
+			-SNOW_PLASTICITY.maxHardeningExponent,
+			Math.min(
+				SNOW_PLASTICITY.maxHardeningExponent,
+				SNOW_PLASTICITY.hardening * (1 - plasticVolume)
+			)
+		);
+		const hardening = Math.exp(hardeningExponent);
+		const lambda = material.lambda * hardening;
+		const mu = material.mu * hardening;
+		const jacobian = determinant(F);
+		const shear = 2 * mu;
+		const volumetric = lambda * jacobian * (jacobian - 1);
+		const difference = {
+			m00: F.m00 - decomposition.rotation.m00,
+			m01: F.m01 - decomposition.rotation.m01,
+			m10: F.m10 - decomposition.rotation.m10,
+			m11: F.m11 - decomposition.rotation.m11
+		};
+		const stressTimesFt: MpmMatrix2 = {
+			m00:
+				shear * (difference.m00 * F.m00 + difference.m01 * F.m01) +
+				volumetric,
+			m01: shear * (difference.m00 * F.m10 + difference.m01 * F.m11),
+			m10: shear * (difference.m10 * F.m00 + difference.m11 * F.m01),
+			m11:
+				shear * (difference.m10 * F.m10 + difference.m11 * F.m11) +
+				volumetric
+		};
+		assertComputedMatrixFinite(stressTimesFt, 'snow stress');
+		return stressTimesFt;
+	}
+	const firstPiola = neoHookeanFirstPiola(F, material);
+	return multiplyMatrices(firstPiola, transposeMatrix(F));
+}
+
+function projectSnowDeformation(
+	deformation: MpmMatrix2,
+	plasticVolume: number
+): { readonly deformation: MpmMatrix2; readonly plasticVolume: number } {
+	const decomposition = decompose2x2(deformation);
+	const minimumStretch = 1 - SNOW_PLASTICITY.compressionYield;
+	const maximumStretch = 1 + SNOW_PLASTICITY.stretchYield;
+	const sigma1 = Math.max(minimumStretch, Math.min(maximumStretch, decomposition.sigma1));
+	const sigma2 = Math.max(minimumStretch, Math.min(maximumStretch, decomposition.sigma2));
+	const updatedPlasticVolume = Math.max(
+		SNOW_PLASTICITY.minPlasticVolume,
+		Math.min(
+			SNOW_PLASTICITY.maxPlasticVolume,
+			(plasticVolume * determinant(deformation)) / (sigma1 * sigma2)
+		)
+	);
+	const projected: MpmMatrix2 = {
+		m00:
+			sigma1 * decomposition.u1.x * decomposition.v1.x +
+			sigma2 * decomposition.u2.x * decomposition.v2.x,
+		m01:
+			sigma1 * decomposition.u1.x * decomposition.v1.y +
+			sigma2 * decomposition.u2.x * decomposition.v2.y,
+		m10:
+			sigma1 * decomposition.u1.y * decomposition.v1.x +
+			sigma2 * decomposition.u2.y * decomposition.v2.x,
+		m11:
+			sigma1 * decomposition.u1.y * decomposition.v1.y +
+			sigma2 * decomposition.u2.y * decomposition.v2.y
+	};
+	assertComputedMatrixFinite(projected, 'projected snow deformation');
+	assertComputedFinite(updatedPlasticVolume, 'snow plastic volume');
+	if (determinant(projected) <= 0) {
+		throw new RangeError('snow projection produced a non-positive deformation determinant');
+	}
+	return { deformation: projected, plasticVolume: updatedPlasticVolume };
+}
+
+function decompose2x2(F: MpmMatrix2): Decomposition2 {
+	const c00 = F.m00 * F.m00 + F.m10 * F.m10;
+	const c01 = F.m00 * F.m01 + F.m10 * F.m11;
+	const c11 = F.m01 * F.m01 + F.m11 * F.m11;
+	const radius = Math.hypot(c00 - c11, 2 * c01);
+	const sigma1 = Math.sqrt(Math.max(0, (c00 + c11 + radius) * 0.5));
+	const determinantF = determinant(F);
+	const sigma2 = determinantF / sigma1;
+	if (
+		!Number.isFinite(sigma1) ||
+		!Number.isFinite(sigma2) ||
+		sigma1 <= 0 ||
+		sigma2 <= 0
+	) {
+		throw new RangeError('snow deformation cannot be decomposed into finite positive stretches');
+	}
+
+	const angle = 0.5 * Math.atan2(2 * c01, c00 - c11);
+	const cosine = Math.cos(angle);
+	const sine = Math.sin(angle);
+	const v1 = { x: cosine, y: sine };
+	const v2 = { x: -sine, y: cosine };
+	const u1 = {
+		x: (F.m00 * v1.x + F.m01 * v1.y) / sigma1,
+		y: (F.m10 * v1.x + F.m11 * v1.y) / sigma1
+	};
+	const u2 = {
+		x: (F.m00 * v2.x + F.m01 * v2.y) / sigma2,
+		y: (F.m10 * v2.x + F.m11 * v2.y) / sigma2
+	};
+	const rotation: MpmMatrix2 = {
+		m00: u1.x * v1.x + u2.x * v2.x,
+		m01: u1.x * v1.y + u2.x * v2.y,
+		m10: u1.y * v1.x + u2.y * v2.x,
+		m11: u1.y * v1.y + u2.y * v2.y
+	};
+	assertComputedMatrixFinite(rotation, 'snow polar rotation');
+	return { sigma1, sigma2, u1, u2, v1, v2, rotation };
 }
 
 function transposeMatrix(matrix: MpmMatrix2): MpmMatrix2 {

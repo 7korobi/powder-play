@@ -3,18 +3,20 @@
 更新日: 2026-10-12
 
 状態: Gate 0 の GPU 操作ラボはユーザーから稼働確認の報告あり。Gate 1 の CPU 数値
-reference と単一材料 GPU MLS-MPM kernel を実装済みだが、実機での shader compile と
-数値検証は未完了。Gate 2 の GPU 選択・局所力ドラッグ・オブジェクト複製は
-`/labs/mpm/kernels` に統合し、ユーザーから基本操作の動作確認あり。長時間操作、容量境界、
-readback、30 fps の確認は残る。既存の β v0.2 は維持する。
+reference と GPU MLS-MPM kernel は実装済みだが、実機での shader compile と数値検証は未完了。
+Gate 2 の GPU 選択・局所力ドラッグ・オブジェクト複製は `/labs/mpm/kernels` に統合し、
+ユーザーから基本操作の動作確認あり。Gate 3 は粒子ごとの Neo-Hookean / Snow 型弾塑性モデルと
+混在シーンをコード実装した段階。Gate 1〜3の GPU 実機受け入れ、Gate 4の液体・粉体、Gate 5の
+持続性能と製品統合が残る。既存の β v0.2 は維持する。
 
 ## 現在の実装状況
 
 - **Gate 0**: `/labs/mpm` に GPU 粒子描画、要求時ピッキング、ドラッグ、複製を実装。粒子位置・速度は GPU buffer を正本とし、毎フレーム全量 readback はしない。ユーザーからラボが動作したとの報告あり。長時間・性能測定は未確認。
-- **Gate 1**: `src/lib/mpm/reference/` に CPU 上の単一材料・Neo-Hookean 弾性 MLS-MPM 1 step、`src/lib/mpm/kernels/` に GPU 上の P2G / grid update / G2P と GPU 描画を実装。`/labs/mpm/kernels` で初回 step の CPU reference 比較を行う。GPU shader compile・数値差・挙動は実機未確認。
+- **Gate 1**: `src/lib/mpm/reference/` にCPU reference、`src/lib/mpm/kernels/` にGPU上のP2G / grid update / G2PとGPU描画を実装。`/labs/mpm/kernels` で初回stepのCPU reference比較を行う。Neo-Hookeanの基準シーンを含む。GPU shader compile・数値差・挙動は実機未確認。
 - **Gate 2**: `/labs/mpm/kernels` に Gate 0 の操作を統合する。選択時だけ16 byteのGPU結果を読み戻し、ドラッグはgrid上の減衰付き局所力、複製は連続した `objectId` 範囲をGPU内でコピーする。粒子と ID buffer は初期化時に固定容量を確保し、容量超過は明示的に拒否する。基本操作はユーザー確認済み。長時間操作、容量境界、readback、数値安定性、性能は未確認。
-- **未実装**: 液体モデル、ゼリー・塑性、水・油界面、粉体。
-- **未確認**: Gate 1 のGPU shader compile・数値検証、Gate 2 の長時間・容量境界・readback・性能試験。
+- **Gate 3**: 粒子単位でNeo-HookeanとSnow型2D弾塑性モデルを選べる。Snow型は主伸長の降伏射影と塑性体積履歴を持ち、両モデルを同一のGPU粒子配列に置ける。柔らかいNeo-HookeanクラスターとSnowクラスターを操作する画面を追加。CPU referenceとlayoutテストは実装済み。GPU実機shader compile、混在時の数値比較、繰返し塑性負荷、視覚・操作確認は未完了。
+- **未実装**: 液体モデル、水・油界面、粉体モデル、明示的な材料間接触・摩擦。
+- **未確認**: Gate 1〜3のGPU実機shader compile・数値検証、Gate 2/3の長時間・容量境界・readback・性能試験。
 - **統合方針**: 実験画面は `/labs/mpm` に隔離し、通常画面 `/` の β v0.2 と既存のクラッシュ対策を置き換えない。
 
 ## 1. 目的と前提
@@ -122,6 +124,16 @@ MLS-MPM の完全な実装より先に行う。合成粒子データを GPU buff
 - 物体 ID の選択、ドラッグ、複製を確認する。
 - 液体・ゼリー・塑性物体を同一の粒子配列に置いたときの境界と安定性を検証する。
 - ここでは剛体衝突、破砕、液体との濡れまで一度に実装しない。追加ごとに独立したシーンとテストを作る。
+
+**コード実装**: 粒子ごとの材料指定と、柔らかいNeo-Hookean弾性クラスター、Snow型
+弾塑性クラスターを同一粒子配列で計算するPoCを追加した。Snow型は2D極分解による回転応答、
+主伸長の降伏射影、塑性体積 `Jp` の更新・硬化を行う。GPU複製はこの材料状態を含めて複製する。
+これはGate 3の実装途中であり、実機合格ではない。液体はまだ混在できず、材料間の明示的接触や
+摩擦もない。
+
+**次の受け入れ確認**: GPU shader compileとCPU/GPU 1-step誤差、弾性体と塑性体が共有grid上で
+安定して動くこと、繰返し押し込み後の `Jp` と変形、複製後に材料モデル・`Jp`・`objectId` が
+維持されることをWebGPU実機で確認する。受け入れ後にGate 4へ進む。
 
 ### Gate 4 — 水・油・粉の混在
 

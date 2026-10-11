@@ -7,9 +7,11 @@ kernels; it is not a GPU MLS-MPM implementation or the Gate-0 interaction demo.
 ## State and units
 
 Each particle supplies `position`, `velocity`, its affine velocity matrix `C`,
-and deformation gradient `F`. All particles use the one `particleMass`,
-`particleVolume`, and `material` in the step config; no material IDs, per-particle
-mass inference, or missing-value defaults are used.
+and deformation gradient `F`. All particles use the one `particleMass` and
+`particleVolume` in the step config. `material` in the step config is the
+default; a particle may override it with its own Lamé parameters and
+constitutive model. Missing particle material uses the configured default.
+`objectId` remains independent of the constitutive model.
 
 `position`, `grid.cellSize`, and the domain extents use the same length unit;
 velocity is length/time, `dt` is time, gravity is length/time², mass is mass,
@@ -56,17 +58,31 @@ x_p' = x_p + dt * v_p'
 F_p' = (I + dt * C_p') * F_p
 ```
 
-The only constitutive law is compressible 2D Neo-Hookean elasticity:
+The default constitutive law is compressible 2D Neo-Hookean elasticity:
 
 ```text
 J = det(F) > 0
 P = mu * (F - F^(-T)) + lambda * log(J) * F^(-T)
 ```
 
-`lambda` must be non-negative and `mu` positive. This is a 2D plane model with
-no out-of-plane response, plasticity, damage, damping, or particle contact.
-Invalid or inverted input `F`, and a step that would invert `F`, are rejected;
-the solver does not clamp or repair deformation.
+`lambda` must be non-negative and `mu` positive. Invalid or inverted input
+`F`, and a step that would invert `F`, are rejected.
+
+Particles may instead select the 2D Snow-style corotated elastoplastic model.
+Its hardening is `exp(clamp(10 * (1 - Jp), -20, 20))`, applied to both Lamé
+parameters, and its stress-times-transpose is
+
+```text
+2 * mu_h * (F - R) * F^T + lambda_h * J * (J - 1) * I
+```
+
+After each G2P update, the two principal stretches are clamped to
+`[1 - 0.025, 1 + 0.0075]`. The plastic-volume history is updated by the ratio
+of trial to projected deformation determinant and clamped to `[0.6, 20]`.
+This is a compact elastoplastic PoC, not a calibrated snow, granular, or
+powder model. Neo-Hookean and Snow particles may coexist in one grid; they do
+not yet have explicit particle contact, friction, damage, liquid behavior, or
+an interface model.
 
 ## Numerical limits
 
@@ -80,8 +96,9 @@ dt / cellSize * sqrt((lambda + 2 * mu) / (particleMass / particleVolume)) << 1
 
 Also keep particle travel per step small relative to `cellSize`, especially near
 walls. There is no automatic substepping or CFL selection; large steps can
-produce inaccurate motion or an inverted deformation gradient and will not be
-silently corrected.
+produce inaccurate motion or an inverted deformation gradient. The Snow model
+only projects principal stretches after G2P; it does not silently repair an
+invalid input deformation.
 
 The deterministic tests use absolute tolerances of `1e-12` for mass and
 `1e-10` for momentum in the selected interior, zero-gravity case. These are

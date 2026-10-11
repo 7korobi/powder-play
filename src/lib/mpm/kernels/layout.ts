@@ -1,8 +1,13 @@
 import type {
+	MpmMaterialParameters,
 	MpmParticle,
 	MpmStepConfig,
 	MpmVector2
 } from '../reference/solver.js';
+import {
+	normalizeMpmConstitutiveModel,
+	SNOW_PLASTICITY
+} from '../materials.js';
 
 export type MpmMlsGpuConfig = Omit<MpmStepConfig, 'dt' | 'gravity'> & {
 	readonly capacity?: number;
@@ -57,7 +62,7 @@ export interface ValidatedMpmMlsGpuInput {
 	readonly gradientScaleF32: number;
 }
 
-export const PARTICLE_FLOATS = 12;
+export const PARTICLE_FLOATS = 16;
 export const PARTICLE_STRIDE_BYTES = PARTICLE_FLOATS * Float32Array.BYTES_PER_ELEMENT;
 export const OBJECT_ID_STRIDE_BYTES = Uint32Array.BYTES_PER_ELEMENT;
 export const SIMULATION_PARAMS_BYTES = 80;
@@ -75,15 +80,15 @@ export function validateMpmMlsGpuInput(
 ): ValidatedMpmMlsGpuInput {
 	const rawConfig = assertRecord(config, 'config');
 	const rawGrid = assertRecord(rawConfig.grid, 'grid');
-	const rawMaterial = assertRecord(rawConfig.material, 'material');
+	const material = validateMaterial(rawConfig.material, 'material');
 
 	const cellsX = finiteNumber(rawGrid.cellsX, 'grid.cellsX');
 	const cellsY = finiteNumber(rawGrid.cellsY, 'grid.cellsY');
 	const cellSize = finiteNumber(rawGrid.cellSize, 'grid.cellSize');
 	const particleMass = finiteNumber(rawConfig.particleMass, 'particleMass');
 	const particleVolume = finiteNumber(rawConfig.particleVolume, 'particleVolume');
-	const lambda = finiteNumber(rawMaterial.lambda, 'material.lambda');
-	const mu = finiteNumber(rawMaterial.mu, 'material.mu');
+	const lambda = material.lambda;
+	const mu = material.mu;
 
 	if (!Number.isSafeInteger(cellsX) || cellsX < 1 || cellsX + 3 > UINT32_MAX) {
 		throw new RangeError('grid.cellsX must be a positive safe integer that fits the GPU layout');
@@ -166,8 +171,10 @@ export function validateMpmMlsGpuInput(
 
 	let packedParticles: Float32Array;
 	let packedObjectIds: Uint32Array;
+	let packedParticleWords: Uint32Array;
 	try {
 		packedParticles = new Float32Array(particleCount * PARTICLE_FLOATS);
+		packedParticleWords = new Uint32Array(packedParticles.buffer);
 		packedObjectIds = new Uint32Array(particleCount);
 	} catch (cause) {
 		throw new RangeError('initial particle state exceeds the supported typed-array size', {
@@ -184,6 +191,22 @@ export function validateMpmMlsGpuInput(
 		const velocity = readVector(rawParticle.velocity, `particles[${index}].velocity`);
 		const C = readMatrix(rawParticle.C, `particles[${index}].C`);
 		const F = readMatrix(rawParticle.F, `particles[${index}].F`);
+		const particleMaterial =
+			rawParticle.material === undefined
+				? material
+				: validateMaterial(rawParticle.material, `particles[${index}].material`);
+		const plasticVolume =
+			rawParticle.plasticVolume === undefined
+				? 1
+				: finiteNumber(rawParticle.plasticVolume, `particles[${index}].plasticVolume`);
+		if (
+			plasticVolume < SNOW_PLASTICITY.minPlasticVolume ||
+			plasticVolume > SNOW_PLASTICITY.maxPlasticVolume
+		) {
+			throw new RangeError(
+				`particles[${index}].plasticVolume must be between ${SNOW_PLASTICITY.minPlasticVolume} and ${SNOW_PLASTICITY.maxPlasticVolume}`
+			);
+		}
 
 		if (
 			position.x < 0 ||
@@ -213,7 +236,11 @@ export function validateMpmMlsGpuInput(
 			finiteFloat32(F.m00, `particles[${index}].F.m00`),
 			finiteFloat32(F.m01, `particles[${index}].F.m01`),
 			finiteFloat32(F.m10, `particles[${index}].F.m10`),
-			finiteFloat32(F.m11, `particles[${index}].F.m11`)
+			finiteFloat32(F.m11, `particles[${index}].F.m11`),
+			finiteFloat32(plasticVolume, `particles[${index}].plasticVolume`, true),
+			0,
+			finiteFloat32(particleMaterial.lambda, `particles[${index}].material.lambda`),
+			finiteFloat32(particleMaterial.mu, `particles[${index}].material.mu`, true)
 		];
 
 		const packedDeterminant = Math.fround(
@@ -236,6 +263,8 @@ export function validateMpmMlsGpuInput(
 			);
 		}
 		packedParticles.set(packed, offset);
+		packedParticleWords[offset + 13] =
+			particleMaterial.model === 'snow' ? 1 : 0;
 		packedObjectIds[index] = objectId;
 
 		const currentRange = objectRanges.at(-1);
@@ -260,7 +289,7 @@ export function validateMpmMlsGpuInput(
 			grid: { cellsX, cellsY, cellSize },
 			particleMass,
 			particleVolume,
-			material: { lambda, mu },
+			material,
 			capacity: particleCapacity
 		},
 		particleCount,
@@ -486,6 +515,21 @@ function validateObjectId(value: unknown, name: string): number {
 		throw new RangeError(`${name} must be an unsigned 32-bit integer`);
 	}
 	return value;
+}
+
+function validateMaterial(value: unknown, name: string): MpmMaterialParameters {
+	const record = assertRecord(value, name);
+	const lambda = finiteNumber(record.lambda, `${name}.lambda`);
+	const mu = finiteNumber(record.mu, `${name}.mu`);
+	const model = normalizeMpmConstitutiveModel(record.model, `${name}.model`);
+	if (lambda < 0) throw new RangeError(`${name}.lambda must be non-negative`);
+	if (mu <= 0) throw new RangeError(`${name}.mu must be greater than zero`);
+	if (!Number.isFinite(lambda + 2 * mu)) {
+		throw new RangeError(`${name} parameters are outside the supported numeric range`);
+	}
+	finiteFloat32(lambda, `${name}.lambda`);
+	finiteFloat32(mu, `${name}.mu`, true);
+	return { lambda, mu, model };
 }
 
 function readVector(value: unknown, name: string): MpmVector2 {

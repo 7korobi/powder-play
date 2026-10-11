@@ -54,6 +54,9 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			0, 0, 0, 0,
 			1, 0, 0, 1
 		]);
+		expect(state.packedParticles[12]).toBe(1);
+		expect(new Uint32Array(state.packedParticles.buffer)[13]).toBe(0);
+		expect(Array.from(state.packedParticles.slice(14, 16))).toEqual([20, 10]);
 		expect(state.particleCount).toBe(2);
 		expect(state.particleCapacity).toBe(2);
 		expect(Array.from(state.packedObjectIds)).toEqual([0, 0]);
@@ -73,13 +76,13 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			nodeCount: 209,
 			pairCount: 9,
 			particleCapacity: 1,
-			particleStateBytes: 48,
-			particleBufferBytes: 48,
+			particleStateBytes: 64,
+			particleBufferBytes: 64,
 			objectIdBufferBytes: 4,
 			bucketHeadBytes: 836,
 			bucketNextBytes: 36,
 			gridStateBytes: 5016,
-			readbackBytes: 56
+			readbackBytes: 72
 		});
 	});
 
@@ -89,7 +92,7 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 
 		expect(layout.particleCapacity).toBe(0);
 		expect(layout.particleStateBytes).toBe(0);
-		expect(layout.particleBufferBytes).toBe(48);
+		expect(layout.particleBufferBytes).toBe(64);
 		expect(layout.bucketNextBytes).toBe(4);
 		expect(layout.objectIdBufferBytes).toBe(4);
 		expect(layout.readbackBytes).toBe(8);
@@ -108,11 +111,35 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(Array.from(state.packedObjectIds)).toEqual([7, 7]);
 		expect(state.objectRanges).toEqual([{ objectId: 7, start: 0, count: 2 }]);
 		expect(layout.pairCount).toBe(36);
-		expect(layout.particleStateBytes).toBe(96);
-		expect(layout.particleBufferBytes).toBe(192);
+		expect(layout.particleStateBytes).toBe(128);
+		expect(layout.particleBufferBytes).toBe(256);
 		expect(layout.objectIdBufferBytes).toBe(16);
 		expect(layout.bucketNextBytes).toBe(144);
-		expect(layout.readbackBytes).toBe(212);
+		expect(layout.readbackBytes).toBe(276);
+	});
+
+	it('packs each particle material and snow plastic history with the GPU layout', () => {
+		const particles = [
+			makeParticle({
+				objectId: 3,
+				plasticVolume: 0.82,
+				material: { lambda: 36, mu: 18, model: 'snow' }
+			}),
+			makeParticle({
+				position: { x: 9, y: 4 },
+				objectId: 3,
+				material: { lambda: 24, mu: 12, model: 'neo-hookean' }
+			})
+		];
+		const state = validateMpmMlsGpuInput(particles, makeConfig());
+		const words = new Uint32Array(state.packedParticles.buffer);
+
+		expect(state.packedParticles[12]).toBe(Math.fround(0.82));
+		expect(words[13]).toBe(1);
+		expect(Array.from(state.packedParticles.slice(14, 16))).toEqual([36, 18]);
+		expect(state.packedParticles[28]).toBe(1);
+		expect(words[29]).toBe(0);
+		expect(Array.from(state.packedParticles.slice(30, 32))).toEqual([24, 12]);
 	});
 
 	it('rejects invalid physical parameters and particle states rather than repairing them', () => {
@@ -152,6 +179,18 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 				makeConfig()
 			)
 		).toThrow(/underflows/);
+		expect(() =>
+			validateMpmMlsGpuInput(
+				[makeParticle({ plasticVolume: 0 })],
+				makeConfig()
+			)
+		).toThrow(/plasticVolume/);
+		expect(() =>
+			validateMpmMlsGpuInput(
+				[makeParticle({ material: { lambda: 20, mu: 10, model: 'liquid' as 'neo-hookean' } })],
+				makeConfig()
+			)
+		).toThrow(/model/);
 		expect(() => validateMpmMlsGpuInput([], makeConfig({ capacity: 0 }))).toThrow(
 			/capacity/
 		);

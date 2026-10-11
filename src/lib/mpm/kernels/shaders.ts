@@ -4,6 +4,10 @@ struct Particle {
 	velocity: vec2<f32>,
 	c: vec4<f32>,
 	f: vec4<f32>,
+	plasticVolume: f32,
+	materialModel: u32,
+	lambda: f32,
+	mu: f32,
 }
 
 struct GridNode {
@@ -55,6 +59,20 @@ const ERROR_DEFORMATION: u32 = 2u;
 const ERROR_P2G: u32 = 4u;
 const ERROR_GRID: u32 = 8u;
 const ERROR_G2P: u32 = 16u;
+const SNOW_COMPRESSION_YIELD: f32 = 0.025;
+const SNOW_STRETCH_YIELD: f32 = 0.0075;
+const SNOW_HARDENING: f32 = 10.0;
+const SNOW_MIN_PLASTIC_VOLUME: f32 = 0.6;
+const SNOW_MAX_PLASTIC_VOLUME: f32 = 20.0;
+const SNOW_MAX_HARDENING_EXPONENT: f32 = 20.0;
+
+struct Decomposition2 {
+	sigma: vec2<f32>,
+	u0: vec2<f32>,
+	u1: vec2<f32>,
+	v0: vec2<f32>,
+	v1: vec2<f32>,
+}
 
 fn finiteFloat(value: f32) -> bool {
 	return (bitcast<u32>(value) & 0x7f800000u) != 0x7f800000u;
@@ -69,6 +87,59 @@ fn finiteVec4(value: vec4<f32>) -> bool {
 		finiteFloat(value.y) &&
 		finiteFloat(value.z) &&
 		finiteFloat(value.w);
+}
+
+fn decompose2x2(matrix: vec4<f32>) -> Decomposition2 {
+	let c00 = matrix.x * matrix.x + matrix.z * matrix.z;
+	let c01 = matrix.x * matrix.y + matrix.z * matrix.w;
+	let c11 = matrix.y * matrix.y + matrix.w * matrix.w;
+	let radius = sqrt((c00 - c11) * (c00 - c11) + 4.0 * c01 * c01);
+	let sigma0 = sqrt(max(0.0, 0.5 * (c00 + c11 + radius)));
+	let determinant = matrix.x * matrix.w - matrix.y * matrix.z;
+	let sigma1 = determinant / max(sigma0, 1.0e-30);
+	let angle = 0.5 * atan2(2.0 * c01, c00 - c11);
+	let cosine = cos(angle);
+	let sine = sin(angle);
+	let v0 = vec2<f32>(cosine, sine);
+	let v1 = vec2<f32>(-sine, cosine);
+	let u0 = vec2<f32>(
+		(matrix.x * v0.x + matrix.y * v0.y) / max(sigma0, 1.0e-30),
+		(matrix.z * v0.x + matrix.w * v0.y) / max(sigma0, 1.0e-30),
+	);
+	let u1 = vec2<f32>(
+		(matrix.x * v1.x + matrix.y * v1.y) / max(sigma1, 1.0e-30),
+		(matrix.z * v1.x + matrix.w * v1.y) / max(sigma1, 1.0e-30),
+	);
+	return Decomposition2(vec2<f32>(sigma0, sigma1), u0, u1, v0, v1);
+}
+
+fn polarRotation(decomposition: Decomposition2) -> vec4<f32> {
+	return vec4<f32>(
+		decomposition.u0.x * decomposition.v0.x +
+			decomposition.u1.x * decomposition.v1.x,
+		decomposition.u0.x * decomposition.v0.y +
+			decomposition.u1.x * decomposition.v1.y,
+		decomposition.u0.y * decomposition.v0.x +
+			decomposition.u1.y * decomposition.v1.x,
+		decomposition.u0.y * decomposition.v0.y +
+			decomposition.u1.y * decomposition.v1.y,
+	);
+}
+
+fn reconstructDeformation(
+	decomposition: Decomposition2,
+	sigma: vec2<f32>,
+) -> vec4<f32> {
+	return vec4<f32>(
+		sigma.x * decomposition.u0.x * decomposition.v0.x +
+			sigma.y * decomposition.u1.x * decomposition.v1.x,
+		sigma.x * decomposition.u0.x * decomposition.v0.y +
+			sigma.y * decomposition.u1.x * decomposition.v1.y,
+		sigma.x * decomposition.u0.y * decomposition.v0.x +
+			sigma.y * decomposition.u1.y * decomposition.v1.x,
+		sigma.x * decomposition.u0.y * decomposition.v0.y +
+			sigma.y * decomposition.u1.y * decomposition.v1.y,
+	);
 }
 
 fn quadraticWeights(fraction: f32) -> vec3<f32> {
@@ -215,20 +286,62 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			atomicOr(&stateError[0], ERROR_DEFORMATION);
 			return;
 		}
-		let inverseTranspose =
-			vec4<f32>(particle.f.w, -particle.f.z, -particle.f.y, particle.f.x) /
-			determinant;
-		let logVolumeChange = log(determinant);
-		let pressure = params.material.x * logVolumeChange;
-		let firstPiola =
-			params.material.y * (particle.f - inverseTranspose) +
-			pressure * inverseTranspose;
-		let stressTimesFt = vec4<f32>(
-			firstPiola.x * particle.f.x + firstPiola.y * particle.f.y,
-			firstPiola.x * particle.f.z + firstPiola.y * particle.f.w,
-			firstPiola.z * particle.f.x + firstPiola.w * particle.f.y,
-			firstPiola.z * particle.f.z + firstPiola.w * particle.f.w,
-		);
+		var stressTimesFt = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+		if (particle.materialModel == 0u) {
+			let inverseTranspose =
+				vec4<f32>(particle.f.w, -particle.f.z, -particle.f.y, particle.f.x) /
+				determinant;
+			let pressure = particle.lambda * log(determinant);
+			let firstPiola =
+				particle.mu * (particle.f - inverseTranspose) +
+				pressure * inverseTranspose;
+			stressTimesFt = vec4<f32>(
+				firstPiola.x * particle.f.x + firstPiola.y * particle.f.y,
+				firstPiola.x * particle.f.z + firstPiola.y * particle.f.w,
+				firstPiola.z * particle.f.x + firstPiola.w * particle.f.y,
+				firstPiola.z * particle.f.z + firstPiola.w * particle.f.w,
+			);
+		} else if (particle.materialModel == 1u) {
+			if (
+				!finiteFloat(particle.plasticVolume) ||
+				particle.plasticVolume < SNOW_MIN_PLASTIC_VOLUME ||
+				particle.plasticVolume > SNOW_MAX_PLASTIC_VOLUME
+			) {
+				atomicOr(&stateError[0], ERROR_P2G);
+				return;
+			}
+			let decomposition = decompose2x2(particle.f);
+			if (
+				!finiteVec2(decomposition.sigma) ||
+				any(decomposition.sigma <= vec2<f32>(0.0))
+			) {
+				atomicOr(&stateError[0], ERROR_P2G);
+				return;
+			}
+			let rotation = polarRotation(decomposition);
+			let hardeningExponent = clamp(
+				SNOW_HARDENING * (1.0 - particle.plasticVolume),
+				-SNOW_MAX_HARDENING_EXPONENT,
+				SNOW_MAX_HARDENING_EXPONENT,
+			);
+			let hardening = exp(hardeningExponent);
+			let mu = particle.mu * hardening;
+			let lambda = particle.lambda * hardening;
+			let difference = particle.f - rotation;
+			let shear = 2.0 * mu;
+			let volumetric = lambda * determinant * (determinant - 1.0);
+			stressTimesFt = vec4<f32>(
+				shear * (difference.x * particle.f.x + difference.y * particle.f.y) +
+					volumetric,
+				shear * (difference.x * particle.f.z + difference.y * particle.f.w),
+				shear * (difference.z * particle.f.x + difference.w * particle.f.y),
+				shear * (difference.z * particle.f.z + difference.w * particle.f.w) +
+					volumetric,
+			);
+		} else {
+			atomicOr(&stateError[0], ERROR_P2G);
+			return;
+		}
 		let affine =
 			params.physical.y * particle.c +
 			params.material.z * stressTimesFt;
@@ -245,8 +358,6 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		if (
 			!finiteFloat(weight) ||
 			weight < 0.0 ||
-			!finiteVec4(inverseTranspose) ||
-			!finiteVec4(firstPiola) ||
 			!finiteVec4(stressTimesFt) ||
 			!finiteVec4(affine) ||
 			!finiteVec2(dpos) ||
@@ -425,7 +536,7 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		dt * updatedC.z,
 		1.0 + dt * updatedC.w,
 	);
-	let updatedF = vec4<f32>(
+	let trialF = vec4<f32>(
 		deformationUpdate.x * particle.f.x +
 			deformationUpdate.y * particle.f.z,
 		deformationUpdate.x * particle.f.y +
@@ -436,13 +547,55 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			deformationUpdate.w * particle.f.w,
 	);
 	let updatedPosition = particle.position + dt * velocity;
-	let updatedDeterminant =
-		updatedF.x * updatedF.w - updatedF.y * updatedF.z;
+	var updatedF = trialF;
+	var updatedPlasticVolume = particle.plasticVolume;
+	let trialDeterminant = trialF.x * trialF.w - trialF.y * trialF.z;
 	if (
 		!finiteVec2(velocity) ||
 		!finiteVec4(updatedC) ||
-		!finiteVec4(updatedF) ||
+		!finiteVec4(trialF) ||
 		!finiteVec2(updatedPosition)
+	) {
+		atomicOr(&stateError[0], ERROR_G2P);
+		return;
+	}
+	if (!finiteFloat(trialDeterminant) || trialDeterminant <= 0.0) {
+		atomicOr(&stateError[0], ERROR_DEFORMATION);
+		return;
+	}
+	if (particle.materialModel == 1u) {
+		let decomposition = decompose2x2(trialF);
+		if (
+			!finiteVec2(decomposition.sigma) ||
+			any(decomposition.sigma <= vec2<f32>(0.0))
+		) {
+			atomicOr(&stateError[0], ERROR_G2P);
+			return;
+		}
+		let minimumStretch = 1.0 - SNOW_COMPRESSION_YIELD;
+		let maximumStretch = 1.0 + SNOW_STRETCH_YIELD;
+		let projectedSigma = clamp(
+			decomposition.sigma,
+			vec2<f32>(minimumStretch),
+			vec2<f32>(maximumStretch),
+		);
+		let projectedDeterminant = projectedSigma.x * projectedSigma.y;
+		updatedPlasticVolume = clamp(
+			particle.plasticVolume * trialDeterminant / projectedDeterminant,
+			SNOW_MIN_PLASTIC_VOLUME,
+			SNOW_MAX_PLASTIC_VOLUME,
+		);
+		updatedF = reconstructDeformation(decomposition, projectedSigma);
+	} else if (particle.materialModel != 0u) {
+		atomicOr(&stateError[0], ERROR_G2P);
+		return;
+	}
+	let updatedDeterminant = updatedF.x * updatedF.w - updatedF.y * updatedF.z;
+	if (
+		!finiteVec4(updatedF) ||
+		!finiteFloat(updatedPlasticVolume) ||
+		updatedPlasticVolume < SNOW_MIN_PLASTIC_VOLUME ||
+		updatedPlasticVolume > SNOW_MAX_PLASTIC_VOLUME
 	) {
 		atomicOr(&stateError[0], ERROR_G2P);
 		return;
@@ -462,11 +615,12 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		velocity.y,
 		params.gravityAndDomain.w,
 	);
-	var updatedParticle: Particle;
+	var updatedParticle = particle;
 	updatedParticle.position = vec2<f32>(boundedX.x, boundedY.x);
 	updatedParticle.velocity = vec2<f32>(boundedX.y, boundedY.y);
 	updatedParticle.c = updatedC;
 	updatedParticle.f = updatedF;
+	updatedParticle.plasticVolume = updatedPlasticVolume;
 	particlesOut[particleIndex] = updatedParticle;
 }
 
@@ -542,6 +696,10 @@ struct Particle {
 	velocity: vec2<f32>,
 	c: vec4<f32>,
 	f: vec4<f32>,
+	plasticVolume: f32,
+	materialModel: u32,
+	lambda: f32,
+	mu: f32,
 }
 
 struct RenderParams {
@@ -554,6 +712,7 @@ struct RenderParams {
 struct VertexOutput {
 	@builtin(position) position: vec4<f32>,
 	@location(0) localPosition: vec2<f32>,
+	@location(1) materialColor: vec3<f32>,
 }
 
 @vertex
@@ -580,6 +739,11 @@ fn vertexMain(
 	var output: VertexOutput;
 	output.position = vec4<f32>(clipPosition, 0.0, 1.0);
 	output.localPosition = local;
+	output.materialColor = select(
+		vec3<f32>(0.28, 0.78, 0.72),
+		vec3<f32>(0.98, 0.56, 0.28),
+		particle.materialModel == 1u,
+	);
 	return output;
 }
 
@@ -588,6 +752,6 @@ fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
 	if (dot(input.localPosition, input.localPosition) > 1.0) {
 		discard;
 	}
-	return vec4<f32>(0.92, 0.72, 0.38, 1.0);
+	return vec4<f32>(input.materialColor, 1.0);
 }
 `;

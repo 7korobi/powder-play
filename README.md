@@ -67,11 +67,13 @@ Android Chrome と iOS Safari のセンサー権限、複数指操作、画面�
 ## 実験中: GPU 粒子操作
 
 `/labs/mpm` は、合成粒子上でWebGPU操作を検証するGate 0の独立した実験画面です。
-`/labs/mpm/kernels` は、Gate 1の単一材料Neo-Hookean弾性MLS-MPMとGate 2のGPU選択・局所力
-ドラッグ・オブジェクト複製を検証します。いずれもWebGPU非対応のブラウザーでは利用できません。
+`/labs/mpm/kernels` は、Gate 1のMLS-MPM数値コア、Gate 2のGPU選択・局所力ドラッグ・
+オブジェクト複製、Gate 3のNeo-Hookean弾性体とSnow型弾塑性体の混在を検証します。
+いずれもWebGPU非対応のブラウザーでは利用できません。
 通常のアプリ画面 `/` は従来のシミュレーションを引き続き使用します。実装状況と次の判定ゲートは
 [2D GPU MLS-MPM ロードマップ](./docs/ROADMAP-MLS-MPM.md) を参照してください。
 
-Gate 2の基本操作はユーザーから動作確認の報告があります。ドラッグは水の物理モデルではなく
-grid上の局所力です。Gate 1のshader compileとCPU/GPU数値比較、Gate 2の長時間安定性・容量境界・
-30 fpsは別途検証が必要です。
+Gate 2の基本操作はユーザーから動作確認の報告があります。Gate 3の材料モデルは実装段階で、
+GPU実機でのshader compile・混在材料の数値比較・持続負荷は未確認です。ドラッグは水の
+物理モデルではなくgrid上の局所力です。Gate 1の数値検証、Gate 2の長時間安定性・容量境界・
+30 fps、Gate 4の水・油・粉体は別途検証・実装が必要です。

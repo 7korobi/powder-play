@@ -177,4 +177,117 @@ describe('CPU MLS-MPM reference', () => {
 		closeEnough(diagnostics.outputMomentum.x, initialMomentum.x, momentumTolerance);
 		closeEnough(diagnostics.outputMomentum.y, initialMomentum.y, momentumTolerance);
 	});
+
+	it('keeps Neo-Hookean and snow objects distinct in one particle array', () => {
+		const particles = [
+			makeParticle({
+				position: { x: 7.5, y: 8 },
+				objectId: 1,
+				material: { lambda: 20, mu: 10, model: 'neo-hookean' }
+			}),
+			makeParticle({
+				position: { x: 8.5, y: 8 },
+				F: { m00: 0.9, m01: 0, m10: 0, m11: 0.9 },
+				objectId: 2,
+				material: { lambda: 20, mu: 10, model: 'snow' }
+			})
+		];
+		const result = stepMpm(
+			particles,
+			makeConfig({ dt: 1e-9, gravity: { x: 0, y: 0 } })
+		);
+		const [elastic, plastic] = result.particles;
+
+		expect(elastic.objectId).toBe(1);
+		expect(elastic.material?.model).toBe('neo-hookean');
+		expect(elastic.plasticVolume).toBe(1);
+		expect(elastic.F.m00).toBeCloseTo(1, 5);
+		expect(plastic.objectId).toBe(2);
+		expect(plastic.material?.model).toBe('snow');
+		expect(plastic.F.m00).toBeCloseTo(0.975, 6);
+		expect(plastic.F.m11).toBeCloseTo(0.975, 6);
+		expect(plastic.plasticVolume).toBeCloseTo((0.9 * 0.9) / (0.975 * 0.975), 6);
+	});
+
+	it('projects rotated Snow stretches while preserving the principal rotation', () => {
+		const angle = 0.37;
+		const cosine = Math.cos(angle);
+		const sine = Math.sin(angle);
+		const result = stepMpm(
+			[
+				makeParticle({
+					position: { x: 8, y: 8 },
+					F: {
+						m00: cosine * 0.9,
+						m01: -sine * 1.1,
+						m10: sine * 0.9,
+						m11: cosine * 1.1
+					},
+					material: { lambda: 20, mu: 10, model: 'snow' }
+				})
+			],
+			makeConfig({ dt: 1e-9, gravity: { x: 0, y: 0 } })
+		);
+		const [particle] = result.particles;
+
+		expect(particle.F.m00).toBeCloseTo(cosine * 0.975, 6);
+		expect(particle.F.m01).toBeCloseTo(-sine * 1.0075, 6);
+		expect(particle.F.m10).toBeCloseTo(sine * 0.975, 6);
+		expect(particle.F.m11).toBeCloseTo(cosine * 1.0075, 6);
+	});
+
+	it('rejects unsupported per-particle constitutive models and plastic history', () => {
+		expect(() =>
+			stepMpm(
+				[
+					makeParticle({
+						material: { lambda: 20, mu: 10, model: 'unsupported' as 'snow' }
+					})
+				],
+				makeConfig()
+			)
+		).toThrow(/model/);
+		expect(() =>
+			stepMpm([makeParticle({ plasticVolume: 0 })], makeConfig())
+		).toThrow(/plasticVolume/);
+	});
+
+	it('keeps snow deformation and plastic history finite through repeated steps', () => {
+		let particles = [
+			makeParticle({
+				position: { x: 7.8, y: 8 },
+				F: { m00: 0.9, m01: 0, m10: 0, m11: 0.9 },
+				objectId: 4,
+				material: { lambda: 20, mu: 10, model: 'snow' }
+			}),
+			makeParticle({
+				position: { x: 8.2, y: 8 },
+				F: { m00: 0.9, m01: 0, m10: 0, m11: 0.9 },
+				objectId: 4,
+				material: { lambda: 20, mu: 10, model: 'snow' }
+			})
+		];
+		const config = makeConfig({
+			dt: 1e-5,
+			gravity: { x: 0, y: 0 }
+		});
+
+		for (let step = 0; step < 100; step += 1) {
+			particles = [...stepMpm(particles, config).particles];
+		}
+
+		for (const particle of particles) {
+			expect(particle.plasticVolume).toBeGreaterThanOrEqual(0.6);
+			expect(particle.plasticVolume).toBeLessThanOrEqual(20);
+			expect(particle.F.m00 * particle.F.m11 - particle.F.m01 * particle.F.m10)
+				.toBeGreaterThan(0);
+			expect([
+				particle.position.x,
+				particle.position.y,
+				particle.velocity.x,
+				particle.velocity.y,
+				particle.plasticVolume
+			].every(Number.isFinite)).toBe(true);
+		}
+	});
 });

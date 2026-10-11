@@ -25,7 +25,9 @@
 	const CLONE_OFFSET: MpmVector2 = { x: 72, y: 0 };
 	const PARTICLE_MASS = 1;
 	const PARTICLE_VOLUME = 25;
-	const MATERIAL = { lambda: 20, mu: 10 } as const;
+	const MATERIAL = { lambda: 20, mu: 10, model: 'neo-hookean' } as const;
+	const ELASTIC_MATERIAL = { lambda: 8, mu: 4, model: 'neo-hookean' } as const;
+	const SNOW_MATERIAL = { lambda: 20, mu: 10, model: 'snow' } as const;
 	const PARITY_TOLERANCE = 0.02;
 	const ZERO_MATRIX: MpmMatrix2 = { m00: 0, m01: 0, m10: 0, m11: 0 };
 	const INITIAL_DEFORMATION: MpmMatrix2 = {
@@ -41,15 +43,23 @@
 	function makeParticles(): MpmParticle[] {
 		const particles: MpmParticle[] = [];
 
-		for (let row = 0; row < 7; row += 1) {
-			for (let column = 0; column < 8; column += 1) {
-				particles.push({
-					position: { x: 160 + column * 8, y: 60 + row * 8 },
-					velocity: { x: 0, y: 0 },
-					C: ZERO_MATRIX,
-					F: INITIAL_DEFORMATION,
-					objectId: 1
-				});
+		const objects = [
+			{ objectId: 1, startX: 120, material: ELASTIC_MATERIAL },
+			{ objectId: 2, startX: 290, material: SNOW_MATERIAL }
+		] as const;
+		for (const object of objects) {
+			for (let row = 0; row < 5; row += 1) {
+				for (let column = 0; column < 6; column += 1) {
+					particles.push({
+						position: { x: object.startX + column * 8, y: 60 + row * 8 },
+						velocity: { x: 0, y: 0 },
+						C: ZERO_MATRIX,
+						F: INITIAL_DEFORMATION,
+						objectId: object.objectId,
+						plasticVolume: 1,
+						material: object.material
+					});
+				}
 			}
 		}
 
@@ -86,7 +96,11 @@
 			particle.F.m00,
 			particle.F.m01,
 			particle.F.m10,
-			particle.F.m11
+			particle.F.m11,
+			particle.plasticVolume ?? 1,
+			(particle.material ?? MATERIAL).model === 'snow' ? 1 : 0,
+			(particle.material ?? MATERIAL).lambda,
+			(particle.material ?? MATERIAL).mu
 		];
 	}
 
@@ -125,7 +139,7 @@
 	let stateCheckPending = $state(false);
 	let stateCheckMessage = $state('');
 	let stateCheckIsError = $state(false);
-	let particleCount = $state(56);
+	let particleCount = $state(60);
 	let particleCapacity = $state(GPU_PARTICLE_CAPACITY);
 	let selection = $state<MpmMlsGpuSelection | null>(null);
 	let interactionMessage = $state('初回の CPU/GPU 1 ステップ比較が完了すると操作できます。');
@@ -569,21 +583,21 @@
 />
 
 <svelte:head>
-	<title>GPU MLS-MPM 操作ラボ · powder-play</title>
+	<title>GPU MLS-MPM 材料・操作ラボ · powder-play</title>
 	<meta
 		name="description"
-		content="GPU MLS-MPM と CPU reference を比較した後に、GPU 粒子操作を検証します。"
+		content="混在する弾性・弾塑性 MLS-MPM を CPU reference と比較し、GPU 粒子操作を検証します。"
 	/>
 </svelte:head>
 
 <main class="lab">
 	<header class="header">
 		<div>
-			<p class="eyebrow">GATE 2 · INTERACTION INTEGRATION</p>
-			<h1>GPU 2D MLS-MPM 操作ラボ</h1>
+				<p class="eyebrow">GATE 3 · MIXED ELASTIC / PLASTIC MATERIALS</p>
+				<h1>GPU 2D MLS-MPM 材料ラボ</h1>
 			<p class="intro">
-				単一材料の弾性 MLS-MPM を GPU compute pass で実行し、初回の1ステップを CPU
-				reference と比較した後、粒子の選択・力ベースのドラッグ・複製を試します。
+					弾性体と弾塑性体を同じ粒子配列で計算します。初回の1ステップを CPU
+					reference と比較した後、それぞれの選択・力ベースのドラッグ・複製を試します。
 			</p>
 		</div>
 		<nav aria-label="実験ページ">
@@ -595,9 +609,9 @@
 	<section class="panel" aria-labelledby="simulation-title">
 		<div class="panel-heading">
 			<div>
-				<h2 id="simulation-title">弾性粒子クラスター</h2>
+				<h2 id="simulation-title">混在する弾性・弾塑性クラスター</h2>
 				<p>
-					{particleCount} / {particleCapacity} 粒子 · {GRID.cellsX} × {GRID.cellsY} grid · Neo-Hookean
+					{particleCount} / {particleCapacity} 粒子 · {GRID.cellsX} × {GRID.cellsY} grid
 				</p>
 			</div>
 			<p class="status" class:error={phase === 'error' || phase === 'lost'} role="status">
@@ -609,7 +623,7 @@
 			<canvas
 				bind:this={canvas}
 				tabindex="0"
-				aria-label="GPU 上で計算する MLS-MPM 粒子シミュレーション"
+				aria-label="GPU 上で計算する Neo-Hookean 弾性体と Snow 弾塑性体の MLS-MPM シミュレーション"
 				aria-describedby="interaction-instructions interaction-status"
 				onpointerdown={handlePointerDown}
 				onlostpointercapture={handlePointerCancel}
@@ -617,6 +631,13 @@
 				WebGPU canvas に対応したブラウザーが必要です。
 			</canvas>
 		</div>
+
+		<p class="material-legend">
+			<span><i class="elastic-swatch"></i> 柔らかい Neo-Hookean 弾性体</span>
+			<span><i class="snow-swatch"></i> Snow 型弾塑性体</span>
+			前者は剛性を下げたゼリー状のPoCです。Snow 型は主伸長を降伏範囲に射影し、塑性体積の履歴を保持します。
+			どちらも流体モデルではありません。
+		</p>
 
 		<div class="interaction-controls" aria-labelledby="interaction-title">
 			<h2 id="interaction-title">粒子操作</h2>
@@ -699,9 +720,10 @@
 	</section>
 
 	<aside class="note">
-		<strong>検証範囲:</strong> P2G・grid update・G2P の単一材料 Neo-Hookean 弾性モデルです。
-		objectId による粒子選択、有限半径の力ベースドラッグ、選択オブジェクトの複製を統合しています。液体の構成則、水・油の分離、複数材料は未実装です。粒子状態の GPU
-		readback は初回比較時と一時停止中の明示的な状態確認時だけ行い、通常の各フレームでは行いません。
+		<strong>検証範囲:</strong> P2G・grid update・G2PでNeo-Hookean弾性とSnow型弾塑性を粒子ごとに
+		計算します。objectIdによる選択・力ベースドラッグ・複製は材料履歴も保ったまま行います。
+		明示的な接触・摩擦、液体、水・油の分離、粉体、数値の長時間安定性は未実装または未検証です。
+		粒子状態のGPU readbackは初回比較時と一時停止中の明示的な状態確認時だけ行い、通常の各フレームでは行いません。
 	</aside>
 </main>
 
@@ -808,6 +830,38 @@
 		border: 1px solid #41576d;
 		border-radius: 0.55rem;
 		background: #07111b;
+	}
+
+	.material-legend {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.75rem 1rem;
+		margin: 0.75rem 0 0;
+		color: #b8c7d8;
+		font-size: 0.9rem;
+		line-height: 1.5;
+	}
+
+	.material-legend span {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+		color: #e8f1fa;
+	}
+
+	.material-legend i {
+		width: 0.75rem;
+		height: 0.75rem;
+		border-radius: 50%;
+	}
+
+	.elastic-swatch {
+		background: #48c7b5;
+	}
+
+	.snow-swatch {
+		background: #fa8f47;
 	}
 
 	canvas {

@@ -575,6 +575,7 @@ function createSolver(
 			if (flags !== 0) throw new MpmMlsGpuNumericalError(flags);
 			return unpackParticles(
 				new Float32Array(snapshot, 0, particleStateBytes / Float32Array.BYTES_PER_ELEMENT),
+				new Uint32Array(snapshot, 0, particleStateBytes / Uint32Array.BYTES_PER_ELEMENT),
 				particleCount,
 				new Uint32Array(snapshot, particleStateBytes, particleCount)
 			);
@@ -914,12 +915,17 @@ function createRenderParameters(state: ValidatedMpmMlsGpuInput): Float32Array {
 
 function unpackParticles(
 	values: Float32Array,
+	words: Uint32Array,
 	particleCount: number,
 	objectIds: Uint32Array
 ): readonly MpmParticle[] {
 	const particles: MpmParticle[] = [];
 	for (let index = 0; index < particleCount; index++) {
-		const offset = index * 12;
+		const offset = index * 16;
+		const materialModel = words[offset + 13];
+		if (materialModel > 1) {
+			throw new RangeError(`GPU returned an unsupported MPM material model ${materialModel}.`);
+		}
 		particles.push({
 			position: { x: values[offset], y: values[offset + 1] },
 			velocity: { x: values[offset + 2], y: values[offset + 3] },
@@ -934,6 +940,12 @@ function unpackParticles(
 				m01: values[offset + 9],
 				m10: values[offset + 10],
 				m11: values[offset + 11]
+			},
+			plasticVolume: values[offset + 12],
+			material: {
+				lambda: values[offset + 14],
+				mu: values[offset + 15],
+				model: materialModel === 1 ? 'snow' : 'neo-hookean'
 			},
 			objectId: objectIds[index]
 		});
