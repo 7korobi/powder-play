@@ -29,6 +29,20 @@ const NEIGHBORS: readonly Vector[] = [
 	{ x: 0, y: 1 },
 	{ x: -1, y: 0 }
 ];
+const PARTICLE_CONTACT_NEIGHBORS: readonly Vector[] = [
+	{ x: 0, y: -2 },
+	{ x: -1, y: -1 },
+	{ x: 0, y: -1 },
+	{ x: 1, y: -1 },
+	{ x: -2, y: 0 },
+	{ x: -1, y: 0 },
+	{ x: 1, y: 0 },
+	{ x: 2, y: 0 },
+	{ x: -1, y: 1 },
+	{ x: 0, y: 1 },
+	{ x: 1, y: 1 },
+	{ x: 0, y: 2 }
+];
 const DIRECTIONS: readonly Vector[] = [
 	{ x: 0, y: -1 },
 	{ x: 1, y: -1 },
@@ -39,8 +53,8 @@ const DIRECTIONS: readonly Vector[] = [
 	{ x: -1, y: 0 },
 	{ x: -1, y: -1 }
 ];
-const PACKING_RADIUS = 2;
-const PACKING_RESPONSE = 0.55;
+const PACKING_RADIUS = 4;
+const PACKING_RESPONSE = 0.72;
 
 export class SimulationWorld {
 	readonly cells: Uint8Array;
@@ -113,17 +127,25 @@ export function createInitialWorld(width: number, height: number): SimulationWor
 	const oilStart = waterStart - oilRows;
 	const powderStart = oilStart - powderRows;
 
-	for (let y = powderStart; y < oilStart; y++) {
-		world.cells.fill(MATERIAL.powder, y * width, (y + 1) * width);
-	}
-	for (let y = oilStart; y < waterStart; y++) {
-		world.cells.fill(MATERIAL.oil, y * width, (y + 1) * width);
-	}
-	for (let y = waterStart; y < height; y++) {
-		world.cells.fill(MATERIAL.water, y * width, (y + 1) * width);
-	}
+	fillQuarterDensityLayer(world, MATERIAL.powder, powderStart, oilStart);
+	fillQuarterDensityLayer(world, MATERIAL.oil, oilStart, waterStart);
+	fillQuarterDensityLayer(world, MATERIAL.water, waterStart, height);
 
 	return world;
+}
+
+function fillQuarterDensityLayer(
+	world: SimulationWorld,
+	material: number,
+	startY: number,
+	endY: number
+): void {
+	for (let y = startY; y < endY; y += 2) {
+		const xStep = y + 1 === endY ? 4 : 2;
+		for (let x = 0; x < world.width; x += xStep) {
+			world.cells[y * world.width + x] = material;
+		}
+	}
 }
 
 export function resampleWorld(world: SimulationWorld, width: number, height: number): SimulationWorld {
@@ -157,7 +179,7 @@ export function selectConnected(
 		const index = queue[cursor];
 		const x = index % world.width;
 		const y = Math.floor(index / world.width);
-		for (const neighbor of NEIGHBORS) {
+		for (const neighbor of PARTICLE_CONTACT_NEIGHBORS) {
 			const nextX = x + neighbor.x;
 			const nextY = y + neighbor.y;
 			if (!world.contains(nextX, nextY) || world.get(nextX, nextY) !== material) continue;

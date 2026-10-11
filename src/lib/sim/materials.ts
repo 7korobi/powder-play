@@ -53,9 +53,9 @@ export class MaterialRegistry {
 			plugin.particleRadius !== undefined &&
 			(!Number.isFinite(plugin.particleRadius) ||
 				plugin.particleRadius <= 0 ||
-				plugin.particleRadius > 0.5)
+				plugin.particleRadius > 1)
 		) {
-			throw new RangeError('Material particle radius must be greater than 0 and at most 0.5.');
+			throw new RangeError('Material particle radius must be greater than 0 and at most 1.');
 		}
 
 		this.definitions.set(plugin.id, Object.freeze({ ...plugin, color: [...plugin.color] as Rgba }));
@@ -96,8 +96,8 @@ export const materialRegistry = new MaterialRegistry([
 		phase: 'liquid',
 		density: 2,
 		color: [28, 111, 238, 26],
-		packingDensity: 0.68,
-		particleRadius: 0.45
+		packingDensity: 0.18,
+		particleRadius: 0.9
 	},
 	{
 		id: MATERIAL.powder,
@@ -105,8 +105,8 @@ export const materialRegistry = new MaterialRegistry([
 		phase: 'granular',
 		density: 1,
 		color: [210, 220, 230, 255],
-		packingDensity: 0.42,
-		particleRadius: 0.38
+		packingDensity: 0.11,
+		particleRadius: 0.76
 	},
 	{
 		id: MATERIAL.oil,
@@ -114,7 +114,7 @@ export const materialRegistry = new MaterialRegistry([
 		phase: 'liquid',
 		density: 1,
 		color: [224, 154, 46, 180],
-		packingDensity: 0.68,
-		particleRadius: 0.45
+		packingDensity: 0.18,
+		particleRadius: 0.9
 	}
 ]);

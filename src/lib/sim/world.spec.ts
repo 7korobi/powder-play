@@ -18,19 +18,25 @@ const defaultForces = {
 };
 
 describe('world initialization and movement', () => {
-	it('starts with 35% air, 40% water, 20% oil, and 5% powder in layers', () => {
+	it('starts with one quarter of each material layer populated by larger particles', () => {
 		const world = createInitialWorld(100, 100);
 		const counts = [0, 0, 0, 0];
 		for (const material of world.cells) counts[material]++;
 
-		expect(counts[MATERIAL.water]).toBe(4_000);
-		expect(counts[MATERIAL.oil]).toBe(2_000);
-		expect(counts[MATERIAL.powder]).toBe(500);
-		expect(counts[MATERIAL.air]).toBe(3_500);
+		expect(counts[MATERIAL.water]).toBe(1_000);
+		expect(counts[MATERIAL.oil]).toBe(500);
+		expect(counts[MATERIAL.powder]).toBe(125);
+		expect(counts[MATERIAL.air]).toBe(8_375);
 		expect(world.get(0, 34)).toBe(MATERIAL.air);
 		expect(world.get(0, 35)).toBe(MATERIAL.powder);
 		expect(world.get(0, 40)).toBe(MATERIAL.oil);
 		expect(world.get(0, 60)).toBe(MATERIAL.water);
+		expect(world.get(1, 60)).toBe(MATERIAL.air);
+		expect(materialRegistry.get(MATERIAL.water).particleRadius).toBe(0.9);
+		expect(materialRegistry.get(MATERIAL.oil).particleRadius).toBe(0.9);
+		expect(materialRegistry.get(MATERIAL.powder).particleRadius).toBe(0.76);
+		expect(materialRegistry.get(MATERIAL.water).packingDensity).toBe(0.18);
+		expect(materialRegistry.get(MATERIAL.powder).packingDensity).toBe(0.11);
 	});
 
 	it('lets powder fall through air but keeps it above water', () => {
@@ -234,7 +240,7 @@ describe('world initialization and movement', () => {
 });
 
 describe('selection and placement', () => {
-	it('selects only orthogonally connected particles and respects the cap', () => {
+	it('selects particles within contact range and respects the cap', () => {
 		const world = new SimulationWorld(5, 5);
 		world.set(1, 1, MATERIAL.powder);
 		world.set(2, 1, MATERIAL.powder);
@@ -245,6 +251,16 @@ describe('selection and placement', () => {
 		expect(selectConnected(world, 1, 1, 2)).toHaveLength(2);
 		expect(selectConnected(world, 4, 4)).toHaveLength(1);
 		expect(selectConnected(world, 0, 0)).toEqual([]);
+	});
+
+	it('treats particles two cells apart as touching', () => {
+		const world = new SimulationWorld(9, 9);
+		world.set(1, 1, MATERIAL.powder);
+		world.set(3, 1, MATERIAL.powder);
+		world.set(3, 3, MATERIAL.powder);
+		world.set(5, 3, MATERIAL.powder);
+
+		expect(selectConnected(world, 1, 1)).toHaveLength(4);
 	});
 
 	it('moves a selection atomically into empty cells and rejects collisions', () => {
