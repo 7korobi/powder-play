@@ -560,6 +560,11 @@
 						<a href="/labs/mpm/kernels">Gate 1 GPU MLS-MPM 実験</a>
 						で別途検証します。
 					</span>
+					<span>
+						Gate 0 の操作を統合した
+						<a href="/labs/mpm/kernels">Gate 2 GPU MLS-MPM 操作統合ラボ</a>
+						も利用できます。初回 CPU/GPU 比較後に粒子の選択・ドラッグ・複製を試せます。
+					</span>
 				</div>
 			</div>
 

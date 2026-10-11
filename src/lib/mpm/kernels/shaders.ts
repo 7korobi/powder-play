@@ -20,6 +20,21 @@ struct SimulationParams {
 	gravityAndDomain: vec4<f32>,
 }
 
+struct InteractionParams {
+	targetAndRadius: vec4<f32>,
+	force: vec4<f32>,
+}
+
+struct PickParams {
+	pointAndRadius: vec4<f32>,
+	countAndPadding: vec4<u32>,
+}
+
+struct CloneParams {
+	rangeAndObjectId: vec4<u32>,
+	offsetAndDomain: vec4<f32>,
+}
+
 @group(0) @binding(0) var<uniform> params: SimulationParams;
 @group(0) @binding(1) var<storage, read> particlesIn: array<Particle>;
 @group(0) @binding(2) var<storage, read_write> particlesOut: array<Particle>;
@@ -27,6 +42,13 @@ struct SimulationParams {
 @group(0) @binding(4) var<storage, read_write> bucketNext: array<i32>;
 @group(0) @binding(5) var<storage, read_write> gridNodes: array<GridNode>;
 @group(0) @binding(6) var<storage, read_write> stateError: array<atomic<u32>>;
+@group(0) @binding(7) var<uniform> interactionParams: InteractionParams;
+@group(0) @binding(8) var<storage, read> particleObjectIds: array<u32>;
+@group(0) @binding(9) var<uniform> pickParams: PickParams;
+@group(0) @binding(10) var<storage, read_write> pickResult: array<u32>;
+@group(0) @binding(11) var<storage, read_write> cloneParticles: array<Particle>;
+@group(0) @binding(12) var<storage, read_write> cloneObjectIds: array<u32>;
+@group(0) @binding(13) var<uniform> cloneParams: CloneParams;
 
 const ERROR_STENCIL: u32 = 1u;
 const ERROR_DEFORMATION: u32 = 2u;
@@ -294,6 +316,33 @@ fn updateGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
 
 	let nodeStorage = vec2<u32>(index % params.grid.z, index / params.grid.z);
 	let nodeCoordinate = vec2<i32>(i32(nodeStorage.x) - 1, i32(nodeStorage.y) - 1);
+	let dragRadius = interactionParams.targetAndRadius.z;
+	if (
+		dragRadius > 0.0 &&
+		nodeCoordinate.x >= 0 &&
+		nodeCoordinate.y >= 0 &&
+		nodeCoordinate.x <= i32(params.grid.x) &&
+		nodeCoordinate.y <= i32(params.grid.y)
+	) {
+		let nodePosition = vec2<f32>(nodeCoordinate) * params.physical.x;
+		let displacement = interactionParams.targetAndRadius.xy - nodePosition;
+		let distance = length(displacement);
+		if (distance < dragRadius) {
+			let falloff = 1.0 - distance / dragRadius;
+			let acceleration =
+				displacement * interactionParams.targetAndRadius.w -
+				velocity * interactionParams.force.x;
+			velocity = velocity + params.physical.w * falloff * acceleration;
+			let speed = length(velocity);
+			if (speed > 1200.0) {
+				velocity = velocity * (1200.0 / speed);
+			}
+		}
+	}
+	if (!finiteVec2(velocity)) {
+		atomicOr(&stateError[0], ERROR_GRID);
+		return;
+	}
 	if (
 		(nodeCoordinate.x <= 0 && velocity.x < 0.0) ||
 		(nodeCoordinate.x >= i32(params.grid.x) && velocity.x > 0.0)
@@ -430,6 +479,60 @@ fn commitParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	if (atomicLoad(&stateError[0]) != 0u) {
 		particlesOut[particleIndex] = particlesIn[particleIndex];
 	}
+}
+
+@compute @workgroup_size(1)
+fn pickParticle() {
+	let point = pickParams.pointAndRadius.xy;
+	let radiusSquared =
+		pickParams.pointAndRadius.z * pickParams.pointAndRadius.z;
+	var closestIndex = 0xffffffffu;
+	var closestDistance = radiusSquared;
+
+	for (var index = 0u; index < pickParams.countAndPadding.x; index = index + 1u) {
+		let position = particlesIn[index].position;
+		let offset = position - point;
+		let distanceSquared = dot(offset, offset);
+		if (
+			distanceSquared <= radiusSquared &&
+			(closestIndex == 0xffffffffu || distanceSquared < closestDistance)
+		) {
+			closestDistance = distanceSquared;
+			closestIndex = index;
+		}
+	}
+
+	pickResult[0] = closestIndex;
+	if (closestIndex == 0xffffffffu) {
+		pickResult[1] = 0u;
+		pickResult[2] = 0u;
+		pickResult[3] = 0u;
+		return;
+	}
+
+	let position = particlesIn[closestIndex].position;
+	pickResult[1] = bitcast<u32>(position.x);
+	pickResult[2] = bitcast<u32>(position.y);
+	pickResult[3] = particleObjectIds[closestIndex];
+}
+
+@compute @workgroup_size(64)
+fn cloneObject(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let localIndex = invocation.x;
+	if (localIndex >= cloneParams.rangeAndObjectId.y) {
+		return;
+	}
+
+	let sourceIndex = cloneParams.rangeAndObjectId.x + localIndex;
+	let destinationIndex = cloneParams.rangeAndObjectId.z + localIndex;
+	var particle = cloneParticles[sourceIndex];
+	particle.position = clamp(
+		particle.position + cloneParams.offsetAndDomain.xy,
+		vec2<f32>(0.0, 0.0),
+		cloneParams.offsetAndDomain.zw,
+	);
+	cloneParticles[destinationIndex] = particle;
+	cloneObjectIds[destinationIndex] = cloneParams.rangeAndObjectId.w;
 }
 `;
 

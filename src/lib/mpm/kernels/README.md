@@ -12,6 +12,22 @@ the same units and conventions as `reference/README.md`.
 The solver owns the canvas context and device obtained from the shared WebGPU
 session; call `dispose()` when the lab is finished.
 
+## Interaction and capacity
+
+`config.capacity` reserves particle and object-id buffers during initialization.
+If omitted, capacity equals the initial particle count. `particleCount` reports
+the current active count and `particleCapacity` reports the fixed allocation.
+Cloning never reallocates those buffers; it appends a GPU-side copy of the
+selected contiguous `objectId` range and returns `false` when capacity is full.
+`objectId` is optional on input particles and defaults to `0`; an object's
+particles must be contiguous in the initial array.
+
+`pick()` runs a GPU nearest-particle search and reads back only a 16-byte
+selection result. `beginDrag()`, `updateDrag()`, and `endDrag()` update a small
+uniform; the next grid update applies a damped, local force around the pointer.
+Drag and clone do not read back the particle array. Full particle state remains
+available only through explicit `readParticles()` calls.
+
 The compute path has separate clear, linked-list insertion, P2G gather, grid
 update, G2P, and particle-commit passes. Every particle inserts its nine
 quadratic B-spline stencil entries into per-node linked lists using integer
@@ -40,9 +56,12 @@ plasticity, damage, substepping, or material mixing.
 - Buffer sizes and 1D dispatch counts are checked against the acquired device's
   WebGPU limits. Devices that cannot hold the requested state fail setup with
   an explicit error.
+- The capacity is fixed for the solver lifetime. Reaching it is an explicit
+  clone failure rather than a silent buffer growth or particle drop.
 - Particle rendering uses a simple fixed color and a radius proportional to
   `cellSize`. The lab route should size the canvas to match the configured
   world aspect ratio.
 
 The pure config/layout tests run without WebGPU. Shader compilation, GPU-vs-CPU
-numerical error, and visual behavior still need validation on a WebGPU device.
+numerical error, picking, force-drag behavior, cloning, and visual behavior
+still need validation on a WebGPU device.

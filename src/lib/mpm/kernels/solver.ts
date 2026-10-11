@@ -3,23 +3,39 @@ import { createMpmWebGpuSession } from '../platform/webgpu.js';
 import {
 	calculateMpmMlsGpuBufferLayout,
 	COMPUTE_WORKGROUP_SIZE,
+	OBJECT_ID_STRIDE_BYTES,
 	packMpmMlsGpuStepParameters,
+	PARTICLE_STRIDE_BYTES,
 	RENDER_PARAMS_BYTES,
 	SIMULATION_PARAMS_BYTES,
 	validateMpmMlsGpuInput,
 	type MpmMlsGpuBufferLayout,
 	type MpmMlsGpuConfig,
+	type MpmMlsGpuObjectRange,
 	type ValidatedMpmMlsGpuInput
 } from './layout.js';
 import { MLS_MPM_COMPUTE_WGSL, MLS_MPM_RENDER_WGSL } from './shaders.js';
 
 export type { MpmMlsGpuConfig } from './layout.js';
 
+export interface MpmMlsGpuSelection {
+	readonly particleIndex: number;
+	readonly objectId: number;
+	readonly anchor: MpmVector2;
+}
+
 export interface MpmMlsGpuSolver {
 	readonly deviceLost: Promise<GPUDeviceLostInfo>;
+	readonly particleCount: number;
+	readonly particleCapacity: number;
 	step(dt: number, gravity: MpmVector2): void;
 	render(): void;
 	readParticles(): Promise<readonly MpmParticle[]>;
+	pick(point: MpmVector2, radius: number): Promise<MpmMlsGpuSelection | null>;
+	beginDrag(selection: MpmMlsGpuSelection, target: MpmVector2, radius: number): void;
+	updateDrag(target: MpmVector2): void;
+	endDrag(): void;
+	clone(selection: MpmMlsGpuSelection, offset: MpmVector2): boolean;
 	dispose(): void;
 }
 
@@ -51,6 +67,8 @@ interface MpmMlsGpuPipelines {
 	readonly updateGrid: GPUComputePipeline;
 	readonly g2p: GPUComputePipeline;
 	readonly commitParticles: GPUComputePipeline;
+	readonly pick: GPUComputePipeline;
+	readonly cloneObject: GPUComputePipeline;
 	readonly render: GPURenderPipeline;
 }
 
@@ -59,10 +77,18 @@ interface MpmMlsGpuStepBindings {
 	readonly p2g: GPUBindGroup;
 	readonly g2p: GPUBindGroup;
 	readonly commitParticles: GPUBindGroup;
+	readonly pick: GPUBindGroup;
 	readonly render: GPUBindGroup;
 }
 
 const STATE_ERROR_BYTES = Uint32Array.BYTES_PER_ELEMENT;
+const INTERACTION_PARAMS_BYTES = 32;
+const PICK_PARAMS_BYTES = 32;
+const PICK_RESULT_BYTES = 16;
+const CLONE_PARAMS_BYTES = 32;
+const MAX_U32 = 0xffff_ffff;
+const DRAG_STIFFNESS = 20;
+const DRAG_DAMPING = 8;
 const BUFFER_USAGE = {
 	MAP_READ: 0x0001,
 	COPY_SRC: 0x0004,
@@ -122,17 +148,23 @@ export async function createMpmMlsGpuSolver(
 interface MpmMlsGpuRuntime {
 	readonly buffers: {
 		readonly simulationParams: GPUBuffer;
+		readonly interactionParams: GPUBuffer;
 		readonly renderParams: GPUBuffer;
 		readonly stateError: GPUBuffer;
 		readonly bucketHeads: GPUBuffer;
 		readonly bucketNext: GPUBuffer;
 		readonly gridNodes: GPUBuffer;
+		readonly particleObjectIds: GPUBuffer;
+		readonly pickParams: GPUBuffer;
+		readonly pickResult: GPUBuffer;
+		readonly cloneParams: GPUBuffer;
 		readonly particles: readonly [GPUBuffer, GPUBuffer];
 	};
 	readonly pipelines: MpmMlsGpuPipelines;
 	readonly clearGrid: GPUBindGroup;
 	readonly updateGrid: GPUBindGroup;
 	readonly bindings: readonly [MpmMlsGpuStepBindings, MpmMlsGpuStepBindings];
+	readonly cloneBindings: readonly [GPUBindGroup, GPUBindGroup];
 }
 
 async function createRuntime(
@@ -160,6 +192,8 @@ async function createRuntime(
 		updateGrid: await createComputePipeline(device, computeModule, 'updateGrid'),
 		g2p: await createComputePipeline(device, computeModule, 'g2p'),
 		commitParticles: await createComputePipeline(device, computeModule, 'commitParticles'),
+		pick: await createComputePipeline(device, computeModule, 'pickParticle'),
+		cloneObject: await createComputePipeline(device, computeModule, 'cloneObject'),
 		render: await createRenderPipeline(device, renderModule, format)
 	};
 
@@ -175,6 +209,11 @@ async function createRuntime(
 		simulationParams: createBuffer(
 			'MLS-MPM simulation parameters',
 			SIMULATION_PARAMS_BYTES,
+			BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST
+		),
+		interactionParams: createBuffer(
+			'MLS-MPM interaction parameters',
+			INTERACTION_PARAMS_BYTES,
 			BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST
 		),
 		renderParams: createBuffer(
@@ -202,6 +241,26 @@ async function createRuntime(
 			layout.gridStateBytes,
 			BUFFER_USAGE.STORAGE
 		),
+		particleObjectIds: createBuffer(
+			'MLS-MPM particle object ids',
+			layout.objectIdBufferBytes,
+			particleBufferUsage
+		),
+		pickParams: createBuffer(
+			'MLS-MPM on-demand particle pick parameters',
+			PICK_PARAMS_BYTES,
+			BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST
+		),
+		pickResult: createBuffer(
+			'MLS-MPM on-demand particle pick result',
+			PICK_RESULT_BYTES,
+			BUFFER_USAGE.STORAGE | BUFFER_USAGE.COPY_SRC | BUFFER_USAGE.COPY_DST
+		),
+		cloneParams: createBuffer(
+			'MLS-MPM GPU object clone parameters',
+			CLONE_PARAMS_BYTES,
+			BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST
+		),
 		particles: [
 			createBuffer(
 				'MLS-MPM particle state A',
@@ -217,6 +276,8 @@ async function createRuntime(
 	};
 
 	device.queue.writeBuffer(buffers.stateError, 0, new Uint32Array([0]));
+	device.queue.writeBuffer(buffers.interactionParams, 0, new Float32Array(8));
+	device.queue.writeBuffer(buffers.pickResult, 0, new Uint32Array([MAX_U32, 0, 0, 0]));
 	device.queue.writeBuffer(
 		buffers.renderParams,
 		0,
@@ -224,6 +285,7 @@ async function createRuntime(
 	);
 	if (layout.particleStateBytes > 0) {
 		device.queue.writeBuffer(buffers.particles[0], 0, state.packedParticles);
+		device.queue.writeBuffer(buffers.particleObjectIds, 0, state.packedObjectIds);
 	}
 
 	const clearGrid = createBindGroup(device, pipelines.clearGrid, [
@@ -234,7 +296,8 @@ async function createRuntime(
 	const updateGrid = createBindGroup(device, pipelines.updateGrid, [
 		bufferEntry(0, buffers.simulationParams),
 		bufferEntry(5, buffers.gridNodes),
-		bufferEntry(6, buffers.stateError)
+		bufferEntry(6, buffers.stateError),
+		bufferEntry(7, buffers.interactionParams)
 	]);
 
 	const createStepBindings = (inputIndex: 0 | 1): MpmMlsGpuStepBindings => {
@@ -273,14 +336,30 @@ async function createRuntime(
 			bufferEntry(0, input),
 			bufferEntry(1, buffers.renderParams)
 		]);
-		return { buildBuckets, p2g, g2p, commitParticles, render };
+		const pick = createBindGroup(device, pipelines.pick, [
+			bufferEntry(1, input),
+			bufferEntry(8, buffers.particleObjectIds),
+			bufferEntry(9, buffers.pickParams),
+			bufferEntry(10, buffers.pickResult)
+		]);
+		return { buildBuckets, p2g, g2p, commitParticles, pick, render };
 	};
+	const createCloneBinding = (inputIndex: 0 | 1): GPUBindGroup =>
+		createBindGroup(device, pipelines.cloneObject, [
+			bufferEntry(11, buffers.particles[inputIndex]),
+			bufferEntry(12, buffers.particleObjectIds),
+			bufferEntry(13, buffers.cloneParams)
+		]);
 	const bindings: readonly [
 		MpmMlsGpuStepBindings,
 		MpmMlsGpuStepBindings
 	] = [createStepBindings(0), createStepBindings(1)];
+	const cloneBindings: readonly [GPUBindGroup, GPUBindGroup] = [
+		createCloneBinding(0),
+		createCloneBinding(1)
+	];
 
-	return { buffers, pipelines, clearGrid, updateGrid, bindings };
+	return { buffers, pipelines, clearGrid, updateGrid, bindings, cloneBindings };
 }
 
 function createSolver(
@@ -291,9 +370,19 @@ function createSolver(
 	ownedBuffers: Set<GPUBuffer>
 ): MpmMlsGpuSolver {
 	let currentBuffer = 0;
+	let particleCount = state.particleCount;
 	let disposed = false;
 	let lostInfo: GPUDeviceLostInfo | null = null;
+	let pickPending = false;
+	let activeDrag: { readonly radius: number } | null = null;
 	const temporaryReadbacks = new Set<GPUBuffer>();
+	const objectRanges = new Map<number, MpmMlsGpuObjectRange>(
+		state.objectRanges.map((range) => [range.objectId, range])
+	);
+	let nextObjectId = 0;
+	for (const range of state.objectRanges) {
+		nextObjectId = Math.max(nextObjectId, range.objectId + 1);
+	}
 	const deviceLost = session.lost;
 	void deviceLost.then((info) => {
 		lostInfo = info;
@@ -308,9 +397,49 @@ function createSolver(
 		}
 	}
 
+	function resolveSelection(selection: MpmMlsGpuSelection): MpmMlsGpuObjectRange {
+		if (typeof selection !== 'object' || selection === null) {
+			throw new TypeError('selection must identify an MPM particle.');
+		}
+		if (
+			!Number.isSafeInteger(selection.particleIndex) ||
+			selection.particleIndex < 0 ||
+			selection.particleIndex >= particleCount ||
+			!Number.isSafeInteger(selection.objectId) ||
+			selection.objectId < 0 ||
+			selection.objectId > MAX_U32
+		) {
+			throw new RangeError('selection must identify an active MPM particle.');
+		}
+		validateMpmWorldPoint(selection.anchor, state, 'selection anchor');
+		const range = objectRanges.get(selection.objectId);
+		if (
+			!range ||
+			selection.particleIndex < range.start ||
+			selection.particleIndex >= range.start + range.count
+		) {
+			throw new RangeError('selection objectId does not match the selected particle.');
+		}
+		return range;
+	}
+
+	function writeInteractionParameters(target: MpmVector2, radius: number): void {
+		const parameters = new Float32Array([
+			target.x,
+			target.y,
+			radius,
+			DRAG_STIFFNESS,
+			DRAG_DAMPING,
+			0,
+			0,
+			0
+		]);
+		session.device.queue.writeBuffer(runtime.buffers.interactionParams, 0, parameters);
+	}
+
 	function step(dt: number, gravity: MpmVector2): void {
 		assertActive();
-		const parameters = packMpmMlsGpuStepParameters(state, layout, dt, gravity);
+		const parameters = packMpmMlsGpuStepParameters(state, layout, dt, gravity, particleCount);
 		const inputIndex = currentBuffer;
 		const groups = runtime.bindings[inputIndex];
 		try {
@@ -328,7 +457,7 @@ function createSolver(
 				encoder,
 				runtime.pipelines.buildBuckets,
 				groups.buildBuckets,
-				state.particleCount
+				layout.particleCapacity
 			);
 			dispatchCompute(encoder, runtime.pipelines.p2g, groups.p2g, layout.nodeCount);
 			dispatchCompute(
@@ -341,13 +470,13 @@ function createSolver(
 				encoder,
 				runtime.pipelines.g2p,
 				groups.g2p,
-				state.particleCount
+				layout.particleCapacity
 			);
 			dispatchCompute(
 				encoder,
 				runtime.pipelines.commitParticles,
 				groups.commitParticles,
-				state.particleCount
+				layout.particleCapacity
 			);
 			session.device.queue.submit([encoder.finish()]);
 			currentBuffer = 1 - inputIndex;
@@ -374,7 +503,7 @@ function createSolver(
 			});
 			pass.setPipeline(runtime.pipelines.render);
 			pass.setBindGroup(0, runtime.bindings[currentBuffer].render);
-			pass.draw(6, state.particleCount);
+			pass.draw(6, particleCount);
 			pass.end();
 			session.device.queue.submit([encoder.finish()]);
 		} catch (cause) {
@@ -384,6 +513,9 @@ function createSolver(
 
 	async function readParticles(): Promise<readonly MpmParticle[]> {
 		assertActive();
+		const particleStateBytes = particleCount * PARTICLE_STRIDE_BYTES;
+		const objectIdBytes = particleCount * OBJECT_ID_STRIDE_BYTES;
+		const errorOffset = particleStateBytes + objectIdBytes;
 		let readback: GPUBuffer;
 		try {
 			readback = session.device.createBuffer({
@@ -404,20 +536,27 @@ function createSolver(
 			const encoder = session.device.createCommandEncoder({
 				label: 'MLS-MPM explicit particle readback'
 			});
-			if (layout.particleStateBytes > 0) {
+			if (particleStateBytes > 0) {
 				encoder.copyBufferToBuffer(
 					runtime.buffers.particles[currentBuffer],
 					0,
 					readback,
 					0,
-					layout.particleStateBytes
+					particleStateBytes
+				);
+				encoder.copyBufferToBuffer(
+					runtime.buffers.particleObjectIds,
+					0,
+					readback,
+					particleStateBytes,
+					objectIdBytes
 				);
 			}
 			encoder.copyBufferToBuffer(
 				runtime.buffers.stateError,
 				0,
 				readback,
-				layout.particleStateBytes,
+				errorOffset,
 				STATE_ERROR_BYTES
 			);
 			session.device.queue.submit([encoder.finish()]);
@@ -430,13 +569,14 @@ function createSolver(
 
 			const flags = new Uint32Array(
 				snapshot,
-				layout.particleStateBytes,
+				errorOffset,
 				1
 			)[0];
 			if (flags !== 0) throw new MpmMlsGpuNumericalError(flags);
 			return unpackParticles(
-				new Float32Array(snapshot, 0, layout.particleStateBytes / Float32Array.BYTES_PER_ELEMENT),
-				state.particleCount
+				new Float32Array(snapshot, 0, particleStateBytes / Float32Array.BYTES_PER_ELEMENT),
+				particleCount,
+				new Uint32Array(snapshot, particleStateBytes, particleCount)
 			);
 		} catch (cause) {
 			if (cause instanceof MpmMlsGpuNumericalError) throw cause;
@@ -460,9 +600,183 @@ function createSolver(
 		}
 	}
 
+	async function pick(
+		point: MpmVector2,
+		radius: number
+	): Promise<MpmMlsGpuSelection | null> {
+		assertActive();
+		const query = validateMpmWorldPoint(point, state, 'pick point');
+		const pickRadius = validateMpmPickRadius(radius, state);
+		if (particleCount === 0) return null;
+		if (pickPending) {
+			throw new Error('An MLS-MPM particle pick is already in progress.');
+		}
+		pickPending = true;
+
+		let staging: GPUBuffer | null = null;
+		let mapped = false;
+		const queryParticleCount = particleCount;
+		try {
+			staging = session.device.createBuffer({
+				label: 'one-particle MLS-MPM pick readback',
+				size: PICK_RESULT_BYTES,
+				usage: BUFFER_USAGE.MAP_READ | BUFFER_USAGE.COPY_DST
+			});
+			ownedBuffers.add(staging);
+			temporaryReadbacks.add(staging);
+
+			const parameters = new ArrayBuffer(PICK_PARAMS_BYTES);
+			const floats = new Float32Array(parameters, 0, 4);
+			floats.set([query.x, query.y, pickRadius, 0]);
+			new Uint32Array(parameters, 16, 4).set([queryParticleCount, 0, 0, 0]);
+			session.device.queue.writeBuffer(runtime.buffers.pickParams, 0, parameters);
+
+			const encoder = session.device.createCommandEncoder({
+				label: 'on-demand MLS-MPM particle pick'
+			});
+			const pass = encoder.beginComputePass({ label: 'nearest MLS-MPM particle pick' });
+			pass.setPipeline(runtime.pipelines.pick);
+			pass.setBindGroup(0, runtime.bindings[currentBuffer].pick);
+			pass.dispatchWorkgroups(1);
+			pass.end();
+			encoder.copyBufferToBuffer(runtime.buffers.pickResult, 0, staging, 0, PICK_RESULT_BYTES);
+			session.device.queue.submit([encoder.finish()]);
+
+			await staging.mapAsync(MAP_MODE_READ);
+			mapped = true;
+			assertActive();
+			const result = new DataView(staging.getMappedRange());
+			const particleIndex = result.getUint32(0, true);
+			if (particleIndex === MAX_U32) return null;
+			if (particleIndex >= queryParticleCount) {
+				throw new Error('GPU returned a particle index outside the active MLS-MPM range.');
+			}
+			const anchor = {
+				x: result.getFloat32(4, true),
+				y: result.getFloat32(8, true)
+			};
+			const objectId = result.getUint32(12, true);
+			const range = objectRanges.get(objectId);
+			if (
+				!range ||
+				particleIndex < range.start ||
+				particleIndex >= range.start + range.count
+			) {
+				throw new Error('GPU returned an object id inconsistent with the selected particle.');
+			}
+			return {
+				particleIndex,
+				objectId,
+				anchor: validateMpmWorldPoint(anchor, state, 'GPU selection anchor')
+			};
+		} catch (cause) {
+			if (disposed) return null;
+			throw new Error('Failed to pick an MLS-MPM particle from GPU state.', { cause });
+		} finally {
+			if (mapped && staging) {
+				try {
+					staging.unmap();
+				} catch {
+					// A lost device may already have unmapped the staging buffer.
+				}
+			}
+			if (staging && temporaryReadbacks.delete(staging)) {
+				ownedBuffers.delete(staging);
+				try {
+					staging.destroy();
+				} catch {
+					// Device teardown owns recovery after a failed or lost pick.
+				}
+			}
+			pickPending = false;
+		}
+	}
+
+	function beginDrag(
+		selection: MpmMlsGpuSelection,
+		target: MpmVector2,
+		radius: number
+	): void {
+		assertActive();
+		resolveSelection(selection);
+		const safeTarget = validateMpmWorldPoint(target, state, 'drag target');
+		const safeRadius = validateMpmDragRadius(radius, state);
+		writeInteractionParameters(safeTarget, safeRadius);
+		activeDrag = { radius: safeRadius };
+	}
+
+	function updateDrag(target: MpmVector2): void {
+		assertActive();
+		if (!activeDrag) return;
+		const safeTarget = validateMpmWorldPoint(target, state, 'drag target');
+		writeInteractionParameters(safeTarget, activeDrag.radius);
+	}
+
+	function endDrag(): void {
+		if (!activeDrag) return;
+		activeDrag = null;
+		if (disposed || lostInfo) return;
+		writeInteractionParameters({ x: 0, y: 0 }, 0);
+	}
+
+	function clone(selection: MpmMlsGpuSelection, offset: MpmVector2): boolean {
+		assertActive();
+		const source = resolveSelection(selection);
+		const translation = validateMpmCloneOffset(offset);
+		if (source.count > layout.particleCapacity - particleCount) return false;
+		if (nextObjectId > MAX_U32) {
+			throw new RangeError('No unsigned 32-bit object ids remain for MLS-MPM cloning.');
+		}
+
+		const destinationStart = particleCount;
+		const clonedObjectId = nextObjectId;
+		const parameters = new ArrayBuffer(CLONE_PARAMS_BYTES);
+		new Uint32Array(parameters, 0, 4).set([
+			source.start,
+			source.count,
+			destinationStart,
+			clonedObjectId
+		]);
+		new Float32Array(parameters, 16, 4).set([
+			translation.x,
+			translation.y,
+			state.domainWidthF32,
+			state.domainHeightF32
+		]);
+
+		try {
+			endDrag();
+			session.device.queue.writeBuffer(runtime.buffers.cloneParams, 0, parameters);
+			const encoder = session.device.createCommandEncoder({
+				label: 'GPU-to-GPU MLS-MPM object clone'
+			});
+			dispatchCompute(
+				encoder,
+				runtime.pipelines.cloneObject,
+				runtime.cloneBindings[currentBuffer],
+				source.count
+			);
+			session.device.queue.submit([encoder.finish()]);
+		} catch (cause) {
+			throw new Error('Failed to clone the selected MLS-MPM object on the GPU.', {
+				cause
+			});
+		}
+
+		objectRanges.set(clonedObjectId, {
+			objectId: clonedObjectId,
+			start: destinationStart,
+			count: source.count
+		});
+		particleCount += source.count;
+		nextObjectId++;
+		return true;
+	}
+
 	function dispose(): void {
 		if (disposed) return;
 		disposed = true;
+		activeDrag = null;
 		const errors = destroyBuffers(ownedBuffers);
 		try {
 			session.dispose();
@@ -475,7 +789,24 @@ function createSolver(
 		}
 	}
 
-	return { deviceLost, step, render, readParticles, dispose };
+	return {
+		deviceLost,
+		get particleCount() {
+			return particleCount;
+		},
+		get particleCapacity() {
+			return layout.particleCapacity;
+		},
+		step,
+		render,
+		readParticles,
+		pick,
+		beginDrag,
+		updateDrag,
+		endDrag,
+		clone,
+		dispose
+	};
 }
 
 function dispatchCompute(
@@ -583,7 +914,8 @@ function createRenderParameters(state: ValidatedMpmMlsGpuInput): Float32Array {
 
 function unpackParticles(
 	values: Float32Array,
-	particleCount: number
+	particleCount: number,
+	objectIds: Uint32Array
 ): readonly MpmParticle[] {
 	const particles: MpmParticle[] = [];
 	for (let index = 0; index < particleCount; index++) {
@@ -602,10 +934,62 @@ function unpackParticles(
 				m01: values[offset + 9],
 				m10: values[offset + 10],
 				m11: values[offset + 11]
-			}
+			},
+			objectId: objectIds[index]
 		});
 	}
 	return particles;
+}
+
+function validateMpmWorldPoint(
+	point: MpmVector2,
+	state: ValidatedMpmMlsGpuInput,
+	name: string
+): MpmVector2 {
+	if (typeof point !== 'object' || point === null) {
+		throw new TypeError(`${name} must be a vector.`);
+	}
+	const x = finiteInteractionFloat32(point.x, `${name}.x`);
+	const y = finiteInteractionFloat32(point.y, `${name}.y`);
+	if (x < 0 || x > state.domainWidthF32 || y < 0 || y > state.domainHeightF32) {
+		throw new RangeError(`${name} must be inside the MLS-MPM domain.`);
+	}
+	return { x, y };
+}
+
+function validateMpmPickRadius(radius: number, state: ValidatedMpmMlsGpuInput): number {
+	const value = finiteInteractionFloat32(radius, 'pick radius');
+	if (value < 0 || value > Math.max(state.domainWidthF32, state.domainHeightF32)) {
+		throw new RangeError('pick radius must be non-negative and within the MLS-MPM domain extent.');
+	}
+	return value;
+}
+
+function validateMpmDragRadius(radius: number, state: ValidatedMpmMlsGpuInput): number {
+	const value = validateMpmPickRadius(radius, state);
+	if (value <= 0) throw new RangeError('drag radius must be greater than zero.');
+	return value;
+}
+
+function validateMpmCloneOffset(offset: MpmVector2): MpmVector2 {
+	if (typeof offset !== 'object' || offset === null) {
+		throw new TypeError('clone offset must be a vector.');
+	}
+	return {
+		x: finiteInteractionFloat32(offset.x, 'clone offset.x'),
+		y: finiteInteractionFloat32(offset.y, 'clone offset.y')
+	};
+}
+
+function finiteInteractionFloat32(value: number, name: string): number {
+	if (typeof value !== 'number' || !Number.isFinite(value)) {
+		throw new TypeError(`${name} must be a finite number.`);
+	}
+	const result = Math.fround(value);
+	if (!Number.isFinite(result)) {
+		throw new RangeError(`${name} is outside the supported float32 range.`);
+	}
+	return result;
 }
 
 async function withDeviceSetupScopes<T>(

@@ -55,6 +55,8 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			1, 0, 0, 1
 		]);
 		expect(state.particleCount).toBe(2);
+		expect(state.particleCapacity).toBe(2);
+		expect(Array.from(state.packedObjectIds)).toEqual([0, 0]);
 		expect(state.domainWidth).toBe(16);
 		expect(state.domainHeight).toBe(8);
 		expect(state.domainWidthF32).toBe(16);
@@ -70,12 +72,14 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			nodeHeight: 11,
 			nodeCount: 209,
 			pairCount: 9,
+			particleCapacity: 1,
 			particleStateBytes: 48,
 			particleBufferBytes: 48,
+			objectIdBufferBytes: 4,
 			bucketHeadBytes: 836,
 			bucketNextBytes: 36,
 			gridStateBytes: 5016,
-			readbackBytes: 52
+			readbackBytes: 56
 		});
 	});
 
@@ -83,10 +87,32 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		const state = validateMpmMlsGpuInput([], makeConfig());
 		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
 
+		expect(layout.particleCapacity).toBe(0);
 		expect(layout.particleStateBytes).toBe(0);
 		expect(layout.particleBufferBytes).toBe(48);
 		expect(layout.bucketNextBytes).toBe(4);
-		expect(layout.readbackBytes).toBe(4);
+		expect(layout.objectIdBufferBytes).toBe(4);
+		expect(layout.readbackBytes).toBe(8);
+	});
+
+	it('reserves capacity up front while packing only initial particle and object state', () => {
+		const particles = [
+			makeParticle({ objectId: 7 }),
+			makeParticle({ position: { x: 9, y: 4 }, objectId: 7 })
+		];
+		const state = validateMpmMlsGpuInput(particles, makeConfig({ capacity: 4 }));
+		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
+
+		expect(state.particleCount).toBe(2);
+		expect(state.particleCapacity).toBe(4);
+		expect(Array.from(state.packedObjectIds)).toEqual([7, 7]);
+		expect(state.objectRanges).toEqual([{ objectId: 7, start: 0, count: 2 }]);
+		expect(layout.pairCount).toBe(36);
+		expect(layout.particleStateBytes).toBe(96);
+		expect(layout.particleBufferBytes).toBe(192);
+		expect(layout.objectIdBufferBytes).toBe(16);
+		expect(layout.bucketNextBytes).toBe(144);
+		expect(layout.readbackBytes).toBe(212);
 	});
 
 	it('rejects invalid physical parameters and particle states rather than repairing them', () => {
@@ -126,6 +152,25 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 				makeConfig()
 			)
 		).toThrow(/underflows/);
+		expect(() => validateMpmMlsGpuInput([], makeConfig({ capacity: 0 }))).toThrow(
+			/capacity/
+		);
+		expect(() =>
+			validateMpmMlsGpuInput([makeParticle()], makeConfig({ capacity: 0 }))
+		).toThrow(/capacity/);
+		expect(() =>
+			validateMpmMlsGpuInput([makeParticle({ objectId: -1 })], makeConfig())
+		).toThrow(/objectId/);
+		expect(() =>
+			validateMpmMlsGpuInput(
+				[
+					makeParticle({ objectId: 1 }),
+					makeParticle({ objectId: 2 }),
+					makeParticle({ objectId: 1 })
+				],
+				makeConfig()
+			)
+		).toThrow(/must be contiguous/);
 	});
 
 	it('rejects device-limit violations and signed linked-list index overflow', () => {
@@ -145,7 +190,11 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 
 		expect(() =>
 			calculateMpmMlsGpuBufferLayout(
-				{ ...state, particleCount: Math.floor(0x7fff_ffff / 9) + 1 },
+				{
+					...state,
+					particleCount: Math.floor(0x7fff_ffff / 9) + 1,
+					particleCapacity: Math.floor(0x7fff_ffff / 9) + 1
+				},
 				LIMITS
 			)
 		).toThrow(/linked-list index range/);
@@ -187,5 +236,25 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(() =>
 			packMpmMlsGpuStepParameters(state, layout, 0.001, { x: 0, y: Number.NaN })
 		).toThrow(/gravity.y/);
+	});
+
+	it('packs the live particle count and stencil count without using reserved capacity', () => {
+		const state = validateMpmMlsGpuInput(
+			[makeParticle(), makeParticle({ position: { x: 9, y: 4 } })],
+			makeConfig({ capacity: 8 })
+		);
+		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
+		const parameters = packMpmMlsGpuStepParameters(
+			state,
+			layout,
+			0.001,
+			{ x: 0, y: 0 },
+			3
+		);
+
+		expect(Array.from(new Uint32Array(parameters, 16, 4))).toEqual([3, 209, 27, 0]);
+		expect(() =>
+			packMpmMlsGpuStepParameters(state, layout, 0.001, { x: 0, y: 0 }, 9)
+		).toThrow(/capacity/);
 	});
 });

@@ -15,6 +15,7 @@ export interface MpmParticle {
 	readonly velocity: MpmVector2;
 	readonly C: MpmMatrix2;
 	readonly F: MpmMatrix2;
+	readonly objectId?: number;
 }
 
 export interface MpmGridParameters {

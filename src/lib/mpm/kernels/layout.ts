@@ -4,7 +4,9 @@ import type {
 	MpmVector2
 } from '../reference/solver.js';
 
-export type MpmMlsGpuConfig = Omit<MpmStepConfig, 'dt' | 'gravity'>;
+export type MpmMlsGpuConfig = Omit<MpmStepConfig, 'dt' | 'gravity'> & {
+	readonly capacity?: number;
+};
 
 export interface MpmMlsGpuDeviceLimits {
 	readonly maxBufferSize: number;
@@ -19,18 +21,29 @@ export interface MpmMlsGpuBufferLayout {
 	readonly nodeHeight: number;
 	readonly nodeCount: number;
 	readonly pairCount: number;
+	readonly particleCapacity: number;
 	readonly particleStateBytes: number;
 	readonly particleBufferBytes: number;
+	readonly objectIdBufferBytes: number;
 	readonly bucketHeadBytes: number;
 	readonly bucketNextBytes: number;
 	readonly gridStateBytes: number;
 	readonly readbackBytes: number;
 }
 
+export interface MpmMlsGpuObjectRange {
+	readonly objectId: number;
+	readonly start: number;
+	readonly count: number;
+}
+
 export interface ValidatedMpmMlsGpuInput {
 	readonly config: MpmMlsGpuConfig;
 	readonly particleCount: number;
+	readonly particleCapacity: number;
 	readonly packedParticles: Float32Array;
+	readonly packedObjectIds: Uint32Array;
+	readonly objectRanges: readonly MpmMlsGpuObjectRange[];
 	readonly domainWidth: number;
 	readonly domainHeight: number;
 	readonly domainWidthF32: number;
@@ -46,6 +59,7 @@ export interface ValidatedMpmMlsGpuInput {
 
 export const PARTICLE_FLOATS = 12;
 export const PARTICLE_STRIDE_BYTES = PARTICLE_FLOATS * Float32Array.BYTES_PER_ELEMENT;
+export const OBJECT_ID_STRIDE_BYTES = Uint32Array.BYTES_PER_ELEMENT;
 export const SIMULATION_PARAMS_BYTES = 80;
 export const RENDER_PARAMS_BYTES = 16;
 export const COMPUTE_WORKGROUP_SIZE = 64;
@@ -132,28 +146,40 @@ export function validateMpmMlsGpuInput(
 		throw new TypeError('particles must be an array');
 	}
 	const particleCount = particles.length;
-	const pairCount = safeProduct(particleCount, 9, 'particle stencil entry count');
+	const particleCapacity =
+		rawConfig.capacity === undefined
+			? particleCount
+			: positiveSafeInteger(rawConfig.capacity, 'capacity');
+	if (particleCapacity < particleCount || particleCapacity > UINT32_MAX) {
+		throw new RangeError('capacity must be at least the initial particle count and fit the GPU layout');
+	}
+	const pairCount = safeProduct(particleCapacity, 9, 'particle stencil entry count');
 	if (pairCount > INT32_MAX) {
 		throw new RangeError('particle stencil entries exceed the linked-list index range');
 	}
 	safeProduct(
-		particleCount,
+		particleCapacity,
 		PARTICLE_STRIDE_BYTES,
 		'particle state buffer size'
 	);
-	safeProduct(particleCount, PARTICLE_FLOATS, 'particle state element count');
+	safeProduct(particleCapacity, PARTICLE_FLOATS, 'particle state element count');
 
 	let packedParticles: Float32Array;
+	let packedObjectIds: Uint32Array;
 	try {
 		packedParticles = new Float32Array(particleCount * PARTICLE_FLOATS);
+		packedObjectIds = new Uint32Array(particleCount);
 	} catch (cause) {
 		throw new RangeError('initial particle state exceeds the supported typed-array size', {
 			cause
 		});
 	}
 
+	const objectRanges: MpmMlsGpuObjectRange[] = [];
+	const closedObjectIds = new Set<number>();
 	for (let index = 0; index < particleCount; index++) {
 		const rawParticle = assertRecord(particles[index], `particles[${index}]`);
+		const objectId = validateObjectId(rawParticle.objectId, `particles[${index}].objectId`);
 		const position = readVector(rawParticle.position, `particles[${index}].position`);
 		const velocity = readVector(rawParticle.velocity, `particles[${index}].velocity`);
 		const C = readMatrix(rawParticle.C, `particles[${index}].C`);
@@ -210,6 +236,23 @@ export function validateMpmMlsGpuInput(
 			);
 		}
 		packedParticles.set(packed, offset);
+		packedObjectIds[index] = objectId;
+
+		const currentRange = objectRanges.at(-1);
+		if (currentRange?.objectId === objectId) {
+			objectRanges[objectRanges.length - 1] = {
+				...currentRange,
+				count: currentRange.count + 1
+			};
+		} else {
+			if (closedObjectIds.has(objectId)) {
+				throw new RangeError(
+					`particles with objectId ${objectId} must be contiguous for GPU cloning`
+				);
+			}
+			if (currentRange) closedObjectIds.add(currentRange.objectId);
+			objectRanges.push({ objectId, start: index, count: 1 });
+		}
 	}
 
 	return {
@@ -217,10 +260,14 @@ export function validateMpmMlsGpuInput(
 			grid: { cellsX, cellsY, cellSize },
 			particleMass,
 			particleVolume,
-			material: { lambda, mu }
+			material: { lambda, mu },
+			capacity: particleCapacity
 		},
 		particleCount,
+		particleCapacity,
 		packedParticles,
+		packedObjectIds,
+		objectRanges,
 		domainWidth,
 		domainHeight,
 		domainWidthF32,
@@ -236,19 +283,22 @@ export function validateMpmMlsGpuInput(
 }
 
 export function calculateMpmMlsGpuBufferLayout(
-	state: Pick<ValidatedMpmMlsGpuInput, 'config' | 'particleCount'>,
+	state: Pick<ValidatedMpmMlsGpuInput, 'config' | 'particleCount' | 'particleCapacity'>,
 	limits: MpmMlsGpuDeviceLimits
 ): MpmMlsGpuBufferLayout {
 	const { cellsX, cellsY } = state.config.grid;
 	const nodeWidth = cellsX + 3;
 	const nodeHeight = cellsY + 3;
 	const nodeCount = safeProduct(nodeWidth, nodeHeight, 'halo grid node count');
-	const pairCount = safeProduct(state.particleCount, 9, 'particle stencil entry count');
+	if (state.particleCount > state.particleCapacity) {
+		throw new RangeError('initial particle count must not exceed particle capacity');
+	}
+	const pairCount = safeProduct(state.particleCapacity, 9, 'particle stencil entry count');
 
 	if (nodeWidth > UINT32_MAX || nodeHeight > UINT32_MAX || nodeCount > UINT32_MAX) {
 		throw new RangeError('halo grid dimensions exceed the GPU index range');
 	}
-	if (state.particleCount > UINT32_MAX || pairCount > INT32_MAX) {
+	if (state.particleCapacity > UINT32_MAX || pairCount > INT32_MAX) {
 		throw new RangeError('particle stencil entries exceed the linked-list index range');
 	}
 
@@ -257,7 +307,16 @@ export function calculateMpmMlsGpuBufferLayout(
 		PARTICLE_STRIDE_BYTES,
 		'particle state buffer size'
 	);
-	const particleBufferBytes = Math.max(PARTICLE_STRIDE_BYTES, particleStateBytes);
+	const capacityStateBytes = safeProduct(
+		state.particleCapacity,
+		PARTICLE_STRIDE_BYTES,
+		'particle state capacity size'
+	);
+	const particleBufferBytes = Math.max(PARTICLE_STRIDE_BYTES, capacityStateBytes);
+	const objectIdBufferBytes = Math.max(
+		OBJECT_ID_STRIDE_BYTES,
+		safeProduct(state.particleCapacity, OBJECT_ID_STRIDE_BYTES, 'particle object id buffer size')
+	);
 	const bucketHeadBytes = safeProduct(nodeCount, Int32Array.BYTES_PER_ELEMENT, 'bucket head size');
 	const bucketNextBytes = Math.max(
 		Int32Array.BYTES_PER_ELEMENT,
@@ -269,8 +328,16 @@ export function calculateMpmMlsGpuBufferLayout(
 		'grid state buffer size'
 	);
 	const readbackBytes = Math.max(
-		Int32Array.BYTES_PER_ELEMENT,
-		safeSum(particleStateBytes, Uint32Array.BYTES_PER_ELEMENT, 'readback buffer size')
+		Uint32Array.BYTES_PER_ELEMENT,
+		safeSum(
+			safeSum(
+				capacityStateBytes,
+				objectIdBufferBytes,
+				'particle and object id readback size'
+			),
+			Uint32Array.BYTES_PER_ELEMENT,
+			'readback buffer size'
+		)
 	);
 
 	assertLimit(limits.maxBufferSize, 'maxBufferSize');
@@ -287,6 +354,7 @@ export function calculateMpmMlsGpuBufferLayout(
 
 	const buffers = [
 		['particle buffers', particleBufferBytes],
+		['particle object ids', objectIdBufferBytes],
 		['bucket heads', bucketHeadBytes],
 		['bucket links', bucketNextBytes],
 		['grid state', gridStateBytes],
@@ -303,6 +371,7 @@ export function calculateMpmMlsGpuBufferLayout(
 
 	const storageBuffers = [
 		['particle buffers', particleBufferBytes],
+		['particle object ids', objectIdBufferBytes],
 		['bucket heads', bucketHeadBytes],
 		['bucket links', bucketNextBytes],
 		['grid state', gridStateBytes],
@@ -319,7 +388,7 @@ export function calculateMpmMlsGpuBufferLayout(
 	const maxWorkgroups = limits.maxComputeWorkgroupsPerDimension;
 	for (const [name, count] of [
 		['grid nodes', nodeCount],
-		['particles', state.particleCount]
+		['particles', state.particleCapacity]
 	] as const) {
 		const workgroups = Math.ceil(count / COMPUTE_WORKGROUP_SIZE);
 		if (workgroups > maxWorkgroups) {
@@ -332,8 +401,10 @@ export function calculateMpmMlsGpuBufferLayout(
 		nodeHeight,
 		nodeCount,
 		pairCount,
+		particleCapacity: state.particleCapacity,
 		particleStateBytes,
 		particleBufferBytes,
+		objectIdBufferBytes,
 		bucketHeadBytes,
 		bucketNextBytes,
 		gridStateBytes,
@@ -345,8 +416,16 @@ export function packMpmMlsGpuStepParameters(
 	state: ValidatedMpmMlsGpuInput,
 	layout: MpmMlsGpuBufferLayout,
 	dt: number,
-	gravity: MpmVector2
+	gravity: MpmVector2,
+	particleCount = state.particleCount
 ): ArrayBuffer {
+	if (!Number.isSafeInteger(particleCount) || particleCount < 0 || particleCount > layout.particleCapacity) {
+		throw new RangeError('particleCount must be an integer within the allocated GPU capacity');
+	}
+	const pairCount = safeProduct(particleCount, 9, 'active particle stencil entry count');
+	if (pairCount > INT32_MAX) {
+		throw new RangeError('active particle stencil entries exceed the linked-list index range');
+	}
 	const stepDt = finiteNumber(dt, 'dt');
 	if (stepDt <= 0) throw new RangeError('dt must be greater than zero');
 	const stepDtF32 = finiteFloat32(stepDt, 'dt', true);
@@ -366,9 +445,9 @@ export function packMpmMlsGpuStepParameters(
 		state.config.grid.cellsY,
 		layout.nodeWidth,
 		layout.nodeHeight,
-		state.particleCount,
+		particleCount,
 		layout.nodeCount,
-		layout.pairCount,
+		pairCount,
 		0
 	]);
 	const floats = new Float32Array(result, 32, 12);
@@ -387,6 +466,26 @@ export function packMpmMlsGpuStepParameters(
 		state.domainHeightF32
 	]);
 	return result;
+}
+
+function positiveSafeInteger(value: unknown, name: string): number {
+	if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+		throw new RangeError(`${name} must be a positive safe integer`);
+	}
+	return value;
+}
+
+function validateObjectId(value: unknown, name: string): number {
+	if (value === undefined) return 0;
+	if (
+		typeof value !== 'number' ||
+		!Number.isSafeInteger(value) ||
+		value < 0 ||
+		value > UINT32_MAX
+	) {
+		throw new RangeError(`${name} must be an unsigned 32-bit integer`);
+	}
+	return value;
 }
 
 function readVector(value: unknown, name: string): MpmVector2 {

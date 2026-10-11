@@ -1,18 +1,28 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { createMpmMlsGpuSolver } from '#lib/mpm/kernels/solver.js';
+	import {
+		createMpmMlsGpuSolver,
+		type MpmMlsGpuSelection
+	} from '#lib/mpm/kernels/solver.js';
 	import {
 		stepMpm,
 		type MpmMatrix2,
 		type MpmParticle,
-		type MpmStepConfig
+		type MpmStepConfig,
+		type MpmVector2
 	} from '#lib/mpm/reference/solver.js';
 
 	const GRID = { cellsX: 48, cellsY: 32, cellSize: 10 } as const;
+	const WORLD_WIDTH = GRID.cellsX * GRID.cellSize;
+	const WORLD_HEIGHT = GRID.cellsY * GRID.cellSize;
 	const FIXED_STEP_SECONDS = 1 / 120;
 	const FRAME_INTERVAL_MS = 1000 / 30;
 	const MAX_FRAME_SECONDS = 0.1;
 	const MAX_STEPS_PER_FRAME = 4;
+	const GPU_PARTICLE_CAPACITY = 128;
+	const PICK_RADIUS = 14;
+	const BRUSH_RADIUS = 24;
+	const CLONE_OFFSET: MpmVector2 = { x: 72, y: 0 };
 	const PARTICLE_MASS = 1;
 	const PARTICLE_VOLUME = 25;
 	const MATERIAL = { lambda: 20, mu: 10 } as const;
@@ -37,7 +47,8 @@
 					position: { x: 160 + column * 8, y: 60 + row * 8 },
 					velocity: { x: 0, y: 0 },
 					C: ZERO_MATRIX,
-					F: INITIAL_DEFORMATION
+					F: INITIAL_DEFORMATION,
+					objectId: 1
 				});
 			}
 		}
@@ -114,7 +125,219 @@
 	let stateCheckPending = $state(false);
 	let stateCheckMessage = $state('');
 	let stateCheckIsError = $state(false);
-	let particleCount = 56;
+	let particleCount = $state(56);
+	let particleCapacity = $state(GPU_PARTICLE_CAPACITY);
+	let selection = $state<MpmMlsGpuSelection | null>(null);
+	let interactionMessage = $state('初回の CPU/GPU 1 ステップ比較が完了すると操作できます。');
+	let interactionIsError = $state(false);
+
+	let componentMounted = false;
+	let activePointerId = $state<number | null>(null);
+	let pointerGeneration = 0;
+	let pointerPosition: MpmVector2 | null = null;
+	let dragActive = $state(false);
+
+	function worldPointFromEvent(event: PointerEvent): MpmVector2 | null {
+		if (!canvas) return null;
+		const bounds = canvas.getBoundingClientRect();
+		if (bounds.width <= 0 || bounds.height <= 0) return null;
+
+		return {
+			x: Math.min(
+				WORLD_WIDTH,
+				Math.max(0, ((event.clientX - bounds.left) / bounds.width) * WORLD_WIDTH)
+			),
+			y: Math.min(
+				WORLD_HEIGHT,
+				Math.max(0, ((event.clientY - bounds.top) / bounds.height) * WORLD_HEIGHT)
+			)
+		};
+	}
+
+	function finishPointerInteraction(): boolean {
+		pointerGeneration += 1;
+		const pointerId = activePointerId;
+		activePointerId = null;
+		pointerPosition = null;
+
+		let succeeded = true;
+		if (dragActive) {
+			dragActive = false;
+			try {
+				solver?.endDrag();
+			} catch (error) {
+				succeeded = false;
+				const message = `ドラッグを終了できませんでした: ${errorText(error)}`;
+				if (componentMounted) {
+					interactionIsError = true;
+					interactionMessage = message;
+				} else {
+					console.error(message, error);
+				}
+			}
+		}
+
+		if (pointerId !== null) {
+			try {
+				if (canvas?.hasPointerCapture?.(pointerId)) {
+					canvas.releasePointerCapture(pointerId);
+				}
+			} catch {
+				// The browser may already have released capture during cancellation.
+			}
+		}
+
+		return succeeded;
+	}
+
+	function handlePointerMove(event: PointerEvent): void {
+		if (activePointerId !== event.pointerId) return;
+		const point = worldPointFromEvent(event);
+		if (!point) return;
+		pointerPosition = point;
+
+		if (!dragActive || !solver) return;
+		try {
+			solver.updateDrag(point);
+		} catch (error) {
+			finishPointerInteraction();
+			interactionIsError = true;
+			interactionMessage = `ドラッグを更新できませんでした: ${errorText(error)}`;
+		}
+	}
+
+	async function handlePointerDown(event: PointerEvent): Promise<void> {
+		if (!event.isPrimary || event.button !== 0 || phase !== 'ready' || !solver) return;
+		const point = worldPointFromEvent(event);
+		if (!point) return;
+
+		event.preventDefault();
+		if (activePointerId !== null) finishPointerInteraction();
+		selection = null;
+		interactionIsError = false;
+		interactionMessage = '近くの粒子を GPU 上で検索しています…';
+		activePointerId = event.pointerId;
+		pointerPosition = point;
+		const requestGeneration = ++pointerGeneration;
+		const currentSolver = solver;
+
+		try {
+			canvas?.setPointerCapture?.(event.pointerId);
+		} catch {
+			// Pointer capture is an enhancement; the pick still works without it.
+		}
+
+		try {
+			const picked = await currentSolver.pick(point, PICK_RADIUS);
+			if (
+				!componentMounted ||
+				solver !== currentSolver ||
+				phase !== 'ready' ||
+				pointerGeneration !== requestGeneration ||
+				activePointerId !== event.pointerId
+			) {
+				return;
+			}
+
+			if (!picked) {
+				finishPointerInteraction();
+				interactionMessage = '粒子が見つかりません。クラスター上をタップしてください。';
+				return;
+			}
+
+			const target = pointerPosition ?? point;
+			dragActive = true;
+			currentSolver.beginDrag(picked, target, BRUSH_RADIUS);
+			selection = picked;
+			interactionMessage = `オブジェクト ${picked.objectId} を選択しました。有限半径 ${BRUSH_RADIUS} の力でドラッグできます。`;
+		} catch (error) {
+			if (
+				!componentMounted ||
+				solver !== currentSolver ||
+				pointerGeneration !== requestGeneration ||
+				activePointerId !== event.pointerId
+			) {
+				return;
+			}
+			finishPointerInteraction();
+			interactionIsError = true;
+			interactionMessage = `粒子を選択できませんでした: ${errorText(error)}`;
+		}
+	}
+
+	function handlePointerUp(event: PointerEvent): void {
+		if (activePointerId !== event.pointerId) return;
+		const wasDragging = dragActive;
+		const finished = finishPointerInteraction();
+		if (!finished) return;
+
+		interactionIsError = false;
+		if (wasDragging && selection) {
+			interactionMessage = `オブジェクト ${selection.objectId} を選択中です。複製するか、再度ドラッグできます。`;
+		} else if (!selection) {
+			interactionMessage = '粒子の検索中にポインターが離れたため、操作をキャンセルしました。';
+		}
+	}
+
+	function handlePointerCancel(event: PointerEvent): void {
+		if (activePointerId !== event.pointerId) return;
+		const finished = finishPointerInteraction();
+		if (finished) {
+			interactionIsError = false;
+			interactionMessage = 'ポインター操作がキャンセルされました。ドラッグを終了しました。';
+		}
+	}
+
+	function clearSelection(): void {
+		const finished = finishPointerInteraction();
+		selection = null;
+		if (finished) {
+			interactionIsError = false;
+			interactionMessage = 'Escape キーで操作をキャンセルしました。粒子をタップすると再選択できます。';
+		}
+	}
+
+	function handleWindowKeydown(event: KeyboardEvent): void {
+		if (
+			event.key !== 'Escape' ||
+			(activePointerId === null && !dragActive && !selection)
+		) {
+			return;
+		}
+
+		event.preventDefault();
+		clearSelection();
+	}
+
+	function cloneSelection(): void {
+		const currentSolver = solver;
+		const currentSelection = selection;
+		if (
+			!currentSolver ||
+			!currentSelection ||
+			phase !== 'ready' ||
+			activePointerId !== null ||
+			dragActive
+		) {
+			return;
+		}
+
+		interactionIsError = false;
+		try {
+			const cloned = currentSolver.clone(currentSelection, CLONE_OFFSET);
+			particleCount = currentSolver.particleCount;
+			particleCapacity = currentSolver.particleCapacity;
+			if (cloned) {
+				interactionMessage = `オブジェクト ${currentSelection.objectId} を複製しました。粒子数 ${particleCount} / 容量 ${particleCapacity}。`;
+			} else {
+				interactionIsError = true;
+				interactionMessage = `容量上限のため複製できませんでした。粒子数 ${particleCount} / 容量 ${particleCapacity}。`;
+			}
+		} catch (error) {
+			interactionIsError = true;
+			interactionMessage = `複製に失敗しました: ${errorText(error)}`;
+		}
+	}
 
 	function togglePaused(): void {
 		paused = !paused;
@@ -127,6 +350,7 @@
 			solver.step(FIXED_STEP_SECONDS, { x: 0, y: gravityMagnitude });
 			solver.render();
 		} catch (error) {
+			finishPointerInteraction();
 			phase = 'error';
 			phaseMessage = `1 ステップを実行できませんでした: ${errorText(error)}`;
 		}
@@ -141,12 +365,13 @@
 		stateCheckMessage = 'GPU 数値状態を読み取り中…';
 		try {
 			const particles = await currentSolver.readParticles();
-			if (solver !== currentSolver) return;
+			if (solver !== currentSolver || phase !== 'ready') return;
 			stateCheckMessage = `${particles.length} 粒子の GPU 数値状態は正常です。`;
 		} catch (error) {
-			if (solver !== currentSolver) return;
+			if (solver !== currentSolver || phase !== 'ready') return;
 			stateCheckIsError = true;
 			stateCheckMessage = `GPU 数値状態を確認できませんでした: ${errorText(error)}`;
+			finishPointerInteraction();
 			phase = 'error';
 			phaseMessage = 'GPU 数値状態の異常を検出したため停止しました。';
 		} finally {
@@ -156,6 +381,7 @@
 
 	onMount(() => {
 		let mounted = true;
+		componentMounted = true;
 		let activeSolver: GpuSolver | null = null;
 		let frameRequest: number | null = null;
 		let lastFrameTimestamp = 0;
@@ -177,7 +403,8 @@
 		};
 
 		function fail(error: unknown): void {
-			if (!mounted) return;
+			if (!mounted || phase === 'lost') return;
+			finishPointerInteraction();
 			phase = 'error';
 			phaseMessage = errorText(error);
 			console.error('GPU MLS-MPM initialization failed.', error);
@@ -205,6 +432,7 @@
 							y: gravityMagnitude
 						});
 					} catch (error) {
+						finishPointerInteraction();
 						phase = 'error';
 						phaseMessage = `シミュレーションを停止しました: ${errorText(error)}`;
 						return;
@@ -222,6 +450,7 @@
 			try {
 				activeSolver.render();
 			} catch (error) {
+				finishPointerInteraction();
 				phase = 'error';
 				phaseMessage = `描画を停止しました: ${errorText(error)}`;
 			}
@@ -230,6 +459,16 @@
 		function handleVisibilityChange(): void {
 			lastFrameTimestamp = 0;
 			accumulator = 0;
+			if (
+				document.visibilityState !== 'visible' &&
+				(activePointerId !== null || dragActive)
+			) {
+				const finished = finishPointerInteraction();
+				if (finished) {
+					interactionIsError = false;
+					interactionMessage = 'ページが非表示になったため、粒子操作をキャンセルしました。';
+				}
+			}
 		}
 
 		async function initialize(): Promise<void> {
@@ -240,10 +479,14 @@
 
 			try {
 				resizeCanvas();
+				const config = makeStepConfig(gravityMagnitude);
 				const candidate = await createMpmMlsGpuSolver(
 					canvasElement,
 					initialParticles,
-					makeStepConfig(gravityMagnitude)
+					{
+						...config,
+						capacity: GPU_PARTICLE_CAPACITY
+					}
 				);
 				if (!mounted) {
 					candidate.dispose();
@@ -252,18 +495,21 @@
 
 				activeSolver = candidate;
 				solver = candidate;
+				particleCount = candidate.particleCount;
+				particleCapacity = candidate.particleCapacity;
 				candidate.deviceLost.then((info) => {
 					if (!mounted || activeSolver !== candidate) return;
 					if (frameRequest !== null) cancelAnimationFrame(frameRequest);
+					finishPointerInteraction();
+					paused = true;
 					phase = 'lost';
 					phaseMessage = info.message || 'WebGPU デバイスが失われました。';
 				});
 
-				const config = makeStepConfig(gravityMagnitude);
 				const expected = stepMpm(initialParticles, config).particles;
 				candidate.step(FIXED_STEP_SECONDS, config.gravity);
 				const actual = await candidate.readParticles();
-				if (!mounted || activeSolver !== candidate) return;
+				if (!mounted || activeSolver !== candidate || phase === 'lost') return;
 
 				const maxError = maxParticleDifference(actual, expected);
 				parityPassed = maxError <= PARITY_TOLERANCE;
@@ -274,6 +520,7 @@
 					: '初回1ステップの CPU reference 比較で粒子数または数値が一致しません。';
 				phase = 'ready';
 				phaseMessage = 'GPU MLS-MPM を実行中です · 目標 30 fps';
+				interactionMessage = '準備完了。粒子をタップ／クリックして、押したままドラッグできます。';
 				lastFrameTimestamp = performance.now();
 				frameRequest = requestAnimationFrame(renderFrame);
 			} catch (error) {
@@ -294,6 +541,8 @@
 
 		return () => {
 			mounted = false;
+			componentMounted = false;
+			finishPointerInteraction();
 			resizeObserver.disconnect();
 			window.removeEventListener('resize', resizeCanvas);
 			document.removeEventListener('visibilitychange', handleVisibilityChange);
@@ -312,22 +561,29 @@
 	});
 </script>
 
+<svelte:window
+	onkeydown={handleWindowKeydown}
+	onpointermove={handlePointerMove}
+	onpointerup={handlePointerUp}
+	onpointercancel={handlePointerCancel}
+/>
+
 <svelte:head>
-	<title>GPU MLS-MPM kernels · powder-play</title>
+	<title>GPU MLS-MPM 操作ラボ · powder-play</title>
 	<meta
 		name="description"
-		content="Single-material 2D MLS-MPM GPU kernel and CPU reference comparison."
+		content="GPU MLS-MPM と CPU reference を比較した後に、GPU 粒子操作を検証します。"
 	/>
 </svelte:head>
 
 <main class="lab">
 	<header class="header">
 		<div>
-			<p class="eyebrow">GATE 1 · NUMERICAL CORE</p>
-			<h1>GPU 2D MLS-MPM</h1>
+			<p class="eyebrow">GATE 2 · INTERACTION INTEGRATION</p>
+			<h1>GPU 2D MLS-MPM 操作ラボ</h1>
 			<p class="intro">
 				単一材料の弾性 MLS-MPM を GPU compute pass で実行し、初回の1ステップを CPU
-				reference と比較します。
+				reference と比較した後、粒子の選択・力ベースのドラッグ・複製を試します。
 			</p>
 		</div>
 		<nav aria-label="実験ページ">
@@ -340,7 +596,9 @@
 		<div class="panel-heading">
 			<div>
 				<h2 id="simulation-title">弾性粒子クラスター</h2>
-				<p>{particleCount} 粒子 · {GRID.cellsX} × {GRID.cellsY} grid · Neo-Hookean</p>
+				<p>
+					{particleCount} / {particleCapacity} 粒子 · {GRID.cellsX} × {GRID.cellsY} grid · Neo-Hookean
+				</p>
 			</div>
 			<p class="status" class:error={phase === 'error' || phase === 'lost'} role="status">
 				{phaseMessage}
@@ -348,9 +606,47 @@
 		</div>
 
 		<div class="canvas-frame">
-			<canvas bind:this={canvas} aria-label="GPU 上で計算する MLS-MPM 粒子シミュレーション">
+			<canvas
+				bind:this={canvas}
+				tabindex="0"
+				aria-label="GPU 上で計算する MLS-MPM 粒子シミュレーション"
+				aria-describedby="interaction-instructions interaction-status"
+				onpointerdown={handlePointerDown}
+				onlostpointercapture={handlePointerCancel}
+			>
 				WebGPU canvas に対応したブラウザーが必要です。
 			</canvas>
+		</div>
+
+		<div class="interaction-controls" aria-labelledby="interaction-title">
+			<h2 id="interaction-title">粒子操作</h2>
+			<p id="interaction-instructions">
+				キャンバス内をタップ／クリックして選択し、押したままドラッグすると半径 {BRUSH_RADIUS}
+				の範囲に力を加えます。Escape キー、ポインターキャンセル、またはページ非表示で操作を終了します。
+			</p>
+			<div class="interaction-actions">
+				<button
+					type="button"
+					class="secondary"
+					onclick={cloneSelection}
+					disabled={phase !== 'ready' || !selection || activePointerId !== null || dragActive}
+				>
+					選択オブジェクトを複製（+{CLONE_OFFSET.x}, {CLONE_OFFSET.y}）
+				</button>
+				<p class="particle-count" aria-label="現在の粒子数と容量">
+					粒子数 {particleCount} / {particleCapacity}（使用数 / GPU 容量）
+				</p>
+			</div>
+			<p
+				id="interaction-status"
+				class="interaction-status"
+				class:error={interactionIsError}
+				role="status"
+				aria-live="polite"
+				aria-atomic="true"
+			>
+				{interactionMessage}
+			</p>
 		</div>
 
 		{#if parityMessage}
@@ -404,7 +700,7 @@
 
 	<aside class="note">
 		<strong>検証範囲:</strong> P2G・grid update・G2P の単一材料 Neo-Hookean 弾性モデルです。
-		液体の構成則、水・油の分離、複数材料、選択・ドラッグ統合は未実装です。粒子状態の GPU
+		objectId による粒子選択、有限半径の力ベースドラッグ、選択オブジェクトの複製を統合しています。液体の構成則、水・油の分離、複数材料は未実装です。粒子状態の GPU
 		readback は初回比較時と一時停止中の明示的な状態確認時だけ行い、通常の各フレームでは行いません。
 	</aside>
 </main>
@@ -521,6 +817,48 @@
 		touch-action: none;
 	}
 
+	canvas:focus-visible {
+		outline: 3px solid #8ec9ff;
+		outline-offset: -4px;
+	}
+
+	.interaction-controls {
+		margin-top: 1rem;
+		padding-top: 1rem;
+		border-top: 1px solid #31445a;
+	}
+
+	.interaction-controls h2 {
+		margin-bottom: 0.35rem;
+	}
+
+	.interaction-controls p {
+		margin-bottom: 0;
+		color: #b8c7d8;
+		line-height: 1.5;
+	}
+
+	.interaction-actions {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.75rem;
+		margin-top: 0.75rem;
+	}
+
+	.interaction-actions .particle-count {
+		font-variant-numeric: tabular-nums;
+	}
+
+	.interaction-status {
+		margin-top: 0.75rem;
+		color: #9de2bc !important;
+	}
+
+	.interaction-status.error {
+		color: #ffb4a9 !important;
+	}
+
 	.parity {
 		margin: 0.8rem 0 0;
 		color: #ffe09a;
@@ -618,6 +956,11 @@
 		.status {
 			max-width: none;
 			text-align: left;
+		}
+
+		.interaction-actions {
+			align-items: stretch;
+			flex-direction: column;
 		}
 
 		.gravity-control {

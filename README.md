@@ -66,12 +66,11 @@ Android Chrome と iOS Safari のセンサー権限、複数指操作、画面�
 
 ## 実験中: GPU 粒子操作
 
-`/labs/mpm` は、WebGPU 上の粒子選択・ドラッグ・複製を検証する独立した実験画面です。
-現段階の粒子移動は操作経路の PoC であり、MLS-MPM の物理演算ではありません。
-WebGPU 非対応のブラウザーでは利用できません。通常のアプリ画面 `/` は従来の
-シミュレーションを引き続き使用します。実装状況と次の判定ゲートは
+`/labs/mpm` は、合成粒子上でWebGPU操作を検証するGate 0の独立した実験画面です。
+`/labs/mpm/kernels` は、Gate 1の単一材料Neo-Hookean弾性MLS-MPMとGate 2のGPU選択・局所力
+ドラッグ・オブジェクト複製を検証します。いずれもWebGPU非対応のブラウザーでは利用できません。
+通常のアプリ画面 `/` は従来のシミュレーションを引き続き使用します。実装状況と次の判定ゲートは
 [2D GPU MLS-MPM ロードマップ](./docs/ROADMAP-MLS-MPM.md) を参照してください。
 
-`/labs/mpm/kernels` は Gate 1 の数値実験画面です。単一材料の Neo-Hookean 弾性 MLS-MPM
-を GPU で実行し、初回の1ステップを CPU reference と照合します。水の構成則や既存の
-粒子操作との統合はまだ対象外です。
+Gate 2のドラッグは水の物理モデルではなくgrid上の局所力です。実機でのshader compile、
+CPU/GPU数値比較、操作の安定性や30 fpsは別途検証が必要です。
