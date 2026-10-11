@@ -32,6 +32,7 @@
 		isRenderFrameDue,
 		type GridSize
 	} from '#lib/perf/resolution.js';
+	import { renderParticleLayer } from '#lib/render/particle-layer.js';
 	import { MATERIAL, materialRegistry } from '#lib/sim/materials.js';
 	import {
 		createFlowStroke,
@@ -102,7 +103,7 @@
 	interface WorldDrawCache {
 		world: SimulationWorld | null;
 		cellRevision: number;
-		particlePaths: Map<number, Path2D>;
+		particleIndicesByMaterial: number[][];
 	}
 
 	type OrientationLock =
@@ -690,6 +691,8 @@
 		context: CanvasRenderingContext2D,
 		buffer: HTMLCanvasElement,
 		bufferContext: CanvasRenderingContext2D,
+		particleLayer: HTMLCanvasElement,
+		particleLayerContext: CanvasRenderingContext2D,
 		image: ImageData,
 		canvas: HTMLCanvasElement,
 		currentWorld: SimulationWorld,
@@ -717,7 +720,7 @@
 			worldDrawCache.world !== currentWorld ||
 			worldDrawCache.cellRevision !== currentWorld.cellRevision;
 		if (worldChanged) {
-			worldDrawCache.particlePaths.clear();
+			for (const indices of worldDrawCache.particleIndicesByMaterial) indices.length = 0;
 			for (let index = 0; index < currentWorld.cells.length; index++) {
 				const material = currentWorld.cells[index];
 				if (paletteReady[material] === 0) {
@@ -734,15 +737,9 @@
 					image.data[pixelOffset + 1] = 0;
 					image.data[pixelOffset + 2] = 0;
 					image.data[pixelOffset + 3] = 0;
-					let path = worldDrawCache.particlePaths.get(material);
-					if (!path) {
-						path = new Path2D();
-						worldDrawCache.particlePaths.set(material, path);
-					}
-					const x = index % currentWorld.width;
-					const y = Math.floor(index / currentWorld.width);
-					path.moveTo(x + 0.5 + radius, y + 0.5);
-					path.arc(x + 0.5, y + 0.5, radius, 0, Math.PI * 2);
+					const indices = worldDrawCache.particleIndicesByMaterial[material];
+					if (!indices) throw new RangeError(`Unsupported particle material id: ${material}.`);
+					indices.push(index);
 					continue;
 				}
 				image.data[pixelOffset] = palette[colorOffset];
@@ -751,6 +748,14 @@
 				image.data[pixelOffset + 3] = palette[colorOffset + 3];
 			}
 			bufferContext.putImageData(image, 0, 0);
+			renderParticleLayer(
+				particleLayer,
+				particleLayerContext,
+				currentWorld,
+				worldDrawCache.particleIndicesByMaterial,
+				palette,
+				particleRadii
+			);
 			worldDrawCache.world = currentWorld;
 			worldDrawCache.cellRevision = currentWorld.cellRevision;
 		}
@@ -760,19 +765,15 @@
 		const top = rect.height / 2 - currentCamera.centerY * scale;
 		context.imageSmoothingEnabled = false;
 		context.drawImage(buffer, left, top, currentWorld.width * scale, currentWorld.height * scale);
-		if (worldDrawCache.particlePaths.size > 0) {
-			context.save();
-			context.translate(left, top);
-			context.scale(scale, scale);
-			for (const [material, path] of worldDrawCache.particlePaths) {
-				const colorOffset = material * 4;
-				context.fillStyle = `rgba(${palette[colorOffset]}, ${palette[colorOffset + 1]}, ${
-					palette[colorOffset + 2]
-				}, ${palette[colorOffset + 3] / 255})`;
-				context.fill(path);
-			}
-			context.restore();
-		}
+		context.imageSmoothingEnabled = true;
+		context.drawImage(
+			particleLayer,
+			left,
+			top,
+			currentWorld.width * scale,
+			currentWorld.height * scale
+		);
+		context.imageSmoothingEnabled = false;
 
 		context.save();
 		context.fillStyle = 'rgba(255, 204, 91, 0.30)';
@@ -844,7 +845,9 @@
 		const context = canvasElement.getContext('2d', { alpha: true });
 		const buffer = document.createElement('canvas');
 		const bufferContext = buffer.getContext('2d', { alpha: true });
-		if (!context || !bufferContext) {
+		const particleLayer = document.createElement('canvas');
+		const particleLayerContext = particleLayer.getContext('2d', { alpha: true });
+		if (!context || !bufferContext || !particleLayerContext) {
 			errorMessage = 'このブラウザーでは 2D Canvas を初期化できません。';
 			return;
 		}
@@ -856,7 +859,7 @@
 		const worldDrawCache: WorldDrawCache = {
 			world: null,
 			cellRevision: -1,
-			particlePaths: new Map()
+			particleIndicesByMaterial: Array.from({ length: 256 }, () => [])
 		};
 		let bufferImage: ImageData | null = null;
 		let animationFrame = 0;
@@ -966,6 +969,8 @@
 				context,
 				buffer,
 				bufferContext,
+				particleLayer,
+				particleLayerContext,
 				bufferImage,
 				canvasElement,
 				world,
