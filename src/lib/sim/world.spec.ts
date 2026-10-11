@@ -83,6 +83,26 @@ describe('world initialization and movement', () => {
 		expect(tiltedWorld.get(2, 2)).toBe(MATERIAL.powder);
 	});
 
+	it('tracks cell changes used to invalidate cached rendering', () => {
+		const world = new SimulationWorld(4, 4);
+		expect(world.cellRevision).toBe(0);
+
+		world.set(1, 1, MATERIAL.powder);
+		const placedRevision = world.cellRevision;
+		stepWorld(world, defaultForces, [], () => 0.5);
+		expect(world.cellRevision).toBeGreaterThan(placedRevision);
+
+		const afterStepRevision = world.cellRevision;
+		const moved = moveSelection(world, selectConnected(world, 1, 2), 1, 0);
+		expect(moved).not.toBeNull();
+		expect(world.cellRevision).toBeGreaterThan(afterStepRevision);
+
+		const afterMoveRevision = world.cellRevision;
+		const pattern = createSelectionPattern(world, moved ?? []);
+		expect(placePattern(world, pattern, 0, 0)).toBe(true);
+		expect(world.cellRevision).toBeGreaterThan(afterMoveRevision);
+	});
+
 	it('spreads over-packed particles into nearby air while conserving their count', () => {
 		const world = new SimulationWorld(7, 7);
 		for (let y = 2; y <= 4; y++) {

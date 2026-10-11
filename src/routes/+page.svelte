@@ -93,6 +93,12 @@
 		startingMode: InteractionMode;
 	}
 
+	interface WorldDrawCache {
+		world: SimulationWorld | null;
+		cellRevision: number;
+		particlePaths: Map<number, Path2D>;
+	}
+
 	type OrientationLock =
 		| 'any'
 		| 'natural'
@@ -687,7 +693,8 @@
 		currentDraft: readonly Point[],
 		palette: Uint8ClampedArray,
 		paletteReady: Uint8Array,
-		particleRadii: Float32Array
+		particleRadii: Float32Array,
+		worldDrawCache: WorldDrawCache
 	): void {
 		const rect = canvas.getBoundingClientRect();
 		if (rect.width <= 0 || rect.height <= 0) return;
@@ -700,53 +707,58 @@
 		}
 		context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
 		context.clearRect(0, 0, rect.width, rect.height);
-
-		const particlePaths = new Map<number, Path2D>();
-		for (let index = 0; index < currentWorld.cells.length; index++) {
-			const material = currentWorld.cells[index];
-			if (paletteReady[material] === 0) {
-				const plugin = materialRegistry.get(material);
-				palette.set(plugin.color, material * 4);
-				particleRadii[material] = plugin.particleRadius ?? -1;
-				paletteReady[material] = 1;
-			}
-			const colorOffset = material * 4;
-			const pixelOffset = index * 4;
-			const radius = particleRadii[material];
-			if (radius >= 0) {
-				image.data[pixelOffset] = 0;
-				image.data[pixelOffset + 1] = 0;
-				image.data[pixelOffset + 2] = 0;
-				image.data[pixelOffset + 3] = 0;
-				let path = particlePaths.get(material);
-				if (!path) {
-					path = new Path2D();
-					particlePaths.set(material, path);
+		const worldChanged =
+			worldDrawCache.world !== currentWorld ||
+			worldDrawCache.cellRevision !== currentWorld.cellRevision;
+		if (worldChanged) {
+			worldDrawCache.particlePaths.clear();
+			for (let index = 0; index < currentWorld.cells.length; index++) {
+				const material = currentWorld.cells[index];
+				if (paletteReady[material] === 0) {
+					const plugin = materialRegistry.get(material);
+					palette.set(plugin.color, material * 4);
+					particleRadii[material] = plugin.particleRadius ?? -1;
+					paletteReady[material] = 1;
 				}
-				const x = index % currentWorld.width;
-				const y = Math.floor(index / currentWorld.width);
-				path.moveTo(x + 0.5 + radius, y + 0.5);
-				path.arc(x + 0.5, y + 0.5, radius, 0, Math.PI * 2);
-				continue;
+				const colorOffset = material * 4;
+				const pixelOffset = index * 4;
+				const radius = particleRadii[material];
+				if (radius >= 0) {
+					image.data[pixelOffset] = 0;
+					image.data[pixelOffset + 1] = 0;
+					image.data[pixelOffset + 2] = 0;
+					image.data[pixelOffset + 3] = 0;
+					let path = worldDrawCache.particlePaths.get(material);
+					if (!path) {
+						path = new Path2D();
+						worldDrawCache.particlePaths.set(material, path);
+					}
+					const x = index % currentWorld.width;
+					const y = Math.floor(index / currentWorld.width);
+					path.moveTo(x + 0.5 + radius, y + 0.5);
+					path.arc(x + 0.5, y + 0.5, radius, 0, Math.PI * 2);
+					continue;
+				}
+				image.data[pixelOffset] = palette[colorOffset];
+				image.data[pixelOffset + 1] = palette[colorOffset + 1];
+				image.data[pixelOffset + 2] = palette[colorOffset + 2];
+				image.data[pixelOffset + 3] = palette[colorOffset + 3];
 			}
-			image.data[pixelOffset] = palette[colorOffset];
-			image.data[pixelOffset + 1] = palette[colorOffset + 1];
-			image.data[pixelOffset + 2] = palette[colorOffset + 2];
-			image.data[pixelOffset + 3] = palette[colorOffset + 3];
+			bufferContext.putImageData(image, 0, 0);
+			worldDrawCache.world = currentWorld;
+			worldDrawCache.cellRevision = currentWorld.cellRevision;
 		}
-		bufferContext.putImageData(image, 0, 0);
 		const viewport = { width: rect.width, height: rect.height };
 		const scale = cameraScale(currentCamera, viewport, currentWorld.width, currentWorld.height);
 		const left = rect.width / 2 - currentCamera.centerX * scale;
 		const top = rect.height / 2 - currentCamera.centerY * scale;
 		context.imageSmoothingEnabled = false;
 		context.drawImage(buffer, left, top, currentWorld.width * scale, currentWorld.height * scale);
-
-		if (particlePaths.size > 0) {
+		if (worldDrawCache.particlePaths.size > 0) {
 			context.save();
 			context.translate(left, top);
 			context.scale(scale, scale);
-			for (const [material, path] of particlePaths) {
+			for (const [material, path] of worldDrawCache.particlePaths) {
 				const colorOffset = material * 4;
 				context.fillStyle = `rgba(${palette[colorOffset]}, ${palette[colorOffset + 1]}, ${
 					palette[colorOffset + 2]
@@ -835,6 +847,11 @@
 		const palette = new Uint8ClampedArray(256 * 4);
 		const paletteReady = new Uint8Array(256);
 		const particleRadii = new Float32Array(256).fill(-1);
+		const worldDrawCache: WorldDrawCache = {
+			world: null,
+			cellRevision: -1,
+			particlePaths: new Map()
+		};
 		let bufferImage: ImageData | null = null;
 		let animationFrame = 0;
 		let measurementFrame = 0;
@@ -849,11 +866,11 @@
 
 		const resizeCanvasBuffer = (): void => {
 			if (!world) return;
-			if (
+			const bufferChanged =
 				!bufferImage ||
 				buffer.width !== world.width ||
-				buffer.height !== world.height
-			) {
+				buffer.height !== world.height;
+			if (bufferChanged) {
 				buffer.width = world.width;
 				buffer.height = world.height;
 				bufferImage = bufferContext.createImageData(world.width, world.height);
@@ -948,7 +965,8 @@
 				flowDraft,
 				palette,
 				paletteReady,
-				particleRadii
+				particleRadii,
+				worldDrawCache
 			);
 			if (!isPaused) {
 				const nextSize = resolution.observe(performance.now() - frameStarted, {

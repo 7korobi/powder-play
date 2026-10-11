@@ -46,6 +46,7 @@ export class SimulationWorld {
 	readonly cells: Uint8Array;
 	readonly lastMoved: Uint32Array;
 	tick = 0;
+	private cellRevisionValue = 0;
 
 	constructor(
 		readonly width: number,
@@ -77,7 +78,18 @@ export class SimulationWorld {
 		if (!Number.isInteger(material) || material < 0 || material > 255) {
 			throw new RangeError('Material ids must be integers between 0 and 255.');
 		}
-		this.cells[y * this.width + x] = material;
+		const index = y * this.width + x;
+		if (this.cells[index] === material) return;
+		this.cells[index] = material;
+		this.markCellsChanged();
+	}
+
+	get cellRevision(): number {
+		return this.cellRevisionValue;
+	}
+
+	markCellsChanged(): void {
+		this.cellRevisionValue++;
 	}
 
 	contains(x: number, y: number): boolean {
@@ -188,6 +200,7 @@ export function moveSelection(
 	for (let index = 0; index < destinations.length; index++) {
 		world.cells[destinations[index]] = materials[index];
 	}
+	world.markCellsChanged();
 	return destinations;
 }
 
@@ -224,6 +237,7 @@ export function placePattern(
 	for (let index = 0; index < destinations.length; index++) {
 		world.cells[destinations[index]] = pattern[index].material;
 	}
+	world.markCellsChanged();
 	return true;
 }
 
@@ -697,6 +711,7 @@ function swapCells(world: SimulationWorld, firstIndex: number, secondIndex: numb
 	const first = world.cells[firstIndex];
 	world.cells[firstIndex] = world.cells[secondIndex];
 	world.cells[secondIndex] = first;
+	world.markCellsChanged();
 	world.lastMoved[firstIndex] = world.tick;
 	world.lastMoved[secondIndex] = world.tick;
 }
