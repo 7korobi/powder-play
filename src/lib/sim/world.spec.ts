@@ -18,14 +18,19 @@ const defaultForces = {
 };
 
 describe('world initialization and movement', () => {
-	it('starts with about 47.5% water, 47.5% air, and 5% powder', () => {
+	it('starts with 35% air, 40% water, 20% oil, and 5% powder in layers', () => {
 		const world = createInitialWorld(100, 100);
-		const counts = [0, 0, 0];
+		const counts = [0, 0, 0, 0];
 		for (const material of world.cells) counts[material]++;
 
-		expect(counts[MATERIAL.water]).toBe(4_700);
-		expect(counts[MATERIAL.air]).toBe(4_800);
+		expect(counts[MATERIAL.water]).toBe(4_000);
+		expect(counts[MATERIAL.oil]).toBe(2_000);
 		expect(counts[MATERIAL.powder]).toBe(500);
+		expect(counts[MATERIAL.air]).toBe(3_500);
+		expect(world.get(0, 34)).toBe(MATERIAL.air);
+		expect(world.get(0, 35)).toBe(MATERIAL.powder);
+		expect(world.get(0, 40)).toBe(MATERIAL.oil);
+		expect(world.get(0, 60)).toBe(MATERIAL.water);
 	});
 
 	it('lets powder fall through air but keeps it above water', () => {
@@ -134,10 +139,11 @@ describe('world initialization and movement', () => {
 			...[
 				materialRegistry.get(MATERIAL.air),
 				materialRegistry.get(MATERIAL.water),
-				materialRegistry.get(MATERIAL.powder)
+				materialRegistry.get(MATERIAL.powder),
+				materialRegistry.get(MATERIAL.oil)
 			],
 			{
-				id: 3,
+				id: 4,
 				name: 'wall',
 				phase: 'solid',
 				density: 3,
@@ -145,9 +151,9 @@ describe('world initialization and movement', () => {
 			}
 		]);
 		const world = new SimulationWorld(3, 4);
-		for (let x = 0; x < world.width; x++) world.set(x, 3, 3);
-		world.set(0, 2, 3);
-		world.set(2, 2, 3);
+		for (let x = 0; x < world.width; x++) world.set(x, 3, 4);
+		world.set(0, 2, 4);
+		world.set(2, 2, 4);
 		world.set(1, 1, MATERIAL.water);
 		world.set(1, 2, MATERIAL.powder);
 
@@ -155,6 +161,40 @@ describe('world initialization and movement', () => {
 
 		expect(world.get(1, 1)).toBe(MATERIAL.powder);
 		expect(world.get(1, 2)).toBe(MATERIAL.water);
+	});
+
+	it('keeps oil above water and lets denser water displace oil upward', () => {
+		const registry = new MaterialRegistry([
+			...[
+				materialRegistry.get(MATERIAL.air),
+				materialRegistry.get(MATERIAL.water),
+				materialRegistry.get(MATERIAL.powder),
+				materialRegistry.get(MATERIAL.oil)
+			],
+			{
+				id: 4,
+				name: 'wall',
+				phase: 'solid',
+				density: 3,
+				color: [0, 0, 0, 255]
+			}
+		]);
+
+		const oilAboveWater = new SimulationWorld(1, 4);
+		oilAboveWater.set(0, 3, 4);
+		oilAboveWater.set(0, 2, MATERIAL.water);
+		oilAboveWater.set(0, 1, MATERIAL.oil);
+		stepWorld(oilAboveWater, defaultForces, [], () => 0.5, registry);
+		expect(oilAboveWater.get(0, 1)).toBe(MATERIAL.oil);
+		expect(oilAboveWater.get(0, 2)).toBe(MATERIAL.water);
+
+		const waterAboveOil = new SimulationWorld(1, 4);
+		waterAboveOil.set(0, 3, 4);
+		waterAboveOil.set(0, 2, MATERIAL.oil);
+		waterAboveOil.set(0, 1, MATERIAL.water);
+		stepWorld(waterAboveOil, defaultForces, [], () => 0.5, registry);
+		expect(waterAboveOil.get(0, 1)).toBe(MATERIAL.oil);
+		expect(waterAboveOil.get(0, 2)).toBe(MATERIAL.water);
 	});
 
 	it('applies gas repulsion only at a nearby movable material boundary', () => {
@@ -169,8 +209,9 @@ describe('world initialization and movement', () => {
 			},
 			materialRegistry.get(MATERIAL.water),
 			materialRegistry.get(MATERIAL.powder),
+			materialRegistry.get(MATERIAL.oil),
 			{
-				id: 3,
+				id: 4,
 				name: 'wall',
 				phase: 'solid',
 				density: 3,
@@ -178,10 +219,10 @@ describe('world initialization and movement', () => {
 			}
 		]);
 		const world = new SimulationWorld(5, 5);
-		for (let x = 0; x < world.width; x++) world.set(x, 3, 3);
-		world.set(1, 2, 3);
+		for (let x = 0; x < world.width; x++) world.set(x, 3, 4);
+		world.set(1, 2, 4);
 		world.set(2, 2, MATERIAL.water);
-		world.set(3, 2, 3);
+		world.set(3, 2, 4);
 
 		stepWorld(world, defaultForces, [], () => 0, registry);
 

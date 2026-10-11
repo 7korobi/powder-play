@@ -1028,10 +1028,10 @@
 </script>
 
 <svelte:head>
-	<title>powder-play — 粉・水・空気で遊ぶ</title>
+	<title>powder-play — 粉・水・油・空気で遊ぶ</title>
 	<meta
 		name="description"
-		content="スマートフォンの傾きやタッチで、粉・水・空気を動かして遊ぶブラウザーゲーム。"
+		content="スマートフォンの傾きやタッチで、粉・水・油・空気を動かして遊ぶブラウザーゲーム。"
 	/>
 	<meta name="theme-color" content="#b9e8ed" />
 </svelte:head>
@@ -1040,7 +1040,7 @@
 	<canvas
 		bind:this={canvasElement}
 		class="world-canvas"
-		aria-label="粉、水、空気を動かして遊ぶキャンバス"
+		aria-label="粉、水、油、空気を動かして遊ぶキャンバス"
 		onpointerdown={pointerDown}
 		onpointermove={pointerMove}
 		onpointerup={pointerUp}

@@ -106,13 +106,18 @@ export class SimulationWorld {
 
 export function createInitialWorld(width: number, height: number): SimulationWorld {
 	const world = new SimulationWorld(width, height);
-	const waterRows = Math.max(1, Math.floor(height * 0.475));
-	const powderRows = Math.max(1, Math.floor(height * 0.05));
-	const powderStart = Math.max(0, height - waterRows - powderRows);
+	const waterRows = Math.floor(height * 0.4);
+	const oilRows = Math.floor(height * 0.2);
+	const powderRows = Math.floor(height * 0.05);
 	const waterStart = height - waterRows;
+	const oilStart = waterStart - oilRows;
+	const powderStart = oilStart - powderRows;
 
-	for (let y = powderStart; y < waterStart; y++) {
+	for (let y = powderStart; y < oilStart; y++) {
 		world.cells.fill(MATERIAL.powder, y * width, (y + 1) * width);
+	}
+	for (let y = oilStart; y < waterStart; y++) {
+		world.cells.fill(MATERIAL.oil, y * width, (y + 1) * width);
 	}
 	for (let y = waterStart; y < height; y++) {
 		world.cells.fill(MATERIAL.water, y * width, (y + 1) * width);

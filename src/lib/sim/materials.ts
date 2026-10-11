@@ -75,7 +75,8 @@ export class MaterialRegistry {
 export const MATERIAL = {
 	air: 0,
 	water: 1,
-	powder: 2
+	powder: 2,
+	oil: 3
 } as const;
 
 export type MaterialId = (typeof MATERIAL)[keyof typeof MATERIAL];
@@ -106,5 +107,14 @@ export const materialRegistry = new MaterialRegistry([
 		color: [210, 220, 230, 255],
 		packingDensity: 0.42,
 		particleRadius: 0.38
+	},
+	{
+		id: MATERIAL.oil,
+		name: '油',
+		phase: 'liquid',
+		density: 1,
+		color: [224, 154, 46, 180],
+		packingDensity: 0.68,
+		particleRadius: 0.45
 	}
 ]);
