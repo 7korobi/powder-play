@@ -20,6 +20,13 @@ npm test
 npm run build
 ```
 
+## Cloudflare Pages へのデプロイ
+
+Cloudflare Pages のビルド設定は次のとおりです。
+
+- ビルドコマンド: `npm run build`
+- ビルド出力ディレクトリ: `.svelte-kit/cloudflare`
+
 ## 操作
 
 - **選択**: 粒子をタップし、選択グループをドラッグして移動
