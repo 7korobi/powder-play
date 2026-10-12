@@ -5,6 +5,7 @@ import type {
 	MpmVector2
 } from '../reference/solver.js';
 import {
+	encodeMpmConstitutiveModel,
 	normalizeMpmConstitutiveModel,
 	SNOW_PLASTICITY
 } from '../materials.js';
@@ -62,7 +63,7 @@ export interface ValidatedMpmMlsGpuInput {
 	readonly gradientScaleF32: number;
 }
 
-export const PARTICLE_FLOATS = 16;
+export const PARTICLE_FLOATS = 20;
 export const PARTICLE_STRIDE_BYTES = PARTICLE_FLOATS * Float32Array.BYTES_PER_ELEMENT;
 export const OBJECT_ID_STRIDE_BYTES = Uint32Array.BYTES_PER_ELEMENT;
 export const SIMULATION_PARAMS_BYTES = 80;
@@ -134,7 +135,11 @@ export function validateMpmMlsGpuInput(
 	const particleMassF32 = finiteFloat32(particleMass, 'particleMass', true);
 	const particleVolumeF32 = finiteFloat32(particleVolume, 'particleVolume', true);
 	const lambdaF32 = finiteFloat32(lambda, 'material.lambda');
-	const muF32 = finiteFloat32(mu, 'material.mu', true);
+	const muF32 = finiteFloat32(
+		mu,
+		'material.mu',
+		material.model !== 'water' && material.model !== 'oil'
+	);
 	const gradientScaleF32 = finiteFloat32(gradientScale, 'grid gradient scale', true);
 	const domainWidthF32 = finiteFloat32(
 		cellsX * cellSizeF32,
@@ -199,6 +204,13 @@ export function validateMpmMlsGpuInput(
 			rawParticle.plasticVolume === undefined
 				? 1
 				: finiteNumber(rawParticle.plasticVolume, `particles[${index}].plasticVolume`);
+		const particleVolume =
+			rawParticle.volume === undefined
+				? particleVolumeF32
+				: finiteNumber(rawParticle.volume, `particles[${index}].volume`);
+		if (particleVolume <= 0) {
+			throw new RangeError(`particles[${index}].volume must be greater than zero`);
+		}
 		if (
 			plasticVolume < SNOW_PLASTICITY.minPlasticVolume ||
 			plasticVolume > SNOW_PLASTICITY.maxPlasticVolume
@@ -223,6 +235,29 @@ export function validateMpmMlsGpuInput(
 			);
 		}
 
+		const isLiquid =
+			particleMaterial.model === 'water' || particleMaterial.model === 'oil';
+		const density = isLiquid ? particleMaterial.density : 0;
+		const frictionCoefficient =
+			particleMaterial.model === 'powder'
+				? particleMaterial.frictionCoefficient
+				: 0;
+		const packedVolume = finiteFloat32(
+			particleVolume,
+			`particles[${index}].volume`,
+			true
+		);
+		const packedDensity = finiteFloat32(
+			density,
+			`particles[${index}].material.density`,
+			isLiquid
+		);
+		const packedMass = isLiquid
+			? Math.fround(packedDensity * packedVolume)
+			: particleMassF32;
+		if (!Number.isFinite(packedMass) || packedMass <= 0) {
+			throw new RangeError(`particles[${index}] mass is outside the supported float32 range`);
+		}
 		const offset = index * PARTICLE_FLOATS;
 		const packed = [
 			finiteFloat32(position.x, `particles[${index}].position.x`),
@@ -240,7 +275,18 @@ export function validateMpmMlsGpuInput(
 			finiteFloat32(plasticVolume, `particles[${index}].plasticVolume`, true),
 			0,
 			finiteFloat32(particleMaterial.lambda, `particles[${index}].material.lambda`),
-			finiteFloat32(particleMaterial.mu, `particles[${index}].material.mu`, true)
+			finiteFloat32(
+				particleMaterial.mu,
+				`particles[${index}].material.mu`,
+				!isLiquid
+			),
+			packedDensity,
+			packedVolume,
+			finiteFloat32(
+				frictionCoefficient,
+				`particles[${index}].material.frictionCoefficient`
+			),
+			0
 		];
 
 		const packedDeterminant = Math.fround(
@@ -263,8 +309,9 @@ export function validateMpmMlsGpuInput(
 			);
 		}
 		packedParticles.set(packed, offset);
-		packedParticleWords[offset + 13] =
-			particleMaterial.model === 'snow' ? 1 : 0;
+		packedParticleWords[offset + 13] = encodeMpmConstitutiveModel(
+			particleMaterial.model ?? 'neo-hookean'
+		);
 		packedObjectIds[index] = objectId;
 
 		const currentRange = objectRanges.at(-1);
@@ -522,11 +569,45 @@ function validateMaterial(value: unknown, name: string): MpmMaterialParameters {
 	const lambda = finiteNumber(record.lambda, `${name}.lambda`);
 	const mu = finiteNumber(record.mu, `${name}.mu`);
 	const model = normalizeMpmConstitutiveModel(record.model, `${name}.model`);
-	if (lambda < 0) throw new RangeError(`${name}.lambda must be non-negative`);
-	if (mu <= 0) throw new RangeError(`${name}.mu must be greater than zero`);
 	if (!Number.isFinite(lambda + 2 * mu)) {
 		throw new RangeError(`${name} parameters are outside the supported numeric range`);
 	}
+	if (model === 'water' || model === 'oil') {
+		const density = finiteNumber(record.density, `${name}.density`);
+		if (lambda <= 0) throw new RangeError(`${name}.lambda must be greater than zero`);
+		if (mu !== 0) throw new RangeError(`${name}.mu must be zero for a liquid material`);
+		if (record.frictionCoefficient !== undefined) {
+			throw new RangeError(`${name}.frictionCoefficient is only valid for powder`);
+		}
+		if (density <= 0) throw new RangeError(`${name}.density must be greater than zero`);
+		finiteFloat32(lambda, `${name}.lambda`, true);
+		finiteFloat32(mu, `${name}.mu`);
+		finiteFloat32(density, `${name}.density`, true);
+		return { lambda, mu: 0, model, density };
+	}
+	if (model === 'powder') {
+		const frictionCoefficient = finiteNumber(
+			record.frictionCoefficient,
+			`${name}.frictionCoefficient`
+		);
+		if (lambda < 0) throw new RangeError(`${name}.lambda must be non-negative`);
+		if (mu <= 0) throw new RangeError(`${name}.mu must be greater than zero`);
+		if (frictionCoefficient < 0) {
+			throw new RangeError(`${name}.frictionCoefficient must be non-negative`);
+		}
+		if (record.density !== undefined) {
+			throw new RangeError(`${name}.density is only valid for water or oil`);
+		}
+		finiteFloat32(lambda, `${name}.lambda`);
+		finiteFloat32(mu, `${name}.mu`, true);
+		finiteFloat32(frictionCoefficient, `${name}.frictionCoefficient`);
+		return { lambda, mu, model, frictionCoefficient };
+	}
+	if (record.density !== undefined || record.frictionCoefficient !== undefined) {
+		throw new RangeError(`${name} has parameters that do not match its constitutive model`);
+	}
+	if (lambda < 0) throw new RangeError(`${name}.lambda must be non-negative`);
+	if (mu <= 0) throw new RangeError(`${name}.mu must be greater than zero`);
 	finiteFloat32(lambda, `${name}.lambda`);
 	finiteFloat32(mu, `${name}.mu`, true);
 	return { lambda, mu, model };

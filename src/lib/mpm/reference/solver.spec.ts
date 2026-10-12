@@ -30,6 +30,16 @@ function closeEnough(actual: number, expected: number, tolerance: number): void 
 	expect(Math.abs(actual - expected)).toBeLessThanOrEqual(tolerance);
 }
 
+function principalLogStretchDifference(F: MpmMatrix2): number {
+	const c00 = F.m00 * F.m00 + F.m10 * F.m10;
+	const c01 = F.m00 * F.m01 + F.m10 * F.m11;
+	const c11 = F.m01 * F.m01 + F.m11 * F.m11;
+	const radius = Math.hypot(c00 - c11, 2 * c01);
+	const sigma1 = Math.sqrt((c00 + c11 + radius) * 0.5);
+	const sigma2 = (F.m00 * F.m11 - F.m01 * F.m10) / sigma1;
+	return Math.log(sigma1) - Math.log(sigma2);
+}
+
 describe('CPU MLS-MPM reference', () => {
 	it('returns zero diagnostics for an empty particle set', () => {
 		const result = stepMpm([], makeConfig());
@@ -209,6 +219,106 @@ describe('CPU MLS-MPM reference', () => {
 		expect(plastic.plasticVolume).toBeCloseTo((0.9 * 0.9) / (0.975 * 0.975), 6);
 	});
 
+	it('uses per-particle water and oil density without introducing liquid shear stress', () => {
+		const shear = { m00: 1, m01: 0.4, m10: 0, m11: 1 };
+		const particles = [
+			makeParticle({
+				position: { x: 7.5, y: 8 },
+				velocity: { x: 0.5, y: -0.25 },
+				F: shear,
+				volume: 0.01,
+				material: { lambda: 8, mu: 0, model: 'water', density: 1 }
+			}),
+			makeParticle({
+				position: { x: 8.5, y: 8 },
+				velocity: { x: 0.5, y: -0.25 },
+				F: shear,
+				volume: 0.02,
+				material: { lambda: 6, mu: 0, model: 'oil', density: 0.8 }
+			})
+		];
+		const result = stepMpm(
+			particles,
+			makeConfig({ dt: 1e-12, gravity: { x: 0, y: 0 } })
+		);
+
+		expect(result.particles[0].F).toEqual(shear);
+		expect(result.particles[1].F).toEqual(shear);
+		expect(result.particles[0].material?.model).toBe('water');
+		expect(result.particles[1].material?.model).toBe('oil');
+		expect(result.diagnostics.inputMass).toBeCloseTo(0.026, 12);
+		expect(result.diagnostics.gridMass).toBeCloseTo(0.026, 12);
+		expect(result.diagnostics.outputMass).toBeCloseTo(0.026, 12);
+		expect(result.diagnostics.inputMomentum.x).toBeCloseTo(0.013, 14);
+		expect(result.diagnostics.inputMomentum.y).toBeCloseTo(-0.0065, 14);
+		expect(result.diagnostics.outputMomentum.x).toBeCloseTo(0.013, 14);
+		expect(result.diagnostics.outputMomentum.y).toBeCloseTo(-0.0065, 14);
+	});
+
+	it('applies liquid bulk pressure only to compression', () => {
+		const material = { lambda: 8, mu: 0, model: 'water', density: 1 } as const;
+		const compressed = stepMpm(
+			[
+				makeParticle({
+					F: { m00: 0.9, m01: 0, m10: 0, m11: 0.9 },
+					material
+				})
+			],
+			makeConfig({ dt: 0.001, gravity: { x: 0, y: 0 } })
+		).particles[0];
+		const expanded = stepMpm(
+			[
+				makeParticle({
+					F: { m00: 1.1, m01: 0, m10: 0, m11: 1.1 },
+					material
+				})
+			],
+			makeConfig({ dt: 0.001, gravity: { x: 0, y: 0 } })
+		).particles[0];
+
+		expect(compressed.C.m00).toBeGreaterThan(0);
+		expect(compressed.F.m00).toBeGreaterThan(0.9);
+		expect(expanded.C.m00).toBe(0);
+		expect(expanded.F.m00).toBe(1.1);
+	});
+
+	it('caps powder shear by pressure-dependent friction', () => {
+		const compressedShear = { m00: 0.8, m01: 0.8, m10: 0, m11: 0.8 };
+		const result = stepMpm(
+			[
+				makeParticle({
+					position: { x: 6, y: 8 },
+					F: compressedShear,
+					material: {
+						lambda: 20,
+						mu: 10,
+						model: 'powder',
+						frictionCoefficient: 0
+					}
+				}),
+				makeParticle({
+					position: { x: 12, y: 8 },
+					F: compressedShear,
+					material: {
+						lambda: 20,
+						mu: 10,
+						model: 'powder',
+						frictionCoefficient: 0.55
+					}
+				})
+			],
+			makeConfig({ dt: 1e-12, gravity: { x: 0, y: 0 } })
+		);
+		const zeroFrictionStretch = principalLogStretchDifference(result.particles[0].F);
+		const frictionalStretch = principalLogStretchDifference(result.particles[1].F);
+		const frictionalMaterial = result.particles[1].material;
+
+		expect(Math.abs(zeroFrictionStretch)).toBeLessThan(1e-8);
+		expect(frictionalStretch).toBeGreaterThan(0.5);
+		expect(result.particles[0].material?.model).toBe('powder');
+		expect(frictionalMaterial).toMatchObject({ model: 'powder', frictionCoefficient: 0.55 });
+	});
+
 	it('projects rotated Snow stretches while preserving the principal rotation', () => {
 		const angle = 0.37;
 		const cosine = Math.cos(angle);
@@ -250,6 +360,35 @@ describe('CPU MLS-MPM reference', () => {
 		expect(() =>
 			stepMpm([makeParticle({ plasticVolume: 0 })], makeConfig())
 		).toThrow(/plasticVolume/);
+		expect(() =>
+			stepMpm(
+				[
+					makeParticle({
+						material: {
+							lambda: 8,
+							mu: 1,
+							model: 'water',
+							density: 1
+						} as MpmParticle['material']
+					})
+				],
+				makeConfig()
+			)
+		).toThrow(/mu must be zero/);
+		expect(() =>
+			stepMpm(
+				[
+					makeParticle({
+						material: {
+							lambda: 20,
+							mu: 10,
+							model: 'powder'
+						} as MpmParticle['material']
+					})
+				],
+				makeConfig()
+			)
+		).toThrow(/frictionCoefficient/);
 	});
 
 	it('keeps snow deformation and plastic history finite through repeated steps', () => {

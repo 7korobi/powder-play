@@ -1,7 +1,6 @@
 import {
 	normalizeMpmConstitutiveModel,
-	SNOW_PLASTICITY,
-	type MpmConstitutiveModel
+	SNOW_PLASTICITY
 } from '../materials.js';
 
 export interface MpmVector2 {
@@ -23,6 +22,7 @@ export interface MpmParticle {
 	readonly F: MpmMatrix2;
 	readonly objectId?: number;
 	readonly plasticVolume?: number;
+	readonly volume?: number;
 	readonly material?: MpmMaterialParameters;
 }
 
@@ -32,11 +32,29 @@ export interface MpmGridParameters {
 	readonly cellSize: number;
 }
 
-export interface MpmMaterialParameters {
-	readonly lambda: number;
-	readonly mu: number;
-	readonly model?: MpmConstitutiveModel;
-}
+export type MpmMaterialParameters =
+	| {
+			readonly lambda: number;
+			readonly mu: number;
+			readonly model?: 'neo-hookean';
+	  }
+	| {
+			readonly lambda: number;
+			readonly mu: number;
+			readonly model: 'snow';
+	  }
+	| {
+			readonly lambda: number;
+			readonly mu: 0;
+			readonly model: 'water' | 'oil';
+			readonly density: number;
+	  }
+	| {
+			readonly lambda: number;
+			readonly mu: number;
+			readonly model: 'powder';
+			readonly frictionCoefficient: number;
+	  };
 
 export interface MpmStepConfig {
 	readonly dt: number;
@@ -84,6 +102,12 @@ interface GridNode {
 	velocityY: number;
 }
 
+interface ParticlePhysicalState {
+	readonly mass: number;
+	readonly volume: number;
+	readonly material: MpmMaterialParameters;
+}
+
 interface ParticleStencil {
 	readonly baseX: number;
 	readonly baseY: number;
@@ -111,25 +135,29 @@ export function stepMpm(
 ): MpmStepResult {
 	const validated = validateConfig(config);
 	validateParticles(particles, validated);
+	const particleStates = particles.map((particle) => resolveParticleState(particle, validated));
 
-	const inputMass = particles.length * validated.particleMass;
+	const inputMass = totalMass(particleStates, 'input mass');
 	assertComputedFinite(inputMass, 'input mass');
-	const inputMomentum = totalMomentum(particles, validated.particleMass, 'input momentum');
+	const inputMomentum = totalMomentum(particles, particleStates, 'input momentum');
 	const grid = new Map<string, GridNode>();
 	const dx = validated.grid.cellSize;
 
-	for (const particle of particles) {
+	for (let index = 0; index < particles.length; index++) {
+		const particle = particles[index];
+		const state = particleStates[index];
 		const stencil = particleStencil(particle.position, dx);
-		const material = particleMaterial(particle, validated.material);
 		const plasticVolume = particle.plasticVolume ?? 1;
 		const stressTimesFt = constitutiveStressTimesFt(
 			particle.F,
 			plasticVolume,
-			material
+			state.material
 		);
+		const stressScale = -validated.dt * state.volume * validated.gradientScale;
+		assertComputedFinite(stressScale, 'particle stress scale');
 		const affine = addMatrices(
-			scaleMatrix(particle.C, validated.particleMass),
-			scaleMatrix(stressTimesFt, validated.stressScale)
+			scaleMatrix(particle.C, state.mass),
+			scaleMatrix(stressTimesFt, stressScale)
 		);
 		assertComputedMatrixFinite(affine, 'particle affine momentum');
 
@@ -159,14 +187,14 @@ export function stepMpm(
 				const dposX = (ox - stencil.fx) * dx;
 				const dposY = (oy - stencil.fy) * dx;
 				const particleMomentumX =
-					validated.particleMass * particle.velocity.x +
+					state.mass * particle.velocity.x +
 					affine.m00 * dposX +
 					affine.m01 * dposY;
 				const particleMomentumY =
-					validated.particleMass * particle.velocity.y +
+					state.mass * particle.velocity.y +
 					affine.m10 * dposX +
 					affine.m11 * dposY;
-				node.mass += weight * validated.particleMass;
+				node.mass += weight * state.mass;
 				node.momentumX += weight * particleMomentumX;
 				node.momentumY += weight * particleMomentumY;
 				assertComputedFinite(node.mass, 'grid node mass');
@@ -209,9 +237,9 @@ export function stepMpm(
 		node.velocityY = velocityY;
 	}
 
-	const outputParticles = particles.map((particle) => {
+	const outputParticles = particles.map((particle, index) => {
+		const state = particleStates[index];
 		const stencil = particleStencil(particle.position, dx);
-		const material = particleMaterial(particle, validated.material);
 		const plasticVolume = particle.plasticVolume ?? 1;
 		let velocityX = 0;
 		let velocityY = 0;
@@ -266,10 +294,12 @@ export function stepMpm(
 		}
 		let F = trialF;
 		let nextPlasticVolume = plasticVolume;
-		if (material.model === 'snow') {
+		if (state.material.model === 'snow') {
 			const projected = projectSnowDeformation(trialF, plasticVolume);
 			F = projected.deformation;
 			nextPlasticVolume = projected.plasticVolume;
+		} else if (state.material.model === 'powder') {
+			F = projectGranularDeformation(trialF, state.material);
 		}
 
 		const nextX = particle.position.x + validated.dt * velocityX;
@@ -286,15 +316,16 @@ export function stepMpm(
 			F,
 			objectId: particle.objectId,
 			plasticVolume: nextPlasticVolume,
-			material
+			volume: state.volume,
+			material: state.material
 		};
 	});
 
-	const outputMass = outputParticles.length * validated.particleMass;
+	const outputMass = totalMass(particleStates, 'output mass');
 	assertComputedFinite(outputMass, 'output mass');
 	const outputMomentum = totalMomentum(
 		outputParticles,
-		validated.particleMass,
+		particleStates,
 		'output momentum'
 	);
 
@@ -350,9 +381,6 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 	if (cellSize <= 0) throw new RangeError('grid.cellSize must be greater than zero');
 	if (particleMass <= 0) throw new RangeError('particleMass must be greater than zero');
 	if (particleVolume <= 0) throw new RangeError('particleVolume must be greater than zero');
-	if (lambda < 0) throw new RangeError('material.lambda must be non-negative');
-	if (mu <= 0) throw new RangeError('material.mu must be greater than zero');
-
 	const domainWidth = cellsX * cellSize;
 	const domainHeight = cellsY * cellSize;
 	const cellSizeSquared = cellSize * cellSize;
@@ -411,6 +439,12 @@ function validateParticles(
 		const particle = value as unknown as MpmParticle;
 		if (value.material !== undefined) {
 			validateMaterial(value.material, `particles[${index}].material`);
+		}
+		if (value.volume !== undefined) {
+			assertFiniteNumber(value.volume, `particles[${index}].volume`);
+			if (value.volume <= 0) {
+				throw new RangeError(`particles[${index}].volume must be greater than zero`);
+			}
 		}
 		if (value.plasticVolume !== undefined) {
 			assertFiniteNumber(value.plasticVolume, `particles[${index}].plasticVolume`);
@@ -496,12 +530,39 @@ function validateMaterial(value: unknown, name: string): MpmMaterialParameters {
 	const mu = value.mu;
 	assertFiniteNumber(lambda, `${name}.lambda`);
 	assertFiniteNumber(mu, `${name}.mu`);
-	if (lambda < 0) throw new RangeError(`${name}.lambda must be non-negative`);
-	if (mu <= 0) throw new RangeError(`${name}.mu must be greater than zero`);
+	const model = normalizeMpmConstitutiveModel(value.model, `${name}.model`);
 	if (!Number.isFinite(lambda + 2 * mu)) {
 		throw new RangeError(`${name} parameters are outside the supported numeric range`);
 	}
-	const model = normalizeMpmConstitutiveModel(value.model, `${name}.model`);
+	if (model === 'water' || model === 'oil') {
+		const density = value.density;
+		assertFiniteNumber(density, `${name}.density`);
+		if (lambda <= 0) throw new RangeError(`${name}.lambda must be greater than zero`);
+		if (mu !== 0) throw new RangeError(`${name}.mu must be zero for a liquid material`);
+		if (value.frictionCoefficient !== undefined) {
+			throw new RangeError(`${name}.frictionCoefficient is only valid for powder`);
+		}
+		if (density <= 0) throw new RangeError(`${name}.density must be greater than zero`);
+		return { lambda, mu: 0, model, density };
+	}
+	if (model === 'powder') {
+		const frictionCoefficient = value.frictionCoefficient;
+		assertFiniteNumber(frictionCoefficient, `${name}.frictionCoefficient`);
+		if (lambda < 0) throw new RangeError(`${name}.lambda must be non-negative`);
+		if (mu <= 0) throw new RangeError(`${name}.mu must be greater than zero`);
+		if (frictionCoefficient < 0) {
+			throw new RangeError(`${name}.frictionCoefficient must be non-negative`);
+		}
+		if (value.density !== undefined) {
+			throw new RangeError(`${name}.density is only valid for water or oil`);
+		}
+		return { lambda, mu, model, frictionCoefficient };
+	}
+	if (value.density !== undefined || value.frictionCoefficient !== undefined) {
+		throw new RangeError(`${name} has parameters that do not match its constitutive model`);
+	}
+	if (lambda < 0) throw new RangeError(`${name}.lambda must be non-negative`);
+	if (mu <= 0) throw new RangeError(`${name}.mu must be greater than zero`);
 	return { lambda, mu, model };
 }
 
@@ -514,11 +575,35 @@ function particleMaterial(
 		: validateMaterial(particle.material, 'particle material');
 }
 
+function resolveParticleState(
+	particle: MpmParticle,
+	config: ValidatedConfig
+): ParticlePhysicalState {
+	const material = particleMaterial(particle, config.material);
+	const volume = particle.volume ?? config.particleVolume;
+	const mass =
+		material.model === 'water' || material.model === 'oil'
+			? material.density * volume
+			: config.particleMass;
+	assertComputedFinite(volume, 'particle volume');
+	assertComputedFinite(mass, 'particle mass');
+	if (volume <= 0 || mass <= 0) {
+		throw new RangeError('particle mass and volume must be greater than zero');
+	}
+	return { mass, volume, material };
+}
+
 function constitutiveStressTimesFt(
 	F: MpmMatrix2,
 	plasticVolume: number,
 	material: MpmMaterialParameters
 ): MpmMatrix2 {
+	if (material.model === 'water' || material.model === 'oil') {
+		const pressure = material.lambda * Math.min(determinant(F) - 1, 0);
+		const stressTimesFt = { m00: pressure, m01: 0, m10: 0, m11: pressure };
+		assertComputedMatrixFinite(stressTimesFt, `${material.model} stress`);
+		return stressTimesFt;
+	}
 	if (material.model === 'snow') {
 		const decomposition = decompose2x2(F);
 		const hardeningExponent = Math.max(
@@ -553,8 +638,52 @@ function constitutiveStressTimesFt(
 		assertComputedMatrixFinite(stressTimesFt, 'snow stress');
 		return stressTimesFt;
 	}
+	if (material.model === 'powder') {
+		return granularStressTimesFt(F, material);
+	}
 	const firstPiola = neoHookeanFirstPiola(F, material);
 	return multiplyMatrices(firstPiola, transposeMatrix(F));
+}
+
+function granularStressTimesFt(
+	F: MpmMatrix2,
+	material: Extract<MpmMaterialParameters, { readonly model: 'powder' }>
+): MpmMatrix2 {
+	const decomposition = decompose2x2(F);
+	const logStretch1 = Math.log(decomposition.sigma1);
+	const logStretch2 = Math.log(decomposition.sigma2);
+	const logVolume = logStretch1 + logStretch2;
+	const pressure = Math.max(0, -(material.lambda + material.mu) * logVolume);
+	const deviatoricLogStretch = 0.5 * (logStretch1 - logStretch2);
+	const maximumDeviatoricLogStretch =
+		(material.frictionCoefficient * pressure) / (2 * material.mu);
+	const projectedDeviatoricLogStretch = Math.min(
+		deviatoricLogStretch,
+		maximumDeviatoricLogStretch
+	);
+	const meanLogStretch = 0.5 * logVolume;
+	const principalStress1 =
+		2 * material.mu * (meanLogStretch + projectedDeviatoricLogStretch) +
+		material.lambda * logVolume;
+	const principalStress2 =
+		2 * material.mu * (meanLogStretch - projectedDeviatoricLogStretch) +
+		material.lambda * logVolume;
+	const stressTimesFt: MpmMatrix2 = {
+		m00:
+			principalStress1 * decomposition.u1.x * decomposition.u1.x +
+			principalStress2 * decomposition.u2.x * decomposition.u2.x,
+		m01:
+			principalStress1 * decomposition.u1.x * decomposition.u1.y +
+			principalStress2 * decomposition.u2.x * decomposition.u2.y,
+		m10:
+			principalStress1 * decomposition.u1.y * decomposition.u1.x +
+			principalStress2 * decomposition.u2.y * decomposition.u2.x,
+		m11:
+			principalStress1 * decomposition.u1.y * decomposition.u1.y +
+			principalStress2 * decomposition.u2.y * decomposition.u2.y
+	};
+	assertComputedMatrixFinite(stressTimesFt, 'powder stress');
+	return stressTimesFt;
 }
 
 function projectSnowDeformation(
@@ -593,6 +722,52 @@ function projectSnowDeformation(
 		throw new RangeError('snow projection produced a non-positive deformation determinant');
 	}
 	return { deformation: projected, plasticVolume: updatedPlasticVolume };
+}
+
+function projectGranularDeformation(
+	deformation: MpmMatrix2,
+	material: Extract<MpmMaterialParameters, { readonly model: 'powder' }>
+): MpmMatrix2 {
+	const decomposition = decompose2x2(deformation);
+	const logStretch1 = Math.log(decomposition.sigma1);
+	const logStretch2 = Math.log(decomposition.sigma2);
+	const logVolume = logStretch1 + logStretch2;
+	const pressure = Math.max(0, -(material.lambda + material.mu) * logVolume);
+	const deviatoricLogStretch = 0.5 * (logStretch1 - logStretch2);
+	const maximumDeviatoricLogStretch =
+		(material.frictionCoefficient * pressure) / (2 * material.mu);
+	const projectedDeviatoricLogStretch = Math.min(
+		deviatoricLogStretch,
+		maximumDeviatoricLogStretch
+	);
+	const meanLogStretch = 0.5 * logVolume;
+	const projected: MpmMatrix2 = {
+		m00:
+			Math.exp(meanLogStretch + projectedDeviatoricLogStretch) *
+				decomposition.u1.x * decomposition.v1.x +
+			Math.exp(meanLogStretch - projectedDeviatoricLogStretch) *
+				decomposition.u2.x * decomposition.v2.x,
+		m01:
+			Math.exp(meanLogStretch + projectedDeviatoricLogStretch) *
+				decomposition.u1.x * decomposition.v1.y +
+			Math.exp(meanLogStretch - projectedDeviatoricLogStretch) *
+				decomposition.u2.x * decomposition.v2.y,
+		m10:
+			Math.exp(meanLogStretch + projectedDeviatoricLogStretch) *
+				decomposition.u1.y * decomposition.v1.x +
+			Math.exp(meanLogStretch - projectedDeviatoricLogStretch) *
+				decomposition.u2.y * decomposition.v2.x,
+		m11:
+			Math.exp(meanLogStretch + projectedDeviatoricLogStretch) *
+				decomposition.u1.y * decomposition.v1.y +
+			Math.exp(meanLogStretch - projectedDeviatoricLogStretch) *
+				decomposition.u2.y * decomposition.v2.y
+	};
+	assertComputedMatrixFinite(projected, 'projected powder deformation');
+	if (determinant(projected) <= 0) {
+		throw new RangeError('powder projection produced a non-positive deformation determinant');
+	}
+	return projected;
 }
 
 function decompose2x2(F: MpmMatrix2): Decomposition2 {
@@ -677,18 +852,25 @@ function determinant(matrix: MpmMatrix2): number {
 
 function totalMomentum(
 	particles: readonly MpmParticle[],
-	particleMass: number,
+	states: readonly ParticlePhysicalState[],
 	name: string
 ): MpmVector2 {
 	let x = 0;
 	let y = 0;
-	for (const particle of particles) {
-		x += particleMass * particle.velocity.x;
-		y += particleMass * particle.velocity.y;
+	for (let index = 0; index < particles.length; index++) {
+		x += states[index].mass * particles[index].velocity.x;
+		y += states[index].mass * particles[index].velocity.y;
 	}
 	assertComputedFinite(x, name);
 	assertComputedFinite(y, name);
 	return { x, y };
+}
+
+function totalMass(states: readonly ParticlePhysicalState[], name: string): number {
+	let mass = 0;
+	for (const state of states) mass += state.mass;
+	assertComputedFinite(mass, name);
+	return mass;
 }
 
 function confineAxis(

@@ -8,6 +8,9 @@ struct Particle {
 	materialModel: u32,
 	lambda: f32,
 	mu: f32,
+	density: f32,
+	volume: f32,
+	frictionCoefficient: f32,
 }
 
 struct GridNode {
@@ -59,6 +62,11 @@ const ERROR_DEFORMATION: u32 = 2u;
 const ERROR_P2G: u32 = 4u;
 const ERROR_GRID: u32 = 8u;
 const ERROR_G2P: u32 = 16u;
+const MODEL_NEO_HOOKEAN: u32 = 0u;
+const MODEL_SNOW: u32 = 1u;
+const MODEL_WATER: u32 = 2u;
+const MODEL_OIL: u32 = 3u;
+const MODEL_POWDER: u32 = 4u;
 const SNOW_COMPRESSION_YIELD: f32 = 0.025;
 const SNOW_STRETCH_YIELD: f32 = 0.0075;
 const SNOW_HARDENING: f32 = 10.0;
@@ -140,6 +148,63 @@ fn reconstructDeformation(
 		sigma.x * decomposition.u0.y * decomposition.v0.y +
 			sigma.y * decomposition.u1.y * decomposition.v1.y,
 	);
+}
+
+fn granularStressTimesFt(
+	matrix: vec4<f32>,
+	lambda: f32,
+	mu: f32,
+	frictionCoefficient: f32,
+) -> vec4<f32> {
+	let decomposition = decompose2x2(matrix);
+	let logStretch = log(decomposition.sigma);
+	let logVolume = logStretch.x + logStretch.y;
+	let pressure = max(0.0, -(lambda + mu) * logVolume);
+	let deviatoricLogStretch = 0.5 * (logStretch.x - logStretch.y);
+	let maximumDeviatoricLogStretch =
+		frictionCoefficient * pressure / (2.0 * mu);
+	let projectedDeviatoricLogStretch =
+		min(deviatoricLogStretch, maximumDeviatoricLogStretch);
+	let meanLogStretch = 0.5 * logVolume;
+	let principalStress = vec2<f32>(
+		2.0 * mu * (meanLogStretch + projectedDeviatoricLogStretch) +
+			lambda * logVolume,
+		2.0 * mu * (meanLogStretch - projectedDeviatoricLogStretch) +
+			lambda * logVolume,
+	);
+	return vec4<f32>(
+		principalStress.x * decomposition.u0.x * decomposition.u0.x +
+			principalStress.y * decomposition.u1.x * decomposition.u1.x,
+		principalStress.x * decomposition.u0.x * decomposition.u0.y +
+			principalStress.y * decomposition.u1.x * decomposition.u1.y,
+		principalStress.x * decomposition.u0.y * decomposition.u0.x +
+			principalStress.y * decomposition.u1.y * decomposition.u1.x,
+		principalStress.x * decomposition.u0.y * decomposition.u0.y +
+			principalStress.y * decomposition.u1.y * decomposition.u1.y,
+	);
+}
+
+fn projectGranularDeformation(
+	matrix: vec4<f32>,
+	lambda: f32,
+	mu: f32,
+	frictionCoefficient: f32,
+) -> vec4<f32> {
+	let decomposition = decompose2x2(matrix);
+	let logStretch = log(decomposition.sigma);
+	let logVolume = logStretch.x + logStretch.y;
+	let pressure = max(0.0, -(lambda + mu) * logVolume);
+	let deviatoricLogStretch = 0.5 * (logStretch.x - logStretch.y);
+	let maximumDeviatoricLogStretch =
+		frictionCoefficient * pressure / (2.0 * mu);
+	let projectedDeviatoricLogStretch =
+		min(deviatoricLogStretch, maximumDeviatoricLogStretch);
+	let meanLogStretch = 0.5 * logVolume;
+	let projectedSigma = exp(vec2<f32>(
+		meanLogStretch + projectedDeviatoricLogStretch,
+		meanLogStretch - projectedDeviatoricLogStretch,
+	));
+	return reconstructDeformation(decomposition, projectedSigma);
 }
 
 fn quadraticWeights(fraction: f32) -> vec3<f32> {
@@ -282,12 +347,17 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		}
 
 		let determinant = particle.f.x * particle.f.w - particle.f.y * particle.f.z;
-		if (!finiteFloat(determinant) || determinant <= 0.0) {
+		if (
+			!finiteFloat(determinant) ||
+			determinant <= 0.0 ||
+			!finiteFloat(particle.volume) ||
+			particle.volume <= 0.0
+		) {
 			atomicOr(&stateError[0], ERROR_DEFORMATION);
 			return;
 		}
 		var stressTimesFt = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-		if (particle.materialModel == 0u) {
+		if (particle.materialModel == MODEL_NEO_HOOKEAN) {
 			let inverseTranspose =
 				vec4<f32>(particle.f.w, -particle.f.z, -particle.f.y, particle.f.x) /
 				determinant;
@@ -301,7 +371,7 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 				firstPiola.z * particle.f.x + firstPiola.w * particle.f.y,
 				firstPiola.z * particle.f.z + firstPiola.w * particle.f.w,
 			);
-		} else if (particle.materialModel == 1u) {
+		} else if (particle.materialModel == MODEL_SNOW) {
 			if (
 				!finiteFloat(particle.plasticVolume) ||
 				particle.plasticVolume < SNOW_MIN_PLASTIC_VOLUME ||
@@ -338,20 +408,61 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 				shear * (difference.z * particle.f.z + difference.w * particle.f.w) +
 					volumetric,
 			);
+		} else if (
+			particle.materialModel == MODEL_WATER ||
+			particle.materialModel == MODEL_OIL
+		) {
+			if (
+				!finiteFloat(particle.density) ||
+				particle.density <= 0.0 ||
+				!finiteFloat(particle.lambda) ||
+				particle.lambda <= 0.0
+			) {
+				atomicOr(&stateError[0], ERROR_P2G);
+				return;
+			}
+			let pressure = particle.lambda * min(determinant - 1.0, 0.0);
+			stressTimesFt = vec4<f32>(pressure, 0.0, 0.0, pressure);
+		} else if (particle.materialModel == MODEL_POWDER) {
+			if (
+				!finiteFloat(particle.lambda) ||
+				!finiteFloat(particle.mu) ||
+				particle.mu <= 0.0 ||
+				!finiteFloat(particle.frictionCoefficient) ||
+				particle.frictionCoefficient < 0.0
+			) {
+				atomicOr(&stateError[0], ERROR_P2G);
+				return;
+			}
+			stressTimesFt = granularStressTimesFt(
+				particle.f,
+				particle.lambda,
+				particle.mu,
+				particle.frictionCoefficient,
+			);
 		} else {
 			atomicOr(&stateError[0], ERROR_P2G);
 			return;
 		}
+		var particleMass = params.physical.y;
+		if (
+			particle.materialModel == MODEL_WATER ||
+			particle.materialModel == MODEL_OIL
+		) {
+			particleMass = particle.density * particle.volume;
+		}
+		let particleStressScale =
+			-params.physical.w * particle.volume * params.material.w;
 		let affine =
-			params.physical.y * particle.c +
-			params.material.z * stressTimesFt;
+			particleMass * particle.c +
+			particleStressScale * stressTimesFt;
 		let dpos =
 			(vec2<f32>(f32(ox), f32(oy)) - fraction) * params.physical.x;
 		let particleMomentum = vec2<f32>(
-			params.physical.y * particle.velocity.x +
+			particleMass * particle.velocity.x +
 				affine.x * dpos.x +
 				affine.y * dpos.y,
-			params.physical.y * particle.velocity.y +
+			particleMass * particle.velocity.y +
 				affine.z * dpos.x +
 				affine.w * dpos.y,
 		);
@@ -367,7 +478,7 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			return;
 		}
 
-		let weightedMass = weight * params.physical.y;
+		let weightedMass = weight * particleMass;
 		let weightedMomentum = weight * particleMomentum;
 		if (
 			(weight > 0.0 && weightedMass <= 0.0) ||
@@ -563,7 +674,7 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		atomicOr(&stateError[0], ERROR_DEFORMATION);
 		return;
 	}
-	if (particle.materialModel == 1u) {
+	if (particle.materialModel == MODEL_SNOW) {
 		let decomposition = decompose2x2(trialF);
 		if (
 			!finiteVec2(decomposition.sigma) ||
@@ -586,7 +697,28 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			SNOW_MAX_PLASTIC_VOLUME,
 		);
 		updatedF = reconstructDeformation(decomposition, projectedSigma);
-	} else if (particle.materialModel != 0u) {
+	} else if (particle.materialModel == MODEL_POWDER) {
+		if (
+			!finiteFloat(particle.lambda) ||
+			!finiteFloat(particle.mu) ||
+			particle.mu <= 0.0 ||
+			!finiteFloat(particle.frictionCoefficient) ||
+			particle.frictionCoefficient < 0.0
+		) {
+			atomicOr(&stateError[0], ERROR_G2P);
+			return;
+		}
+		updatedF = projectGranularDeformation(
+			trialF,
+			particle.lambda,
+			particle.mu,
+			particle.frictionCoefficient,
+		);
+	} else if (
+		particle.materialModel != MODEL_NEO_HOOKEAN &&
+		particle.materialModel != MODEL_WATER &&
+		particle.materialModel != MODEL_OIL
+	) {
 		atomicOr(&stateError[0], ERROR_G2P);
 		return;
 	}
@@ -700,7 +832,16 @@ struct Particle {
 	materialModel: u32,
 	lambda: f32,
 	mu: f32,
+	density: f32,
+	volume: f32,
+	frictionCoefficient: f32,
 }
+
+const MODEL_NEO_HOOKEAN: u32 = 0u;
+const MODEL_SNOW: u32 = 1u;
+const MODEL_WATER: u32 = 2u;
+const MODEL_OIL: u32 = 3u;
+const MODEL_POWDER: u32 = 4u;
 
 struct RenderParams {
 	domainAndRadius: vec4<f32>,
@@ -739,11 +880,17 @@ fn vertexMain(
 	var output: VertexOutput;
 	output.position = vec4<f32>(clipPosition, 0.0, 1.0);
 	output.localPosition = local;
-	output.materialColor = select(
-		vec3<f32>(0.28, 0.78, 0.72),
-		vec3<f32>(0.98, 0.56, 0.28),
-		particle.materialModel == 1u,
-	);
+	var materialColor = vec3<f32>(0.28, 0.78, 0.72);
+	if (particle.materialModel == MODEL_SNOW) {
+		materialColor = vec3<f32>(0.98, 0.56, 0.28);
+	} else if (particle.materialModel == MODEL_WATER) {
+		materialColor = vec3<f32>(0.18, 0.55, 0.95);
+	} else if (particle.materialModel == MODEL_OIL) {
+		materialColor = vec3<f32>(0.95, 0.75, 0.22);
+	} else if (particle.materialModel == MODEL_POWDER) {
+		materialColor = vec3<f32>(0.72, 0.48, 0.3);
+	}
+	output.materialColor = materialColor;
 	return output;
 }
 

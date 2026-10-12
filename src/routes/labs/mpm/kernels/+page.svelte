@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { encodeMpmConstitutiveModel } from '#lib/mpm/materials.js';
 	import {
 		createMpmMlsGpuSolver,
 		type MpmMlsGpuSelection
@@ -26,8 +27,24 @@
 	const PARTICLE_MASS = 1;
 	const PARTICLE_VOLUME = 25;
 	const MATERIAL = { lambda: 20, mu: 10, model: 'neo-hookean' } as const;
-	const ELASTIC_MATERIAL = { lambda: 8, mu: 4, model: 'neo-hookean' } as const;
-	const SNOW_MATERIAL = { lambda: 20, mu: 10, model: 'snow' } as const;
+	const WATER_MATERIAL = {
+		lambda: 8,
+		mu: 0,
+		model: 'water',
+		density: 0.04
+	} as const;
+	const OIL_MATERIAL = {
+		lambda: 6,
+		mu: 0,
+		model: 'oil',
+		density: 0.032
+	} as const;
+	const POWDER_MATERIAL = {
+		lambda: 20,
+		mu: 10,
+		model: 'powder',
+		frictionCoefficient: 0.55
+	} as const;
 	const PARITY_TOLERANCE = 0.02;
 	const ZERO_MATRIX: MpmMatrix2 = { m00: 0, m01: 0, m10: 0, m11: 0 };
 	const INITIAL_DEFORMATION: MpmMatrix2 = {
@@ -44,14 +61,18 @@
 		const particles: MpmParticle[] = [];
 
 		const objects = [
-			{ objectId: 1, startX: 120, material: ELASTIC_MATERIAL },
-			{ objectId: 2, startX: 290, material: SNOW_MATERIAL }
+			{ objectId: 1, startX: 100, startY: 210, material: WATER_MATERIAL },
+			{ objectId: 2, startX: 100, startY: 170, material: OIL_MATERIAL },
+			{ objectId: 3, startX: 260, startY: 170, material: POWDER_MATERIAL }
 		] as const;
 		for (const object of objects) {
-			for (let row = 0; row < 5; row += 1) {
-				for (let column = 0; column < 6; column += 1) {
+			for (let row = 0; row < 4; row += 1) {
+				for (let column = 0; column < 5; column += 1) {
 					particles.push({
-						position: { x: object.startX + column * 8, y: 60 + row * 8 },
+						position: {
+							x: object.startX + column * 8,
+							y: object.startY + row * 8
+						},
 						velocity: { x: 0, y: 0 },
 						C: ZERO_MATRIX,
 						F: INITIAL_DEFORMATION,
@@ -84,6 +105,13 @@
 	}
 
 	function particleValues(particle: MpmParticle): number[] {
+		const material = particle.material ?? MATERIAL;
+		const density =
+			material.model === 'water' || material.model === 'oil'
+				? material.density
+				: 0;
+		const frictionCoefficient =
+			material.model === 'powder' ? material.frictionCoefficient : 0;
 		return [
 			particle.position.x,
 			particle.position.y,
@@ -98,9 +126,12 @@
 			particle.F.m10,
 			particle.F.m11,
 			particle.plasticVolume ?? 1,
-			(particle.material ?? MATERIAL).model === 'snow' ? 1 : 0,
-			(particle.material ?? MATERIAL).lambda,
-			(particle.material ?? MATERIAL).mu
+			encodeMpmConstitutiveModel(material.model ?? 'neo-hookean'),
+			material.lambda,
+			material.mu,
+			density,
+			particle.volume ?? PARTICLE_VOLUME,
+			frictionCoefficient
 		];
 	}
 
@@ -583,21 +614,21 @@
 />
 
 <svelte:head>
-	<title>GPU MLS-MPM 材料・操作ラボ · powder-play</title>
+	<title>GPU MLS-MPM 水・油・粉体ラボ · powder-play</title>
 	<meta
 		name="description"
-		content="混在する弾性・弾塑性 MLS-MPM を CPU reference と比較し、GPU 粒子操作を検証します。"
+		content="水・油・粉体の試作構成則を CPU reference と比較し、GPU 粒子操作を検証します。"
 	/>
 </svelte:head>
 
 <main class="lab">
 	<header class="header">
 		<div>
-				<p class="eyebrow">GATE 3 · MIXED ELASTIC / PLASTIC MATERIALS</p>
-				<h1>GPU 2D MLS-MPM 材料ラボ</h1>
+				<p class="eyebrow">GATE 4 · WATER / OIL / POWDER</p>
+				<h1>GPU 2D MLS-MPM 混合材料ラボ</h1>
 			<p class="intro">
-					弾性体と弾塑性体を同じ粒子配列で計算します。初回の1ステップを CPU
-					reference と比較した後、それぞれの選択・力ベースのドラッグ・複製を試します。
+					水・油は密度を分けた弱圧縮性流体、粉体は圧力依存のせん断降伏として同じ粒子配列で計算します。
+					初回の1ステップを CPU reference と比較し、選択・力ベースのドラッグ・複製を試します。
 			</p>
 		</div>
 		<nav aria-label="実験ページ">
@@ -609,7 +640,7 @@
 	<section class="panel" aria-labelledby="simulation-title">
 		<div class="panel-heading">
 			<div>
-				<h2 id="simulation-title">混在する弾性・弾塑性クラスター</h2>
+				<h2 id="simulation-title">密度の異なる水・油と摩擦性粉体</h2>
 				<p>
 					{particleCount} / {particleCapacity} 粒子 · {GRID.cellsX} × {GRID.cellsY} grid
 				</p>
@@ -623,7 +654,7 @@
 			<canvas
 				bind:this={canvas}
 				tabindex="0"
-				aria-label="GPU 上で計算する Neo-Hookean 弾性体と Snow 弾塑性体の MLS-MPM シミュレーション"
+				aria-label="GPU 上で計算する水・油の弱圧縮性流体と粉体の MLS-MPM シミュレーション"
 				aria-describedby="interaction-instructions interaction-status"
 				onpointerdown={handlePointerDown}
 				onlostpointercapture={handlePointerCancel}
@@ -633,10 +664,10 @@
 		</div>
 
 		<p class="material-legend">
-			<span><i class="elastic-swatch"></i> 柔らかい Neo-Hookean 弾性体</span>
-			<span><i class="snow-swatch"></i> Snow 型弾塑性体</span>
-			前者は剛性を下げたゼリー状のPoCです。Snow 型は主伸長を降伏範囲に射影し、塑性体積の履歴を保持します。
-			どちらも流体モデルではありません。
+			<span><i class="water-swatch"></i> 水（基準密度 0.04）</span>
+			<span><i class="oil-swatch"></i> 油（基準密度 0.032）</span>
+			<span><i class="powder-swatch"></i> 粉体（摩擦係数 0.55）</span>
+			水・油はせん断応力を持たず体積圧力だけを持つ試作モデルです。水・油の界面維持や浮沈は未実装です。
 		</p>
 
 		<div class="interaction-controls" aria-labelledby="interaction-title">
@@ -720,9 +751,9 @@
 	</section>
 
 	<aside class="note">
-		<strong>検証範囲:</strong> P2G・grid update・G2PでNeo-Hookean弾性とSnow型弾塑性を粒子ごとに
-		計算します。objectIdによる選択・力ベースドラッグ・複製は材料履歴も保ったまま行います。
-		明示的な接触・摩擦、液体、水・油の分離、粉体、数値の長時間安定性は未実装または未検証です。
+		<strong>検証範囲:</strong> P2G・grid update・G2Pで水・油の弱圧縮性EOSと粉体のDrucker–Prager風
+		せん断降伏を粒子ごとに計算します。objectIdによる選択・力ベースドラッグ・複製は密度・材料状態も保持します。
+		材料間の明示的接触、界面張力・非混和性、浮沈、実粉体の校正、長時間安定性は未実装または未検証です。
 		粒子状態のGPU readbackは初回比較時と一時停止中の明示的な状態確認時だけ行い、通常の各フレームでは行いません。
 	</aside>
 </main>
@@ -856,12 +887,16 @@
 		border-radius: 50%;
 	}
 
-	.elastic-swatch {
-		background: #48c7b5;
+	.water-swatch {
+		background: #2e8cf2;
 	}
 
-	.snow-swatch {
-		background: #fa8f47;
+	.oil-swatch {
+		background: #f2bf38;
+	}
+
+	.powder-swatch {
+		background: #b87a4d;
 	}
 
 	canvas {

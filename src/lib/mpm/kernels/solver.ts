@@ -1,9 +1,15 @@
-import type { MpmParticle, MpmVector2 } from '../reference/solver.js';
+import type {
+	MpmMaterialParameters,
+	MpmParticle,
+	MpmVector2
+} from '../reference/solver.js';
+import { decodeMpmConstitutiveModel } from '../materials.js';
 import { createMpmWebGpuSession } from '../platform/webgpu.js';
 import {
 	calculateMpmMlsGpuBufferLayout,
 	COMPUTE_WORKGROUP_SIZE,
 	OBJECT_ID_STRIDE_BYTES,
+	PARTICLE_FLOATS,
 	packMpmMlsGpuStepParameters,
 	PARTICLE_STRIDE_BYTES,
 	RENDER_PARAMS_BYTES,
@@ -921,10 +927,27 @@ function unpackParticles(
 ): readonly MpmParticle[] {
 	const particles: MpmParticle[] = [];
 	for (let index = 0; index < particleCount; index++) {
-		const offset = index * 16;
-		const materialModel = words[offset + 13];
-		if (materialModel > 1) {
-			throw new RangeError(`GPU returned an unsupported MPM material model ${materialModel}.`);
+		const offset = index * PARTICLE_FLOATS;
+		const model = decodeMpmConstitutiveModel(words[offset + 13]);
+		const lambda = values[offset + 14];
+		const mu = values[offset + 15];
+		let material: MpmMaterialParameters;
+		if (model === 'water' || model === 'oil') {
+			material = {
+				model,
+				lambda,
+				mu: 0,
+				density: values[offset + 16]
+			};
+		} else if (model === 'powder') {
+			material = {
+				model,
+				lambda,
+				mu,
+				frictionCoefficient: values[offset + 18]
+			};
+		} else {
+			material = { model, lambda, mu };
 		}
 		particles.push({
 			position: { x: values[offset], y: values[offset + 1] },
@@ -942,11 +965,8 @@ function unpackParticles(
 				m11: values[offset + 11]
 			},
 			plasticVolume: values[offset + 12],
-			material: {
-				lambda: values[offset + 14],
-				mu: values[offset + 15],
-				model: materialModel === 1 ? 'snow' : 'neo-hookean'
-			},
+			volume: values[offset + 17],
+			material,
 			objectId: objectIds[index]
 		});
 	}

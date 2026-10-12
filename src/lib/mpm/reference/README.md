@@ -7,20 +7,22 @@ kernels; it is not a GPU MLS-MPM implementation or the Gate-0 interaction demo.
 ## State and units
 
 Each particle supplies `position`, `velocity`, its affine velocity matrix `C`,
-and deformation gradient `F`. All particles use the one `particleMass` and
-`particleVolume` in the step config. `material` in the step config is the
-default; a particle may override it with its own Lamé parameters and
-constitutive model. Missing particle material uses the configured default.
+and deformation gradient `F`. `particleMass` and `particleVolume` in the step
+config are the defaults. A particle may override its reference volume and
+material. Water and oil derive particle mass from their material density
+multiplied by reference volume; other models use the configured particle mass.
 `objectId` remains independent of the constitutive model.
 
 `position`, `grid.cellSize`, and the domain extents use the same length unit;
 velocity is length/time, `dt` is time, gravity is length/time², mass is mass,
-and `particleVolume` is a reference area. The 2D Lamé parameters `lambda` and
-`mu` are force/length (2D stress-resultant) units, so `particleMass /
-particleVolume` is surface mass density. A consistently nondimensional system
-is also valid. `F` maps reference-space column vectors to current space; the
-row-major matrix entries are `m00`, `m01`, `m10`, `m11`, and matrix-vector
-products use column vectors.
+and `particleVolume` is a reference area; a particle's `volume` overrides it.
+Water/oil `density` is reference surface mass density, and their `lambda` is a
+bulk modulus with `mu` fixed at zero. For elastic and powder models, the 2D
+Lamé parameters `lambda` and `mu` are force/length (2D stress-resultant) units,
+so `particleMass / particleVolume` is surface mass density. A consistently
+nondimensional system is also valid. `F` maps reference-space column vectors
+to current space; the row-major matrix entries are `m00`, `m01`, `m10`, `m11`,
+and matrix-vector products use column vectors.
 
 The physical grid domain is the closed rectangle
 `[0, cellsX * cellSize] × [0, cellsY * cellSize]`. The P2G stencil uses its
@@ -79,10 +81,30 @@ parameters, and its stress-times-transpose is
 After each G2P update, the two principal stretches are clamped to
 `[1 - 0.025, 1 + 0.0075]`. The plastic-volume history is updated by the ratio
 of trial to projected deformation determinant and clamped to `[0.6, 20]`.
-This is a compact elastoplastic PoC, not a calibrated snow, granular, or
-powder model. Neo-Hookean and Snow particles may coexist in one grid; they do
-not yet have explicit particle contact, friction, damage, liquid behavior, or
-an interface model.
+
+Water and oil are separate, tension-free weakly-compressible fluid models. For
+their deformation determinant `J`, the stress-times-transpose used by P2G is
+
+```text
+P * F^T = lambda * min(J - 1, 0) * I
+```
+
+They have no shear stress. Their reference density changes particle mass, but
+does not by itself produce buoyancy or preserve a water/oil interface.
+
+Powder uses a simplified Drucker-Prager-like shear cap in log-stretch space.
+With principal log stretches `ell_i = log(sigma_i)`, the volumetric log strain
+is `log(J)`, pressure is `max(0, -(lambda + mu) * log(J))`, and the
+deviatoric log stretch is limited to `frictionCoefficient * pressure / (2*mu)`.
+The same projection is applied in P2G stress and after G2P. This is an
+exploratory shear-yield model without plastic compaction, cohesion, or material
+calibration; it is not a complete granular solver.
+
+These models can coexist in one particle array and grid, but that grid has a
+single velocity field. There is no explicit particle contact, water/oil
+interface or surface tension, buoyancy separation, damage, or automatic
+substepping. A mixed scene can therefore interpenetrate or numerically mix
+phases even though each particle retains its material identity.
 
 ## Numerical limits
 

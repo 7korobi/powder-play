@@ -76,13 +76,13 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			nodeCount: 209,
 			pairCount: 9,
 			particleCapacity: 1,
-			particleStateBytes: 64,
-			particleBufferBytes: 64,
+			particleStateBytes: 80,
+			particleBufferBytes: 80,
 			objectIdBufferBytes: 4,
 			bucketHeadBytes: 836,
 			bucketNextBytes: 36,
 			gridStateBytes: 5016,
-			readbackBytes: 72
+			readbackBytes: 88
 		});
 	});
 
@@ -92,7 +92,7 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 
 		expect(layout.particleCapacity).toBe(0);
 		expect(layout.particleStateBytes).toBe(0);
-		expect(layout.particleBufferBytes).toBe(64);
+		expect(layout.particleBufferBytes).toBe(80);
 		expect(layout.bucketNextBytes).toBe(4);
 		expect(layout.objectIdBufferBytes).toBe(4);
 		expect(layout.readbackBytes).toBe(8);
@@ -111,11 +111,11 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(Array.from(state.packedObjectIds)).toEqual([7, 7]);
 		expect(state.objectRanges).toEqual([{ objectId: 7, start: 0, count: 2 }]);
 		expect(layout.pairCount).toBe(36);
-		expect(layout.particleStateBytes).toBe(128);
-		expect(layout.particleBufferBytes).toBe(256);
+		expect(layout.particleStateBytes).toBe(160);
+		expect(layout.particleBufferBytes).toBe(320);
 		expect(layout.objectIdBufferBytes).toBe(16);
 		expect(layout.bucketNextBytes).toBe(144);
-		expect(layout.readbackBytes).toBe(276);
+		expect(layout.readbackBytes).toBe(340);
 	});
 
 	it('packs each particle material and snow plastic history with the GPU layout', () => {
@@ -137,9 +137,49 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(state.packedParticles[12]).toBe(Math.fround(0.82));
 		expect(words[13]).toBe(1);
 		expect(Array.from(state.packedParticles.slice(14, 16))).toEqual([36, 18]);
-		expect(state.packedParticles[28]).toBe(1);
-		expect(words[29]).toBe(0);
-		expect(Array.from(state.packedParticles.slice(30, 32))).toEqual([24, 12]);
+		expect(state.packedParticles[32]).toBe(1);
+		expect(words[33]).toBe(0);
+		expect(Array.from(state.packedParticles.slice(34, 36))).toEqual([24, 12]);
+		expect(Array.from(state.packedParticles.slice(16, 20))).toEqual([
+			0,
+			Math.fround(0.01),
+			0,
+			0
+		]);
+	});
+
+	it('packs liquid density, per-particle volume, and powder friction', () => {
+		const particles = [
+			makeParticle({
+				material: { lambda: 8, mu: 0, model: 'water', density: 1 },
+				volume: 0.02
+			}),
+			makeParticle({
+				position: { x: 9, y: 4 },
+				material: { lambda: 6, mu: 0, model: 'oil', density: 0.8 }
+			}),
+			makeParticle({
+				position: { x: 10, y: 4 },
+				material: {
+					lambda: 20,
+					mu: 10,
+					model: 'powder',
+					frictionCoefficient: 0.55
+				}
+			})
+		];
+		const state = validateMpmMlsGpuInput(particles, makeConfig());
+		const words = new Uint32Array(state.packedParticles.buffer);
+
+		expect(words[13]).toBe(2);
+		expect(Array.from(state.packedParticles.slice(14, 19))).toEqual([
+			8, 0, 1, Math.fround(0.02), 0
+		]);
+		expect(words[33]).toBe(3);
+		expect(state.packedParticles[36]).toBe(Math.fround(0.8));
+		expect(state.packedParticles[37]).toBe(Math.fround(0.01));
+		expect(words[53]).toBe(4);
+		expect(state.packedParticles[58]).toBe(Math.fround(0.55));
 	});
 
 	it('rejects invalid physical parameters and particle states rather than repairing them', () => {
@@ -191,6 +231,37 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 				makeConfig()
 			)
 		).toThrow(/model/);
+		expect(() =>
+			validateMpmMlsGpuInput(
+				[
+					makeParticle({
+						material: {
+							lambda: 8,
+							mu: 10,
+							model: 'water',
+							density: 1
+						} as MpmParticle['material']
+					})
+				],
+				makeConfig()
+			)
+		).toThrow(/mu must be zero/);
+		expect(() =>
+			validateMpmMlsGpuInput(
+				[
+					makeParticle({
+						material: { lambda: 20, mu: 10, model: 'powder' } as MpmParticle['material']
+					})
+				],
+				makeConfig()
+			)
+		).toThrow(/frictionCoefficient/);
+		expect(() =>
+			validateMpmMlsGpuInput(
+				[makeParticle({ volume: 0 })],
+				makeConfig()
+			)
+		).toThrow(/volume/);
 		expect(() => validateMpmMlsGpuInput([], makeConfig({ capacity: 0 }))).toThrow(
 			/capacity/
 		);

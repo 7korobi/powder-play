@@ -4,7 +4,8 @@
 is asynchronous because it requests the WebGPU session and builds the compute
 and render pipelines. `config` contains the CPU reference's `grid`,
 `particleMass`, `particleVolume`, and default `material`; particles may override
-that material individually. Time step and gravity are supplied to
+their material and reference volume individually. Water and oil particle mass
+is their reference density multiplied by reference volume. Time step and gravity are supplied to
 `step(dt, gravity)`. The caller owns wall-clock stepping and
 pause/resume. `render()` reads the current particle buffer directly on the GPU.
 CPU particle data is returned only when `readParticles()` is explicitly called.
@@ -22,8 +23,9 @@ Cloning never reallocates those buffers; it appends a GPU-side copy of the
 selected contiguous `objectId` range and returns `false` when capacity is full.
 `objectId` is optional on input particles and defaults to `0`; an object's
 particles must be contiguous in the initial array. Each particle carries its
-constitutive model and Lamé parameters through GPU stepping, readback, and
-cloning. The GPU state also preserves the Snow model's plastic-volume history.
+constitutive model and material parameters through GPU stepping, readback, and
+cloning. The GPU state also preserves liquid density, particle volume, powder
+friction, and the Snow model's plastic-volume history.
 
 `pick()` runs a GPU nearest-particle search and reads back only a 16-byte
 selection result. `beginDrag()`, `updateDrag()`, and `endDrag()` update a small
@@ -39,12 +41,18 @@ or global grid-by-particle scan is used. Grid storage adds one halo node beyond
 each side of the physical `[0, cellsX] × [0, cellsY]` node range. The grid wall
 rule and post-G2P particle clipping match the CPU reference.
 
-The solver supports per-particle compressible 2D Neo-Hookean elasticity and a
-Snow-style corotated elastoplastic model. The latter clamps principal stretches
-to `[0.975, 1.0075]`, tracks plastic volume in `[0.6, 20]`, and applies bounded
-exponential hardening. These models can share a particle array and grid, but
-there is no liquid constitutive law, powder model, explicit particle contact,
-damage, automatic substepping, or water/oil interface model.
+The solver supports per-particle compressible 2D Neo-Hookean elasticity,
+Snow-style corotated plasticity, and separate water, oil, and powder models.
+Water and oil use a tension-free, weakly-compressible bulk equation of state;
+their reference densities affect particle mass. Powder uses a
+Drucker-Prager-like pressure-dependent shear cap in log-stretch space. These
+are exploratory constitutive models, not calibrated real-material models.
+The Snow model clamps principal stretches to `[0.975, 1.0075]`, tracks plastic
+volume in `[0.6, 20]`, and applies bounded exponential hardening.
+
+All materials currently share one grid velocity field. There is no explicit
+water/oil interface, surface tension, immiscibility, buoyancy separation,
+cross-material contact, powder compaction, damage, or automatic substepping.
 
 ## Numerical and runtime limits
 
@@ -71,5 +79,6 @@ damage, automatic substepping, or water/oil interface model.
 
 The pure config/layout tests run without WebGPU. Shader compilation, mixed
 material GPU-vs-CPU error, plastic deformation under sustained loading,
-picking, force-drag behavior, cloning, and visual behavior still need
-validation on a WebGPU device.
+water/oil interface behavior, powder behavior under sustained loading, picking,
+force-drag behavior, cloning, and visual behavior still need validation on a
+WebGPU device.
