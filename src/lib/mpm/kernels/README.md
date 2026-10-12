@@ -34,12 +34,17 @@ of the selected multiplier.
 
 The Gate 4 sample starts with 8,000 water, 6,000 oil, and 200 Neo-Hookean
 elastic pebbles built from three particles each (14,600 active particles
-total). The pebbles form a 20 × 10 array with 20-world-unit center spacing.
-Each is an equilateral triangle with 11-world-unit edges and width, about
-0.5% of the simulation-domain width. Each triangle spans roughly 1.1 grid
-cells and has its own `objectId`; this does not provide explicit contact, so
-mutual penetration and sustained elastic recovery are not validated. Each
-pebble uses lambda 20 and mu 10.
+total). The pebbles form a 14-column × 15-row array with 68-world-unit center
+spacing; the last row is centered and contains four pebbles. Each is an
+equilateral triangle with 66-world-unit edges and width, about 3% of the
+simulation-domain width. Each triangle spans roughly 6.6 grid cells and has
+its own `objectId`. The three particle vertices are not connected by explicit
+elastic bonds or contact, so mutual penetration and sustained shape retention
+are not validated. Each pebble uses lambda 20 and mu 10.
+At scene initialization, water and oil velocity components are sampled
+independently from ±12 world units/s and each pebble vertex from ±24 world
+units/s. A fixed scene seed reproduces the same velocities for tests and
+benchmarks; the lab chooses a fresh seed on initialization.
 
 Water and oil reference densities are 0.02 and 0.016, half the previous
 values. Their reference volumes and EOS stiffnesses are unchanged. The liquid

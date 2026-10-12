@@ -7,15 +7,23 @@ export const GATE4_PEBBLE_COUNT = 200;
 export const GATE4_PEBBLE_PARTICLES_PER_OBJECT = 3;
 export const GATE4_PEBBLE_PARTICLE_COUNT =
 	GATE4_PEBBLE_COUNT * GATE4_PEBBLE_PARTICLES_PER_OBJECT;
-export const GATE4_PEBBLE_COLUMNS = 20;
-export const GATE4_PEBBLE_ROWS = 10;
-export const GATE4_PEBBLE_SPACING = 20;
+export const GATE4_PEBBLE_COLUMNS = 14;
+export const GATE4_PEBBLE_ROWS = 15;
+export const GATE4_PEBBLE_SPACING = 68;
+export const GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX = 12;
+export const GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX = 24;
+const PEBBLE_BASE_WIDTH_RATIO = 0.005;
+const PEBBLE_SIZE_MULTIPLIER = 6;
+const UINT32_RANGE = 0x1_0000_0000;
 export const GATE4_PEBBLE_EDGE_LENGTH =
-	GATE4_GRID.cellsX * GATE4_GRID.cellSize * 0.005;
+	GATE4_GRID.cellsX *
+	GATE4_GRID.cellSize *
+	PEBBLE_BASE_WIDTH_RATIO *
+	PEBBLE_SIZE_MULTIPLIER;
 export const GATE4_PARTICLE_COUNT = 14_000 + GATE4_PEBBLE_PARTICLE_COUNT;
 
 const PARTICLE_SPACING = 9;
-const PEBBLE_CENTER: MpmVector2 = { x: 1_520, y: 300 };
+const PEBBLE_CENTER: MpmVector2 = { x: 1_520, y: 750 };
 const PEBBLE_FIRST_OBJECT_ID = 3;
 const PEBBLE_MATERIAL = {
 	lambda: 20,
@@ -76,6 +84,25 @@ function getPebbleVertices(center: MpmVector2): readonly MpmVector2[] {
 	];
 }
 
+function createSeededRandom(seed: number): () => number {
+	if (!Number.isSafeInteger(seed) || seed < 0 || seed >= UINT32_RANGE) {
+		throw new RangeError('The scene seed must be an unsigned 32-bit integer.');
+	}
+
+	let state = seed;
+	return () => {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		return state / UINT32_RANGE;
+	};
+}
+
+function createRandomVelocity(random: () => number, componentMax: number): MpmVector2 {
+	return {
+		x: (random() * 2 - 1) * componentMax,
+		y: (random() * 2 - 1) * componentMax
+	};
+}
+
 export interface MpmGate4Scene {
 	readonly particles: readonly MpmParticle[];
 	readonly parityProbeIndices: readonly number[];
@@ -87,7 +114,10 @@ export interface MpmCpuParitySample {
 	readonly probeSampleIndices: readonly number[];
 }
 
-export function createMpmGate4Scene(): MpmGate4Scene {
+export function createMpmGate4Scene(
+	seed = Math.floor(Math.random() * UINT32_RANGE)
+): MpmGate4Scene {
+	const random = createSeededRandom(seed);
 	const particles: MpmParticle[] = [];
 	const parityProbeIndices: number[] = [];
 
@@ -100,7 +130,10 @@ export function createMpmGate4Scene(): MpmGate4Scene {
 						x: object.startX + column * PARTICLE_SPACING,
 						y: object.startY + row * PARTICLE_SPACING
 					},
-					velocity: { x: 0, y: 0 },
+					velocity: createRandomVelocity(
+						random,
+						GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX
+					),
 					C: ZERO_MATRIX,
 					F: INITIAL_DEFORMATION,
 					objectId: object.objectId,
@@ -118,23 +151,32 @@ export function createMpmGate4Scene(): MpmGate4Scene {
 		Math.floor(GATE4_PEBBLE_ROWS / 2) * GATE4_PEBBLE_COLUMNS +
 		Math.floor(GATE4_PEBBLE_COLUMNS / 2);
 	for (let pebbleIndex = 0; pebbleIndex < GATE4_PEBBLE_COUNT; pebbleIndex += 1) {
+		const row = Math.floor(pebbleIndex / GATE4_PEBBLE_COLUMNS);
+		const rowStartIndex = row * GATE4_PEBBLE_COLUMNS;
+		const pebblesInRow = Math.min(
+			GATE4_PEBBLE_COLUMNS,
+			GATE4_PEBBLE_COUNT - rowStartIndex
+		);
+		const column =
+			pebbleIndex - rowStartIndex + (GATE4_PEBBLE_COLUMNS - pebblesInRow) * 0.5;
 		const center = {
 			x:
 				PEBBLE_CENTER.x +
-				(pebbleIndex % GATE4_PEBBLE_COLUMNS - (GATE4_PEBBLE_COLUMNS - 1) / 2) *
+				(column - (GATE4_PEBBLE_COLUMNS - 1) / 2) *
 					GATE4_PEBBLE_SPACING,
 			y:
 				PEBBLE_CENTER.y +
-				(Math.floor(pebbleIndex / GATE4_PEBBLE_COLUMNS) -
-					(GATE4_PEBBLE_ROWS - 1) / 2) *
-					GATE4_PEBBLE_SPACING
+				(row - (GATE4_PEBBLE_ROWS - 1) / 2) * GATE4_PEBBLE_SPACING
 		};
 		const pebbleStart = particles.length;
 		const objectId = PEBBLE_FIRST_OBJECT_ID + pebbleIndex;
 		for (const position of getPebbleVertices(center)) {
 			particles.push({
 				position,
-				velocity: { x: 0, y: 0 },
+				velocity: createRandomVelocity(
+					random,
+					GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX
+				),
 				C: ZERO_MATRIX,
 				F: INITIAL_DEFORMATION,
 				objectId,

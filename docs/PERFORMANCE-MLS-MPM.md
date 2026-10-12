@@ -248,10 +248,12 @@ Chrome CPU時計の分解能のためCPU medianの0 msは実処理時間ゼロ�
 永続数値statusを確認した。これらは小石の長時間弾性復元、衝突、全14,003粒子の
 全量CPU parityを検証するものではない。
 
-### 現行: 小石200個シーン計測（2026-10-12）
+### ベースライン: 小石200個シーン計測（11-unit版、2026-10-12）
 
 水8,000・油6,000・三粒子小石200個の14,600 active / 1,000,000 capacityを計測した。
 各三角形は辺長11 world units、20×10配置・中心間隔20 world units、個別 `objectId` 3〜202。
+この測定後に辺長33 / spacing40の1.5%-width版へ変更し、さらに現行の辺長66 /
+spacing68・14列×15行版へ拡大・再配置した。以下の結果はどちらの後続版の性能や弾性挙動も表さない。
 格子 `220×150`, `h=10`, `dt=1/240`, 重力 `(0,90)`。Chrome 154 / Apple Metal 3
 （fallbackなし）/ `timestamp-query`、暖機64 step、静止暖機600 ms、12 batch×8 step、描画なし。
 GPU確保量は217,228,520 byte。この単発profileは旧20,000粒 powder版や14,003粒途中版との
@@ -267,7 +269,7 @@ bucket構築 0.00838、P2G 0.02819、grid update 0.00884、G2P 0.01261、
 commit 0.00400 ms/step。attributionはbatchと異なるpass構成であり、通常batchのGPU値とは比較しない。
 CPU時計の分解能のため、encode median/p95の0 msは実処理時間ゼロを意味しない。
 
-現行ページの初回CPU/GPU比較は小石群中央と水・油の局所サンプルで最大絶対誤差
+このベースライン版ページの初回CPU/GPU比較は小石群中央と水・油の局所サンプルで最大絶対誤差
 `1.28e-5`、許容範囲内。別個の45粒子・５モデル／８ step回帰で最大絶対誤差
 `1.3956e-5`、batch/単発差0、pick・drag・clone・render・rollback・永続数値statusを確認した。
 これらは長時間の小石同士の接触・弾性復元や全14,600粒子の全量CPU parityを証明しない。
@@ -275,6 +277,55 @@ CPU時計の分解能のため、encode median/p95の0 msは実処理時間ゼ�
 **未確認**: mobile・他GPU・高capacityで全粒子を動かす場合の性能、
 ５分以上の持続性能、dense nodeの分布、powder/界面の物理校正、tail latencyの改善。
 この短い描画なし試験を、30/60 FPS達成や物理Gate合格へ読み替えない。
+
+### 66-unit・ゼロ初速版シーン計測（2026-10-12）
+
+水8,000・油6,000・三粒子小石200個（各辺66 world units、枠幅3%）の
+14,600 active / 1,000,000 capacityを計測した。小石は14列×15行（最終行4個）、
+中心間隔68 world units、個別 `objectId` 3〜202。格子 `220×150`, `h=10`,
+`dt=1/240`, 重力 `(0,90)`。Chrome 154 / Apple Metal 3（fallbackなし）/
+`timestamp-query`、初速ランダム化前（全粒子の初速0）の状態で暖機64 step、
+静止暖機600 ms、12 batch×8 step、描画なし。
+GPU確保量は217,228,520 byte。この測定は11-unit・33-unitの配置とのpaired A/Bではなく、
+相対的な性能改善率は主張しない。
+
+| profile | GPU median / p95 (ms/step) | CPU normal encode median / p95 (ms/batch) | queue wait median / p95 (ms/batch) | measured pass/batch |
+|---|---:|---:|---:|---:|
+| batch | 0.06448 / 0.06644 | 0 / 0 | 0.90 / 1.20 | 1 |
+| stages | 0.07594 / 0.07928 | 0 / 0 | 1.10 / 1.20 | 56 |
+
+stages profileのdispatch attribution medianはclear 0.00472、prepare 0.00558、
+bucket構築 0.00865、P2G 0.02825、grid update 0.00892、G2P 0.01275、
+commit 0.00415 ms/step。attributionはbatchと異なるpass構成であり、通常batch値と直接比較しない。
+CPU時計の分解能のため、encode median/p95の0 msは実処理時間ゼロを意味しない。
+
+このゼロ初速版ページの初回CPU/GPU比較は最大絶対誤差
+`1.28e-5`、許容範囲内。別個の45粒子・５モデル／８ step回帰で最大絶対誤差
+`1.3956e-5`、batch/単発差0、pick・drag・clone・render・rollback・永続数値statusを確認した。
+これらは長時間弾性復元、頂点間の一体変形、明示的接触を検証するものではない。
+
+### 現行: 66-unit・ランダム初速シーン計測（2026-10-12）
+
+前項と同じ14,600 active / 1,000,000 capacityの配置・格子・時間刻み・重力を使い、
+水・油の速度成分を±12、小石の各頂点の速度成分を±24 world units/sから独立に抽選した。
+シーン生成seedは `0x4d504d34` に固定し、計測を再現可能にした。Chrome 154 / Apple Metal 3
+（fallbackなし）/ `timestamp-query`、暖機64 step、静止暖機600 ms、12 batch×8 step、
+描画なし。GPU確保量は217,228,520 byte。
+
+| profile | GPU median / p95 (ms/step) | CPU normal encode median / p95 (ms/batch) | queue wait median / p95 (ms/batch) | measured pass/batch |
+|---|---:|---:|---:|---:|
+| batch | 0.06569 / 0.07025 | 0 / 0.10 | 0.90 / 1.00 | 1 |
+| stages | 0.09391 / 0.11052 | 0 / 0 | 1.20 / 1.50 | 56 |
+
+stages profileのdispatch attribution medianはclear 0.00571、prepare 0.00690、
+bucket構築 0.01158、P2G 0.03598、grid update 0.00977、G2P 0.01672、
+commit 0.00502 ms/step。attributionはbatchと異なるpass構成であり、通常batch値と直接比較しない。
+CPU時計の分解能のため、encode median/p95の0 msは実処理時間ゼロを意味しない。
+
+ランダム初速で再読み込みしたページの初回CPU/GPU比較は最大絶対誤差 `2.48e-5`、
+許容範囲内。GPU benchmark内の45粒子・５モデル／８ step回帰は最大絶対誤差
+`1.3956e-5`、batch/単発差0、pick・drag・clone・render・rollback・永続数値statusを確認した。
+この短時間試験は長時間弾性復元、頂点間の一体変形、明示的接触を検証するものではない。
 
 ## 6. 参照
 

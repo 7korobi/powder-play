@@ -23,6 +23,7 @@ async function benchmark(profile) {
 	const { createMpmMlsGpuSolver, MpmMlsGpuNumericalError } = await import('/src/lib/mpm/kernels/solver.ts');
 	const { createMpmGate4Scene, GATE4_GRID } = await import('/src/lib/mpm/scenes/gate4.ts');
 	const { stepMpm } = await import('/src/lib/mpm/reference/solver.ts');
+	const gate4BenchmarkSeed = 0x4d504d34;
 	if (!navigator.gpu) throw new Error('WebGPU is unavailable.');
 	const adapter = await navigator.gpu.requestAdapter();
 	if (!adapter?.features.has('timestamp-query')) throw new Error('timestamp-query is required; queue wait is not a GPU timing substitute.');
@@ -64,7 +65,7 @@ async function benchmark(profile) {
 		min: Math.min(...values), max: Math.max(...values), samples: values.length
 	});
 	try {
-		const scene = createMpmGate4Scene();
+		const scene = createMpmGate4Scene(gate4BenchmarkSeed);
 		const config = {
 			grid: GATE4_GRID, particleMass: 1, particleVolume: 25,
 			material: { lambda: 20, mu: 10, model: 'neo-hookean' }, capacity: 1_000_000

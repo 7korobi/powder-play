@@ -4,8 +4,10 @@ import {
 	createMpmGate4Scene,
 	GATE4_CLONE_OFFSET,
 	GATE4_GRID,
+	GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX,
 	GATE4_PARTICLE_CAPACITY,
 	GATE4_PEBBLE_EDGE_LENGTH,
+	GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX,
 	GATE4_PEBBLE_PARTICLE_COUNT,
 	GATE4_PEBBLE_PARTICLES_PER_OBJECT,
 	GATE4_PEBBLE_COUNT,
@@ -17,14 +19,20 @@ import {
 import { stepMpm } from '../reference/solver.js';
 
 describe('Gate 4 mixed-material sample scene', () => {
-	const scene = createMpmGate4Scene();
+	const sceneSeed = 0x4d504d34;
+	const scene = createMpmGate4Scene(sceneSeed);
 
 	it('creates two liquid regions and 200 contiguous three-particle elastic pebbles', () => {
 		expect(scene.particles).toHaveLength(14_600);
 		expect(scene.particles).toHaveLength(GATE4_PARTICLE_COUNT);
 		expect(GATE4_PARTICLE_CAPACITY).toBe(1_000_000);
 		expect(GATE4_GRID).toEqual({ cellsX: 220, cellsY: 150, cellSize: 10 });
-		expect(GATE4_PEBBLE_COLUMNS * GATE4_PEBBLE_ROWS).toBe(GATE4_PEBBLE_COUNT);
+		expect(GATE4_PEBBLE_ROWS).toBe(
+			Math.ceil(GATE4_PEBBLE_COUNT / GATE4_PEBBLE_COLUMNS)
+		);
+		expect(GATE4_PEBBLE_COLUMNS * GATE4_PEBBLE_ROWS).toBeGreaterThanOrEqual(
+			GATE4_PEBBLE_COUNT
+		);
 		expect(GATE4_PEBBLE_PARTICLE_COUNT).toBe(
 			GATE4_PEBBLE_COUNT * GATE4_PEBBLE_PARTICLES_PER_OBJECT
 		);
@@ -73,6 +81,75 @@ describe('Gate 4 mixed-material sample scene', () => {
 		expect(scene.particles[100].position.y - scene.particles[0].position.y).toBe(9);
 	});
 
+	it('gives every particle bounded random initial velocity and gives pebbles angular momentum', () => {
+		const repeatedScene = createMpmGate4Scene(sceneSeed);
+		expect(
+			repeatedScene.particles.map(({ velocity }) => velocity)
+		).toEqual(scene.particles.map(({ velocity }) => velocity));
+
+		const liquidParticles = scene.particles.slice(0, 14_000);
+		expect(
+			liquidParticles.every(
+				({ velocity }) =>
+					Math.abs(velocity.x) <= GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX &&
+					Math.abs(velocity.y) <= GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX
+			)
+		).toBe(true);
+		expect(
+			liquidParticles.some(({ velocity }) => velocity.x !== 0 || velocity.y !== 0)
+		).toBe(true);
+		expect(
+			liquidParticles
+				.slice(0, 8_000)
+				.some(({ velocity }) => velocity.x !== 0 || velocity.y !== 0)
+		).toBe(true);
+		expect(
+			liquidParticles
+				.slice(8_000)
+				.some(({ velocity }) => velocity.x !== 0 || velocity.y !== 0)
+		).toBe(true);
+
+		const pebbleParticles = scene.particles.slice(14_000);
+		expect(
+			pebbleParticles.every(
+				({ velocity }) =>
+					Math.abs(velocity.x) <= GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX &&
+					Math.abs(velocity.y) <= GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX
+			)
+		).toBe(true);
+
+		const firstPebble = pebbleParticles.slice(0, GATE4_PEBBLE_PARTICLES_PER_OBJECT);
+		const pebbles = Array.from({ length: GATE4_PEBBLE_COUNT }, (_, index) =>
+			pebbleParticles.slice(
+				index * GATE4_PEBBLE_PARTICLES_PER_OBJECT,
+				(index + 1) * GATE4_PEBBLE_PARTICLES_PER_OBJECT
+			)
+		);
+		expect(
+			pebbles.every(
+				(pebble) =>
+					new Set(pebble.map(({ velocity }) => `${velocity.x},${velocity.y}`)).size === 3
+			)
+		).toBe(true);
+		const center = {
+			x: firstPebble.reduce((sum, { position }) => sum + position.x, 0) / firstPebble.length,
+			y: firstPebble.reduce((sum, { position }) => sum + position.y, 0) / firstPebble.length
+		};
+		const angularMomentum = firstPebble.reduce(
+			(sum, particle) =>
+				sum +
+				(particle.position.x - center.x) * particle.velocity.y -
+				(particle.position.y - center.y) * particle.velocity.x,
+			0
+		);
+		expect(Math.abs(angularMomentum)).toBeGreaterThan(1);
+	});
+
+	it('rejects scene seeds outside the unsigned 32-bit range', () => {
+		expect(() => createMpmGate4Scene(-1)).toThrow(RangeError);
+		expect(() => createMpmGate4Scene(0x1_0000_0000)).toThrow(RangeError);
+	});
+
 	it('uses half liquid densities, tenfold liquid stiffness, and Neo-Hookean pebbles', () => {
 		expect(scene.particles).toHaveLength(GATE4_PARTICLE_COUNT);
 		expect(scene.particles[0].material).toMatchObject({
@@ -92,11 +169,12 @@ describe('Gate 4 mixed-material sample scene', () => {
 		});
 	});
 
-	it('builds 200 undeformed equilateral pebbles with 0.5%-width edges on a spaced grid', () => {
+	it('builds 200 undeformed equilateral pebbles with 3%-width edges and spacing', () => {
 		expect(GATE4_PEBBLE_EDGE_LENGTH).toBeCloseTo(
-			GATE4_GRID.cellsX * GATE4_GRID.cellSize * 0.005,
+			GATE4_GRID.cellsX * GATE4_GRID.cellSize * 0.03,
 			12
 		);
+		expect(GATE4_PEBBLE_SPACING).toBeGreaterThan(GATE4_PEBBLE_EDGE_LENGTH);
 
 		const pebbleParticles = scene.particles.slice(14_000);
 		const pebbleCenters = [];
@@ -161,6 +239,16 @@ describe('Gate 4 mixed-material sample scene', () => {
 		expect(pebbleCenters[GATE4_PEBBLE_COLUMNS].y - pebbleCenters[0].y).toBe(
 			GATE4_PEBBLE_SPACING
 		);
+		const lastRowStart = (GATE4_PEBBLE_ROWS - 1) * GATE4_PEBBLE_COLUMNS;
+		const lastRow = pebbleCenters.slice(lastRowStart);
+		expect(lastRow).toHaveLength(
+			GATE4_PEBBLE_COUNT - lastRowStart
+		);
+		expect(lastRow[0].y).toBe(lastRow[lastRow.length - 1].y);
+		expect(lastRow[0].x + lastRow[lastRow.length - 1].x).toBeCloseTo(
+			pebbleCenters[0].x + pebbleCenters[GATE4_PEBBLE_COLUMNS - 1].x,
+			12
+		);
 	});
 
 	it('keeps all starting particles inside the grid and gathers only local parity neighborhoods', () => {
@@ -184,8 +272,8 @@ describe('Gate 4 mixed-material sample scene', () => {
 						GATE4_GRID.cellsY * GATE4_GRID.cellSize - wallCushion
 			)
 		).toBe(true);
-		expect(sample.particles).toHaveLength(83);
-		expect(sample.sourceIndices).toHaveLength(83);
+		expect(sample.particles).toHaveLength(57);
+		expect(sample.sourceIndices).toHaveLength(57);
 		expect(sample.probeSampleIndices).toHaveLength(3);
 	});
 
