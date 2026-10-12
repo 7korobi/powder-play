@@ -78,10 +78,11 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			particleCapacity: 1,
 			particleStateBytes: 80,
 			particleBufferBytes: 80,
+			preparedAffineBytes: 16,
 			objectIdBufferBytes: 4,
 			bucketHeadBytes: 836,
 			bucketNextBytes: 36,
-			gridStateBytes: 5016,
+			gridStateBytes: 6688,
 			readbackBytes: 112
 		});
 	});
@@ -93,6 +94,7 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(layout.particleCapacity).toBe(0);
 		expect(layout.particleStateBytes).toBe(0);
 		expect(layout.particleBufferBytes).toBe(80);
+		expect(layout.preparedAffineBytes).toBe(16);
 		expect(layout.bucketNextBytes).toBe(4);
 		expect(layout.objectIdBufferBytes).toBe(4);
 		expect(layout.readbackBytes).toBe(32);
@@ -113,9 +115,26 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(layout.pairCount).toBe(36);
 		expect(layout.particleStateBytes).toBe(160);
 		expect(layout.particleBufferBytes).toBe(320);
+		expect(layout.preparedAffineBytes).toBe(64);
 		expect(layout.objectIdBufferBytes).toBe(16);
 		expect(layout.bucketNextBytes).toBe(144);
 		expect(layout.readbackBytes).toBe(364);
+	});
+
+	it('supports a one-million particle capacity within standard desktop buffer limits', () => {
+		const state = validateMpmMlsGpuInput(
+			[makeParticle()],
+			makeConfig({ capacity: 1_000_000 })
+		);
+		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
+
+		expect(layout.particleCapacity).toBe(1_000_000);
+		expect(layout.pairCount).toBe(9_000_000);
+		expect(layout.particleBufferBytes).toBe(80_000_000);
+		expect(layout.preparedAffineBytes).toBe(16_000_000);
+		expect(layout.objectIdBufferBytes).toBe(4_000_000);
+		expect(layout.bucketNextBytes).toBe(36_000_000);
+		expect(layout.readbackBytes).toBe(84_000_028);
 	});
 
 	it('packs each particle material and snow plastic history with the GPU layout', () => {
@@ -146,6 +165,22 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			0,
 			0
 		]);
+	});
+
+	it('requires six storage bindings for cached P2G gather', () => {
+		const state = validateMpmMlsGpuInput([makeParticle()], makeConfig());
+		expect(() =>
+			calculateMpmMlsGpuBufferLayout(state, {
+				...LIMITS,
+				maxStorageBuffersPerShaderStage: 5
+			})
+		).toThrow(/six storage buffers/);
+		expect(() =>
+			calculateMpmMlsGpuBufferLayout(state, {
+				...LIMITS,
+				maxStorageBuffersPerShaderStage: 6
+			})
+		).not.toThrow();
 	});
 
 	it('packs liquid density, per-particle volume, and powder friction', () => {

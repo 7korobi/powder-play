@@ -38,8 +38,10 @@ export interface MpmMlsGpuSolver {
 	readonly particleCount: number;
 	readonly particleCapacity: number;
 	step(dt: number, gravity: MpmVector2): void;
+	stepBatch(stepCount: number, dt: number, gravity: MpmVector2): void;
 	render(): void;
 	readParticles(particleIndices?: readonly number[]): Promise<readonly MpmParticle[]>;
+	checkNumericalStatus(): Promise<void>;
 	measureQueueCompletionMs(): Promise<number>;
 	pick(point: MpmVector2, radius: number): Promise<MpmMlsGpuSelection | null>;
 	beginDrag(selection: MpmMlsGpuSelection, target: MpmVector2, radius: number): void;
@@ -99,8 +101,50 @@ export class MpmMlsGpuNumericalError extends Error {
 	}
 }
 
+function decodeNumericalError(
+	snapshot: ArrayBuffer,
+	offset: number,
+	particleAt?: (particleIndex: number) => MpmParticle | undefined
+): MpmMlsGpuNumericalError | null {
+	const status = new Uint32Array(snapshot, offset, NUMERICAL_STATUS_WORDS);
+	if (status[0] === 0) return null;
+
+	const particleIndex = status[1] === MAX_U32 ? undefined : status[1];
+	const values = new Float32Array(
+		snapshot,
+		offset + 2 * Uint32Array.BYTES_PER_ELEMENT,
+		4
+	);
+	const diagnostics =
+		status[6] !== 1
+			? undefined
+			: {
+					determinant: values[0],
+					deformationIncrement: values[1],
+					precedingDeterminant: values[2]
+				};
+	const projectedDeformation =
+		status[6] !== 2
+			? undefined
+			: {
+					m00: values[0],
+					m01: values[1],
+					m10: values[2],
+					m11: values[3]
+				};
+
+	return new MpmMlsGpuNumericalError(
+		status[0],
+		particleIndex,
+		diagnostics,
+		particleIndex === undefined ? undefined : particleAt?.(particleIndex),
+		projectedDeformation
+	);
+}
+
 interface MpmMlsGpuPipelines {
 	readonly clearGrid: GPUComputePipeline;
+	readonly prepareParticles: GPUComputePipeline;
 	readonly buildBuckets: GPUComputePipeline;
 	readonly p2g: GPUComputePipeline;
 	readonly updateGrid: GPUComputePipeline;
@@ -112,6 +156,7 @@ interface MpmMlsGpuPipelines {
 }
 
 interface MpmMlsGpuStepBindings {
+	readonly prepareParticles: GPUBindGroup;
 	readonly buildBuckets: GPUBindGroup;
 	readonly p2g: GPUBindGroup;
 	readonly g2p: GPUBindGroup;
@@ -192,6 +237,7 @@ interface MpmMlsGpuRuntime {
 		readonly bucketHeads: GPUBuffer;
 		readonly bucketNext: GPUBuffer;
 		readonly gridNodes: GPUBuffer;
+		readonly preparedAffines: GPUBuffer;
 		readonly particleObjectIds: GPUBuffer;
 		readonly pickParams: GPUBuffer;
 		readonly pickResult: GPUBuffer;
@@ -225,6 +271,7 @@ async function createRuntime(
 
 	const pipelines: MpmMlsGpuPipelines = {
 		clearGrid: await createComputePipeline(device, computeModule, 'clearGrid'),
+		prepareParticles: await createComputePipeline(device, computeModule, 'prepareParticles'),
 		buildBuckets: await createComputePipeline(device, computeModule, 'buildBuckets'),
 		p2g: await createComputePipeline(device, computeModule, 'p2g'),
 		updateGrid: await createComputePipeline(device, computeModule, 'updateGrid'),
@@ -277,6 +324,11 @@ async function createRuntime(
 		gridNodes: createBuffer(
 			'MLS-MPM halo grid state',
 			layout.gridStateBytes,
+			BUFFER_USAGE.STORAGE
+		),
+		preparedAffines: createBuffer(
+			'MLS-MPM prepared affine momentum',
+			layout.preparedAffineBytes,
 			BUFFER_USAGE.STORAGE
 		),
 		particleObjectIds: createBuffer(
@@ -346,6 +398,12 @@ async function createRuntime(
 		const inputBuffers = buffers.particles;
 		const input = inputBuffers[inputIndex];
 		const output = inputBuffers[1 - inputIndex];
+		const prepareParticles = createBindGroup(device, pipelines.prepareParticles, [
+			bufferEntry(0, buffers.simulationParams),
+			bufferEntry(1, input),
+			bufferEntry(6, buffers.stateError),
+			bufferEntry(14, buffers.preparedAffines)
+		]);
 		const buildBuckets = createBindGroup(device, pipelines.buildBuckets, [
 			bufferEntry(0, buffers.simulationParams),
 			bufferEntry(1, input),
@@ -359,7 +417,8 @@ async function createRuntime(
 			bufferEntry(3, buffers.bucketHeads),
 			bufferEntry(4, buffers.bucketNext),
 			bufferEntry(5, buffers.gridNodes),
-			bufferEntry(6, buffers.stateError)
+			bufferEntry(6, buffers.stateError),
+			bufferEntry(14, buffers.preparedAffines)
 		]);
 		const g2p = createBindGroup(device, pipelines.g2p, [
 			bufferEntry(0, buffers.simulationParams),
@@ -384,7 +443,7 @@ async function createRuntime(
 			bufferEntry(9, buffers.pickParams),
 			bufferEntry(10, buffers.pickResult)
 		]);
-		return { buildBuckets, p2g, g2p, commitParticles, pick, render };
+		return { prepareParticles, buildBuckets, p2g, g2p, commitParticles, pick, render };
 	};
 	const createCloneBinding = (inputIndex: 0 | 1): GPUBindGroup =>
 		createBindGroup(device, pipelines.cloneObject, [
@@ -480,50 +539,74 @@ function createSolver(
 	}
 
 	function step(dt: number, gravity: MpmVector2): void {
+		stepBatch(1, dt, gravity);
+	}
+
+	function stepBatch(stepCount: number, dt: number, gravity: MpmVector2): void {
 		assertActive();
+		if (!Number.isSafeInteger(stepCount) || stepCount < 1) {
+			throw new RangeError('stepCount must be a positive safe integer.');
+		}
 		const parameters = packMpmMlsGpuStepParameters(state, layout, dt, gravity, particleCount);
-		const inputIndex = currentBuffer;
-		const groups = runtime.bindings[inputIndex];
+		let inputIndex = currentBuffer;
 		try {
 			session.device.queue.writeBuffer(runtime.buffers.simulationParams, 0, parameters);
 			const encoder = session.device.createCommandEncoder({
-				label: 'MLS-MPM simulation step'
+				label:
+					stepCount === 1
+						? 'MLS-MPM simulation step'
+						: `MLS-MPM simulation batch (${stepCount} steps)`
 			});
-			dispatchCompute(
-				encoder,
-				runtime.pipelines.clearGrid,
-				runtime.clearGrid,
-				layout.nodeCount
-			);
-			dispatchCompute(
-				encoder,
-				runtime.pipelines.buildBuckets,
-				groups.buildBuckets,
-				particleCount
-			);
-			dispatchCompute(encoder, runtime.pipelines.p2g, groups.p2g, layout.nodeCount);
-			dispatchCompute(
-				encoder,
-				runtime.pipelines.updateGrid,
-				runtime.updateGrid,
-				layout.nodeCount
-			);
-			dispatchCompute(
-				encoder,
-				runtime.pipelines.g2p,
-				groups.g2p,
-				particleCount
-			);
-			dispatchCompute(
-				encoder,
-				runtime.pipelines.commitParticles,
-				groups.commitParticles,
-				particleCount
-			);
+			const pass = encoder.beginComputePass({ label: 'MLS-MPM simulation batch' });
+			for (let stepIndex = 0; stepIndex < stepCount; stepIndex += 1) {
+				const groups = runtime.bindings[inputIndex];
+				dispatchCompute(
+					pass,
+					runtime.pipelines.clearGrid,
+					runtime.clearGrid,
+					layout.nodeCount
+				);
+				dispatchCompute(
+					pass,
+					runtime.pipelines.prepareParticles,
+					groups.prepareParticles,
+					particleCount
+				);
+				dispatchCompute(
+					pass,
+					runtime.pipelines.buildBuckets,
+					groups.buildBuckets,
+					particleCount
+				);
+				dispatchCompute(pass, runtime.pipelines.p2g, groups.p2g, layout.nodeCount);
+				dispatchCompute(
+					pass,
+					runtime.pipelines.updateGrid,
+					runtime.updateGrid,
+					layout.nodeCount
+				);
+				dispatchCompute(
+					pass,
+					runtime.pipelines.g2p,
+					groups.g2p,
+					particleCount
+				);
+				dispatchCompute(
+					pass,
+					runtime.pipelines.commitParticles,
+					groups.commitParticles,
+					particleCount
+				);
+				inputIndex = 1 - inputIndex;
+			}
+			pass.end();
 			session.device.queue.submit([encoder.finish()]);
-			currentBuffer = 1 - inputIndex;
+			currentBuffer = inputIndex;
 		} catch (cause) {
-			throw new Error('Failed to encode or submit an MLS-MPM step.', { cause });
+			throw new Error(
+				`Failed to encode or submit an MLS-MPM batch of ${stepCount} step(s).`,
+				{ cause }
+			);
 		}
 	}
 
@@ -559,6 +642,67 @@ function createSolver(
 		await session.device.queue.onSubmittedWorkDone();
 		assertActive();
 		return performance.now() - startedAt;
+	}
+
+	async function checkNumericalStatus(): Promise<void> {
+		assertActive();
+		let readback: GPUBuffer;
+		try {
+			readback = session.device.createBuffer({
+				label: 'MLS-MPM numerical status readback',
+				size: NUMERICAL_STATUS_BYTES,
+				usage: BUFFER_USAGE.MAP_READ | BUFFER_USAGE.COPY_DST
+			});
+		} catch (cause) {
+			throw new Error('Failed to allocate an MLS-MPM numerical status readback buffer.', {
+				cause
+			});
+		}
+		ownedBuffers.add(readback);
+		temporaryReadbacks.add(readback);
+
+		let mapped = false;
+		try {
+			const encoder = session.device.createCommandEncoder({
+				label: 'MLS-MPM numerical status readback'
+			});
+			encoder.copyBufferToBuffer(
+				runtime.buffers.stateError,
+				0,
+				readback,
+				0,
+				NUMERICAL_STATUS_BYTES
+			);
+			session.device.queue.submit([encoder.finish()]);
+			await readback.mapAsync(MAP_MODE_READ);
+			mapped = true;
+			assertActive();
+			const snapshot = readback.getMappedRange().slice(0);
+			readback.unmap();
+			mapped = false;
+
+			const numericalError = decodeNumericalError(snapshot, 0);
+			if (numericalError) throw numericalError;
+		} catch (cause) {
+			if (cause instanceof MpmMlsGpuNumericalError) throw cause;
+			throw new Error('Failed to read GPU MLS-MPM numerical status.', { cause });
+		} finally {
+			if (mapped) {
+				try {
+					readback.unmap();
+				} catch {
+					// A destroyed or lost device may already have unmapped the staging buffer.
+				}
+			}
+			if (temporaryReadbacks.delete(readback)) {
+				ownedBuffers.delete(readback);
+				try {
+					readback.destroy();
+				} catch {
+					// The caller's status check is already settled; device teardown owns recovery.
+				}
+			}
+		}
 	}
 
 	function validateReadbackIndices(indices: readonly number[]): readonly number[] {
@@ -656,57 +800,23 @@ function createSolver(
 			readback.unmap();
 			mapped = false;
 
-			const numericalStatus = new Uint32Array(
-				snapshot,
-				errorOffset,
-				NUMERICAL_STATUS_WORDS
-			);
 			const particles = unpackParticles(
 				new Float32Array(snapshot, 0, particleStateBytes / Float32Array.BYTES_PER_ELEMENT),
 				new Uint32Array(snapshot, 0, particleStateBytes / Uint32Array.BYTES_PER_ELEMENT),
 				readParticleCount,
 				new Uint32Array(snapshot, particleStateBytes, readParticleCount)
 			);
-			if (numericalStatus[0] !== 0) {
-				const particleIndex =
-					numericalStatus[1] === MAX_U32 ? undefined : numericalStatus[1];
+			const numericalError = decodeNumericalError(snapshot, errorOffset, (particleIndex) => {
 				const stateIndex =
 					particleIndex === undefined
 						? -1
 						: selectedIndices === null
 							? particleIndex
 							: selectedIndices.indexOf(particleIndex);
-				const particleState =
-					stateIndex >= 0 ? particles[stateIndex] : undefined;
-				const values = new Float32Array(
-					snapshot,
-					errorOffset + 2 * Uint32Array.BYTES_PER_ELEMENT,
-					4
-				);
-				const diagnostics =
-					numericalStatus[6] !== 1
-						? undefined
-						: {
-								determinant: values[0],
-								deformationIncrement: values[1],
-								precedingDeterminant: values[2]
-							};
-				const projectedDeformation =
-					numericalStatus[6] !== 2
-						? undefined
-						: {
-								m00: values[0],
-								m01: values[1],
-								m10: values[2],
-								m11: values[3]
-							};
-				throw new MpmMlsGpuNumericalError(
-					numericalStatus[0],
-					particleIndex,
-					diagnostics,
-					particleState,
-					projectedDeformation
-				);
+				return stateIndex >= 0 ? particles[stateIndex] : undefined;
+			});
+			if (numericalError) {
+				throw numericalError;
 			}
 			return particles;
 		} catch (cause) {
@@ -881,12 +991,14 @@ function createSolver(
 			const encoder = session.device.createCommandEncoder({
 				label: 'GPU-to-GPU MLS-MPM object clone'
 			});
+			const pass = encoder.beginComputePass({ label: 'MLS-MPM object clone' });
 			dispatchCompute(
-				encoder,
+				pass,
 				runtime.pipelines.cloneObject,
 				runtime.cloneBindings[currentBuffer],
 				source.count
 			);
+			pass.end();
 			session.device.queue.submit([encoder.finish()]);
 		} catch (cause) {
 			throw new Error('Failed to clone the selected MLS-MPM object on the GPU.', {
@@ -929,8 +1041,10 @@ function createSolver(
 			return layout.particleCapacity;
 		},
 		step,
+		stepBatch,
 		render,
 		readParticles,
+		checkNumericalStatus,
 		measureQueueCompletionMs,
 		pick,
 		beginDrag,
@@ -942,18 +1056,16 @@ function createSolver(
 }
 
 function dispatchCompute(
-	encoder: GPUCommandEncoder,
+	pass: GPUComputePassEncoder,
 	pipeline: GPUComputePipeline,
 	bindGroup: GPUBindGroup,
 	count: number
 ): void {
 	const workgroups = Math.ceil(count / COMPUTE_WORKGROUP_SIZE);
 	if (workgroups === 0) return;
-	const pass = encoder.beginComputePass({ label: pipeline.label });
 	pass.setPipeline(pipeline);
 	pass.setBindGroup(0, bindGroup);
 	pass.dispatchWorkgroups(workgroups);
-	pass.end();
 }
 
 async function createComputePipeline(

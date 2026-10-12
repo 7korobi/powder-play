@@ -329,6 +329,28 @@ describe('CPU MLS-MPM reference', () => {
 		expect(result.diagnostics.outputMomentum.y).toBeCloseTo(-0.0065, 14);
 	});
 
+	it('moves denser liquid particles downward relative to lighter liquids in a mixed region', () => {
+		const particles = [
+			makeParticle({
+				position: { x: 8, y: 8 },
+				volume: 1,
+				material: { lambda: 8, mu: 0, model: 'water', density: 2 }
+			}),
+			makeParticle({
+				position: { x: 8, y: 8 },
+				volume: 1,
+				material: { lambda: 8, mu: 0, model: 'oil', density: 1 }
+			})
+		];
+		const result = stepMpm(
+			particles,
+			makeConfig({ dt: 0.01, gravity: { x: 0, y: 10 } })
+		);
+
+		expect(result.particles[0].velocity.y).toBeGreaterThan(result.particles[1].velocity.y);
+		expect(result.particles[0].position.y).toBeGreaterThan(result.particles[1].position.y);
+	});
+
 	it('applies liquid bulk pressure only to compression', () => {
 		const material = { lambda: 8, mu: 0, model: 'water', density: 1 } as const;
 		const compressed = stepMpm(
@@ -354,6 +376,48 @@ describe('CPU MLS-MPM reference', () => {
 		expect(compressed.F.m00).toBeGreaterThan(0.9);
 		expect(expanded.C.m00).toBe(0);
 		expect(expanded.F.m00).toBe(1.1);
+	});
+
+	it('bounds liquid volume expansion to keep deformation determinants finite', () => {
+		const particles = [
+			makeParticle({
+				F: { m00: 3, m01: 0, m10: 0, m11: 3 },
+				material: { lambda: 8, mu: 0, model: 'water', density: 1 }
+			})
+		];
+		const config = makeConfig({ dt: 0.001, gravity: { x: 0, y: 0 } });
+		let state = particles;
+
+		for (let step = 0; step < 20; step += 1) {
+			state = [...stepMpm(state, config).particles];
+			const deformation = state[0].F;
+			const determinant =
+				deformation.m00 * deformation.m11 - deformation.m01 * deformation.m10;
+
+			expect(Number.isFinite(determinant)).toBe(true);
+			expect(determinant).toBeGreaterThanOrEqual(0.5 - 1e-10);
+			expect(determinant).toBeLessThanOrEqual(2 + 1e-10);
+		}
+	});
+
+	it('bounds powder volume collapse to prevent excessive compression', () => {
+		const particle = makeParticle({
+			F: { m00: 0.1, m01: 0, m10: 0, m11: 1 },
+			material: {
+				lambda: 20,
+				mu: 10,
+				model: 'powder',
+				frictionCoefficient: 0.55
+			}
+		});
+		const result = stepMpm(
+			[particle],
+			makeConfig({ dt: 1e-12, gravity: { x: 0, y: 0 } })
+		).particles[0];
+		const determinant =
+			result.F.m00 * result.F.m11 - result.F.m01 * result.F.m10;
+
+		expect(determinant).toBeCloseTo(0.5, 10);
 	});
 
 	it('caps powder shear by pressure-dependent friction', () => {

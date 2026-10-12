@@ -100,6 +100,8 @@ interface GridNode {
 	momentumY: number;
 	velocityX: number;
 	velocityY: number;
+	liquidMass: number;
+	liquidVolume: number;
 }
 
 interface ParticlePhysicalState {
@@ -129,6 +131,9 @@ interface Decomposition2 {
 
 const IDENTITY: MpmMatrix2 = { m00: 1, m01: 0, m10: 0, m11: 1 };
 const WALL_CUSHION_CELLS = 8;
+const MIN_LIQUID_DETERMINANT = 0.5;
+const MAX_LIQUID_DETERMINANT = 2;
+const MIN_POWDER_DETERMINANT = 0.5;
 const MAX_DEFORMATION_INCREMENT = 0.25;
 const MAX_DEFORMATION_SUBSTEPS = 64;
 
@@ -158,6 +163,9 @@ export function stepMpm(
 		);
 		const stressScale = -validated.dt * state.volume * validated.gradientScale;
 		assertComputedFinite(stressScale, 'particle stress scale');
+		const isLiquid = state.material.model === 'water' || state.material.model === 'oil';
+		const liquidVolume = isLiquid ? state.volume * determinant(particle.F) : 0;
+		if (isLiquid) assertComputedFinite(liquidVolume, 'liquid particle volume');
 		const affine = addMatrices(
 			scaleMatrix(particle.C, state.mass),
 			scaleMatrix(stressTimesFt, stressScale)
@@ -182,7 +190,9 @@ export function stepMpm(
 						momentumX: 0,
 						momentumY: 0,
 						velocityX: 0,
-						velocityY: 0
+						velocityY: 0,
+						liquidMass: 0,
+						liquidVolume: 0
 					};
 					grid.set(key, node);
 				}
@@ -200,6 +210,12 @@ export function stepMpm(
 				node.mass += weight * state.mass;
 				node.momentumX += weight * particleMomentumX;
 				node.momentumY += weight * particleMomentumY;
+				if (isLiquid) {
+					node.liquidMass += weight * state.mass;
+					node.liquidVolume += weight * liquidVolume;
+					assertComputedFinite(node.liquidMass, 'liquid grid mass');
+					assertComputedFinite(node.liquidVolume, 'liquid grid volume');
+				}
 				assertComputedFinite(node.mass, 'grid node mass');
 				assertComputedFinite(node.momentumX, 'grid node momentum');
 				assertComputedFinite(node.momentumY, 'grid node momentum');
@@ -244,6 +260,9 @@ export function stepMpm(
 		let c01 = 0;
 		let c10 = 0;
 		let c11 = 0;
+		let localLiquidMass = 0;
+		let localLiquidVolume = 0;
+		const isLiquid = state.material.model === 'water' || state.material.model === 'oil';
 
 		for (let oy = 0; oy < 3; oy++) {
 			for (let ox = 0; ox < 3; ox++) {
@@ -259,11 +278,34 @@ export function stepMpm(
 				const dposY = (oy - stencil.fy) * dx;
 				velocityX += weight * node.velocityX;
 				velocityY += weight * node.velocityY;
+				if (isLiquid) {
+					localLiquidMass += weight * node.liquidMass;
+					localLiquidVolume += weight * node.liquidVolume;
+				}
 				c00 += weight * node.velocityX * dposX;
 				c01 += weight * node.velocityX * dposY;
 				c10 += weight * node.velocityY * dposX;
 				c11 += weight * node.velocityY * dposY;
 			}
+		}
+
+		if (isLiquid) {
+			assertComputedFinite(localLiquidMass, 'local liquid mass');
+			assertComputedFinite(localLiquidVolume, 'local liquid volume');
+			if (localLiquidMass <= 0 || localLiquidVolume <= 0) {
+				throw new RangeError('liquid particle stencil has no local liquid density');
+			}
+			const particleDensity =
+				state.mass / (state.volume * determinant(particle.F));
+			const localDensity = localLiquidMass / localLiquidVolume;
+			assertComputedFinite(particleDensity, 'particle density');
+			assertComputedFinite(localDensity, 'local liquid density');
+			if (particleDensity <= 0 || localDensity <= 0) {
+				throw new RangeError('liquid densities must be positive');
+			}
+			const relativeDensity = (particleDensity - localDensity) / particleDensity;
+			velocityX += validated.dt * validated.gravity.x * relativeDensity;
+			velocityY += validated.dt * validated.gravity.y * relativeDensity;
 		}
 
 		const C: MpmMatrix2 = {
@@ -643,7 +685,11 @@ function granularStressTimesFt(
 	const logStretch1 = Math.log(decomposition.sigma1);
 	const logStretch2 = Math.log(decomposition.sigma2);
 	const logVolume = logStretch1 + logStretch2;
-	const pressure = Math.max(0, -(material.lambda + material.mu) * logVolume);
+	const boundedLogVolume = Math.max(
+		Math.log(MIN_POWDER_DETERMINANT),
+		logVolume
+	);
+	const pressure = Math.max(0, -(material.lambda + material.mu) * boundedLogVolume);
 	const deviatoricLogStretch = 0.5 * (logStretch1 - logStretch2);
 	const maximumDeviatoricLogStretch =
 		(material.frictionCoefficient * pressure) / (2 * material.mu);
@@ -722,18 +768,23 @@ function projectGranularDeformation(
 	const logStretch1 = Math.log(decomposition.sigma1);
 	const logStretch2 = Math.log(decomposition.sigma2);
 	const logVolume = logStretch1 + logStretch2;
-	const pressure = Math.max(0, -(material.lambda + material.mu) * logVolume);
+	const minimumLogVolume = Math.log(MIN_POWDER_DETERMINANT);
+	const boundedLogVolume = Math.max(minimumLogVolume, logVolume);
+	const pressure = Math.max(0, -(material.lambda + material.mu) * boundedLogVolume);
 	const deviatoricLogStretch = 0.5 * (logStretch1 - logStretch2);
 	const maximumDeviatoricLogStretch =
 		(material.frictionCoefficient * pressure) / (2 * material.mu);
-	if (deviatoricLogStretch <= maximumDeviatoricLogStretch) {
+	if (
+		deviatoricLogStretch <= maximumDeviatoricLogStretch &&
+		logVolume >= minimumLogVolume
+	) {
 		return deformation;
 	}
 	const projectedDeviatoricLogStretch = Math.min(
 		deviatoricLogStretch,
 		maximumDeviatoricLogStretch
 	);
-	const meanLogStretch = 0.5 * logVolume;
+	const meanLogStretch = 0.5 * boundedLogVolume;
 	const projected: MpmMatrix2 = {
 		m00:
 			Math.exp(meanLogStretch + projectedDeviatoricLogStretch) *
@@ -780,7 +831,12 @@ function projectLiquidDeformation(deformation: MpmMatrix2): MpmMatrix2 {
 		throw new RangeError('liquid deformation cannot be projected to a finite rotation');
 	}
 
-	const scale = Math.sqrt(determinantF);
+	// The tension-free EOS needs a finite area-ratio bound to prevent runaway expansion.
+	const boundedDeterminant = Math.min(
+		MAX_LIQUID_DETERMINANT,
+		Math.max(MIN_LIQUID_DETERMINANT, determinantF)
+	);
+	const scale = Math.sqrt(boundedDeterminant);
 	const cosine = rotationCosineNumerator / rotationMagnitude;
 	const sine = rotationSineNumerator / rotationMagnitude;
 	const projected: MpmMatrix2 = {

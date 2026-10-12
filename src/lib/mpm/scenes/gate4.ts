@@ -1,36 +1,80 @@
-import type { MpmMaterialParameters, MpmParticle } from '../reference/solver.js';
+import type { MpmMaterialParameters, MpmParticle, MpmVector2 } from '../reference/solver.js';
 
-export const GATE4_GRID = { cellsX: 270, cellsY: 180, cellSize: 10 } as const;
-export const GATE4_PARTICLE_COUNT = 20_000;
-export const GATE4_PARTICLE_CAPACITY = 40_000;
+export const GATE4_GRID = { cellsX: 220, cellsY: 150, cellSize: 10 } as const;
+export const GATE4_PARTICLE_CAPACITY = 1_000_000;
+export const GATE4_CLONE_OFFSET: MpmVector2 = { x: 72, y: 0 };
+export const GATE4_PEBBLE_COUNT = 200;
+export const GATE4_PEBBLE_PARTICLES_PER_OBJECT = 3;
+export const GATE4_PEBBLE_PARTICLE_COUNT =
+	GATE4_PEBBLE_COUNT * GATE4_PEBBLE_PARTICLES_PER_OBJECT;
+export const GATE4_PEBBLE_COLUMNS = 20;
+export const GATE4_PEBBLE_ROWS = 10;
+export const GATE4_PEBBLE_SPACING = 20;
+export const GATE4_PEBBLE_EDGE_LENGTH =
+	GATE4_GRID.cellsX * GATE4_GRID.cellSize * 0.005;
+export const GATE4_PARTICLE_COUNT = 14_000 + GATE4_PEBBLE_PARTICLE_COUNT;
 
-const PARTICLE_SPACING = 8;
+const PARTICLE_SPACING = 9;
+const PEBBLE_CENTER: MpmVector2 = { x: 1_520, y: 300 };
+const PEBBLE_FIRST_OBJECT_ID = 3;
+const PEBBLE_MATERIAL = {
+	lambda: 20,
+	mu: 10,
+	model: 'neo-hookean'
+} as const satisfies MpmMaterialParameters;
 const ZERO_MATRIX = { m00: 0, m01: 0, m10: 0, m11: 0 } as const;
 const INITIAL_DEFORMATION = { m00: 1, m01: 0, m10: 0, m11: 1 } as const;
 const WATER_MATERIAL = {
-	lambda: 4_000,
+	lambda: 40_000,
 	mu: 0,
 	model: 'water',
-	density: 0.04
+	density: 0.02
 } as const satisfies MpmMaterialParameters;
 const OIL_MATERIAL = {
-	lambda: 3_000,
+	lambda: 30_000,
 	mu: 0,
 	model: 'oil',
-	density: 0.032
+	density: 0.016
 } as const satisfies MpmMaterialParameters;
-const POWDER_MATERIAL = {
-	lambda: 20,
-	mu: 10,
-	model: 'powder',
-	frictionCoefficient: 0.55
-} as const satisfies MpmMaterialParameters;
-
 const OBJECTS = [
-	{ objectId: 1, startX: 100, startY: 1_100, columns: 100, rows: 80, material: WATER_MATERIAL },
-	{ objectId: 2, startX: 100, startY: 600, columns: 100, rows: 60, material: OIL_MATERIAL },
-	{ objectId: 3, startX: 1_600, startY: 100, columns: 100, rows: 60, material: POWDER_MATERIAL }
+	{
+		objectId: 1,
+		startX: 100,
+		startY: 640,
+		columns: 100,
+		rows: 80,
+		probeRow: 0,
+		probeColumn: 50,
+		material: WATER_MATERIAL
+	},
+	{
+		objectId: 2,
+		startX: 100,
+		startY: 100,
+		columns: 100,
+		rows: 60,
+		probeRow: 59,
+		probeColumn: 50,
+		material: OIL_MATERIAL
+	},
 ] as const;
+
+function getPebbleVertices(center: MpmVector2): readonly MpmVector2[] {
+	return [
+		{
+			x: center.x - GATE4_PEBBLE_EDGE_LENGTH * 0.5,
+			y: center.y - GATE4_PEBBLE_EDGE_LENGTH / (2 * Math.sqrt(3))
+		},
+		{
+			x: center.x + GATE4_PEBBLE_EDGE_LENGTH * 0.5,
+			y: center.y - GATE4_PEBBLE_EDGE_LENGTH / (2 * Math.sqrt(3))
+		},
+		{
+			x: center.x,
+			y: center.y + GATE4_PEBBLE_EDGE_LENGTH / Math.sqrt(3)
+		}
+	];
+}
 
 export interface MpmGate4Scene {
 	readonly particles: readonly MpmParticle[];
@@ -66,8 +110,41 @@ export function createMpmGate4Scene(): MpmGate4Scene {
 			}
 		}
 		parityProbeIndices.push(
-			objectStart + Math.floor(object.rows / 2) * object.columns + Math.floor(object.columns / 2)
+			objectStart + object.probeRow * object.columns + object.probeColumn
 		);
+	}
+
+	const parityPebbleIndex =
+		Math.floor(GATE4_PEBBLE_ROWS / 2) * GATE4_PEBBLE_COLUMNS +
+		Math.floor(GATE4_PEBBLE_COLUMNS / 2);
+	for (let pebbleIndex = 0; pebbleIndex < GATE4_PEBBLE_COUNT; pebbleIndex += 1) {
+		const center = {
+			x:
+				PEBBLE_CENTER.x +
+				(pebbleIndex % GATE4_PEBBLE_COLUMNS - (GATE4_PEBBLE_COLUMNS - 1) / 2) *
+					GATE4_PEBBLE_SPACING,
+			y:
+				PEBBLE_CENTER.y +
+				(Math.floor(pebbleIndex / GATE4_PEBBLE_COLUMNS) -
+					(GATE4_PEBBLE_ROWS - 1) / 2) *
+					GATE4_PEBBLE_SPACING
+		};
+		const pebbleStart = particles.length;
+		const objectId = PEBBLE_FIRST_OBJECT_ID + pebbleIndex;
+		for (const position of getPebbleVertices(center)) {
+			particles.push({
+				position,
+				velocity: { x: 0, y: 0 },
+				C: ZERO_MATRIX,
+				F: INITIAL_DEFORMATION,
+				objectId,
+				plasticVolume: 1,
+				material: PEBBLE_MATERIAL
+			});
+		}
+		if (pebbleIndex === parityPebbleIndex) {
+			parityProbeIndices.push(pebbleStart + GATE4_PEBBLE_PARTICLES_PER_OBJECT - 1);
+		}
 	}
 
 	if (particles.length !== GATE4_PARTICLE_COUNT) {

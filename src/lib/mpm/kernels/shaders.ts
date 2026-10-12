@@ -17,6 +17,8 @@ struct GridNode {
 	mass: f32,
 	momentum: vec2<f32>,
 	velocity: vec2<f32>,
+	liquidMass: f32,
+	liquidVolume: f32,
 }
 
 struct SimulationParams {
@@ -58,6 +60,7 @@ const WALL_CUSHION_CELLS: f32 = 8.0;
 @group(0) @binding(11) var<storage, read_write> cloneParticles: array<Particle>;
 @group(0) @binding(12) var<storage, read_write> cloneObjectIds: array<u32>;
 @group(0) @binding(13) var<uniform> cloneParams: CloneParams;
+@group(0) @binding(14) var<storage, read_write> preparedAffines: array<vec4<f32>>;
 
 const ERROR_STENCIL: u32 = 1u;
 const ERROR_DEFORMATION: u32 = 2u;
@@ -81,6 +84,9 @@ const SNOW_HARDENING: f32 = 10.0;
 const SNOW_MIN_PLASTIC_VOLUME: f32 = 0.6;
 const SNOW_MAX_PLASTIC_VOLUME: f32 = 20.0;
 const SNOW_MAX_HARDENING_EXPONENT: f32 = 20.0;
+const MIN_LIQUID_DETERMINANT: f32 = 0.5;
+const MAX_LIQUID_DETERMINANT: f32 = 2.0;
+const MIN_POWDER_DETERMINANT: f32 = 0.5;
 const MAX_DEFORMATION_INCREMENT: f32 = 0.25;
 const MAX_DEFORMATION_SUBSTEPS: f32 = 64.0;
 
@@ -195,7 +201,8 @@ fn granularStressTimesFt(
 	let decomposition = decompose2x2(matrix);
 	let logStretch = log(decomposition.sigma);
 	let logVolume = logStretch.x + logStretch.y;
-	let pressure = max(0.0, -(lambda + mu) * logVolume);
+	let boundedLogVolume = max(log(MIN_POWDER_DETERMINANT), logVolume);
+	let pressure = max(0.0, -(lambda + mu) * boundedLogVolume);
 	let deviatoricLogStretch = 0.5 * (logStretch.x - logStretch.y);
 	let maximumDeviatoricLogStretch =
 		frictionCoefficient * pressure / (2.0 * mu);
@@ -229,16 +236,21 @@ fn projectGranularDeformation(
 	let decomposition = decompose2x2(matrix);
 	let logStretch = log(decomposition.sigma);
 	let logVolume = logStretch.x + logStretch.y;
-	let pressure = max(0.0, -(lambda + mu) * logVolume);
+	let minimumLogVolume = log(MIN_POWDER_DETERMINANT);
+	let boundedLogVolume = max(minimumLogVolume, logVolume);
+	let pressure = max(0.0, -(lambda + mu) * boundedLogVolume);
 	let deviatoricLogStretch = 0.5 * (logStretch.x - logStretch.y);
 	let maximumDeviatoricLogStretch =
 		frictionCoefficient * pressure / (2.0 * mu);
-	if (deviatoricLogStretch <= maximumDeviatoricLogStretch) {
+	if (
+		deviatoricLogStretch <= maximumDeviatoricLogStretch &&
+		logVolume >= minimumLogVolume
+	) {
 		return matrix;
 	}
 	let projectedDeviatoricLogStretch =
 		min(deviatoricLogStretch, maximumDeviatoricLogStretch);
-	let meanLogStretch = 0.5 * logVolume;
+	let meanLogStretch = 0.5 * boundedLogVolume;
 	let projectedSigma = exp(vec2<f32>(
 		meanLogStretch + projectedDeviatoricLogStretch,
 		meanLogStretch - projectedDeviatoricLogStretch,
@@ -253,7 +265,12 @@ fn projectLiquidDeformation(matrix: vec4<f32>) -> vec4<f32> {
 	let rotationLength = length(normalizedRotation);
 	let rotation = normalizedRotation / rotationLength;
 	let volume = matrix.x * matrix.w - matrix.y * matrix.z;
-	let scale = sqrt(volume);
+	let boundedVolume = clamp(
+		volume,
+		MIN_LIQUID_DETERMINANT,
+		MAX_LIQUID_DETERMINANT,
+	);
+	let scale = sqrt(boundedVolume);
 	return scale * vec4<f32>(rotation.x, -rotation.y, rotation.y, rotation.x);
 }
 
@@ -303,6 +320,8 @@ fn clearGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	gridNodes[index].mass = 0.0;
 	gridNodes[index].momentum = vec2<f32>(0.0, 0.0);
 	gridNodes[index].velocity = vec2<f32>(0.0, 0.0);
+	gridNodes[index].liquidMass = 0.0;
+	gridNodes[index].liquidVolume = 0.0;
 }
 
 @compute @workgroup_size(64)
@@ -343,58 +362,15 @@ fn buildBuckets(@builtin(global_invocation_id) invocation: vec3<u32>) {
 }
 
 @compute @workgroup_size(64)
-fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
-	let nodeIndex = invocation.x;
-	if (nodeIndex >= params.counts.y) {
+fn prepareParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let particleIndex = invocation.x;
+	if (particleIndex >= params.counts.x) {
 		return;
 	}
 	if (atomicLoad(&stateError[0]) != 0u) {
 		return;
 	}
-
-	var mass = 0.0;
-	var momentum = vec2<f32>(0.0, 0.0);
-	var entry = atomicLoad(&bucketHeads[nodeIndex]);
-	var visited = 0u;
-
-	loop {
-		if (entry == -1) {
-			break;
-		}
-		if (entry < -1 || visited >= params.counts.x) {
-			atomicOr(&stateError[0], ERROR_STENCIL);
-			return;
-		}
-		let pairIndex = u32(entry);
-		if (pairIndex >= params.counts.z) {
-			atomicOr(&stateError[0], ERROR_STENCIL);
-			return;
-		}
-		let particleIndex = pairIndex / 9u;
-		if (particleIndex >= params.counts.x) {
-			atomicOr(&stateError[0], ERROR_STENCIL);
-			return;
-		}
-
-		let supportIndex = pairIndex % 9u;
-		let ox = supportIndex % 3u;
-		let oy = supportIndex / 3u;
-		let particle = particlesIn[particleIndex];
-		let gridPosition = particle.position / params.physical.x;
-		if (!finiteVec2(gridPosition)) {
-			atomicOr(&stateError[0], ERROR_STENCIL);
-			return;
-		}
-		let base = vec2<i32>(floor(gridPosition - vec2<f32>(0.5, 0.5)));
-		let fraction = gridPosition - vec2<f32>(base);
-		let weightsX = quadraticWeights(fraction.x);
-		let weightsY = quadraticWeights(fraction.y);
-		let weight = weightsX[ox] * weightsY[oy];
-		let supportNode = base + vec2<i32>(i32(ox), i32(oy));
-		if (!stencilFitsHalo(base) || gridIndex(supportNode) != nodeIndex) {
-			atomicOr(&stateError[0], ERROR_STENCIL);
-			return;
-		}
+	let particle = particlesIn[particleIndex];
 
 		let determinant = particle.f.x * particle.f.w - particle.f.y * particle.f.z;
 		if (
@@ -511,6 +487,77 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		let affine =
 			particleMass * particle.c +
 			particleStressScale * stressTimesFt;
+	if (!finiteVec4(stressTimesFt) || !finiteVec4(affine)) {
+		atomicMin(&stateError[1], particleIndex);
+		atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_NONFINITE_PARTICLE);
+		return;
+	}
+	preparedAffines[particleIndex] = affine;
+}
+
+@compute @workgroup_size(64)
+fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let nodeIndex = invocation.x;
+	if (nodeIndex >= params.counts.y) {
+		return;
+	}
+	if (atomicLoad(&stateError[0]) != 0u) {
+		return;
+	}
+
+	var mass = 0.0;
+	var momentum = vec2<f32>(0.0, 0.0);
+	var liquidMass = 0.0;
+	var liquidVolume = 0.0;
+	var entry = atomicLoad(&bucketHeads[nodeIndex]);
+	var visited = 0u;
+
+	loop {
+		if (entry == -1) {
+			break;
+		}
+		if (entry < -1 || visited >= params.counts.x) {
+			atomicOr(&stateError[0], ERROR_STENCIL);
+			return;
+		}
+		let pairIndex = u32(entry);
+		if (pairIndex >= params.counts.z) {
+			atomicOr(&stateError[0], ERROR_STENCIL);
+			return;
+		}
+		let particleIndex = pairIndex / 9u;
+		if (particleIndex >= params.counts.x) {
+			atomicOr(&stateError[0], ERROR_STENCIL);
+			return;
+		}
+
+		let supportIndex = pairIndex % 9u;
+		let ox = supportIndex % 3u;
+		let oy = supportIndex / 3u;
+		let particle = particlesIn[particleIndex];
+		let gridPosition = particle.position / params.physical.x;
+		if (!finiteVec2(gridPosition)) {
+			atomicOr(&stateError[0], ERROR_STENCIL);
+			return;
+		}
+		let base = vec2<i32>(floor(gridPosition - vec2<f32>(0.5, 0.5)));
+		let fraction = gridPosition - vec2<f32>(base);
+		let weightsX = quadraticWeights(fraction.x);
+		let weightsY = quadraticWeights(fraction.y);
+		let weight = weightsX[ox] * weightsY[oy];
+		let supportNode = base + vec2<i32>(i32(ox), i32(oy));
+		if (!stencilFitsHalo(base) || gridIndex(supportNode) != nodeIndex) {
+			atomicOr(&stateError[0], ERROR_STENCIL);
+			return;
+		}
+		var particleMass = params.physical.y;
+		if (
+			particle.materialModel == MODEL_WATER ||
+			particle.materialModel == MODEL_OIL
+		) {
+			particleMass = particle.density * particle.volume;
+		}
+		let affine = preparedAffines[particleIndex];
 		let dpos =
 			(vec2<f32>(f32(ox), f32(oy)) - fraction) * params.physical.x;
 		let particleMomentum = vec2<f32>(
@@ -524,7 +571,6 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		if (
 			!finiteFloat(weight) ||
 			weight < 0.0 ||
-			!finiteVec4(stressTimesFt) ||
 			!finiteVec4(affine) ||
 			!finiteVec2(dpos) ||
 			!finiteVec2(particleMomentum)
@@ -538,7 +584,20 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		let weightedMomentum = weight * particleMomentum;
 		mass = mass + weightedMass;
 		momentum = momentum + weightedMomentum;
-		if (!finiteFloat(mass) || !finiteVec2(momentum)) {
+		if (
+			particle.materialModel == MODEL_WATER ||
+			particle.materialModel == MODEL_OIL
+		) {
+			let determinant = particle.f.x * particle.f.w - particle.f.y * particle.f.z;
+			liquidMass = liquidMass + weightedMass;
+			liquidVolume = liquidVolume + weight * particle.volume * determinant;
+		}
+		if (
+			!finiteFloat(mass) ||
+			!finiteVec2(momentum) ||
+			!finiteFloat(liquidMass) ||
+			!finiteFloat(liquidVolume)
+		) {
 			atomicMin(&stateError[1], particleIndex);
 			atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_NONFINITE_ACCUMULATION);
 			return;
@@ -554,6 +613,8 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	gridNodes[nodeIndex].mass = mass;
 	gridNodes[nodeIndex].momentum = momentum;
 	gridNodes[nodeIndex].velocity = vec2<f32>(0.0, 0.0);
+	gridNodes[nodeIndex].liquidMass = liquidMass;
+	gridNodes[nodeIndex].liquidVolume = liquidVolume;
 }
 
 fn applyWallCushion(velocity: f32, coordinate: i32, extent: i32) -> f32 {
@@ -674,8 +735,13 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	let fraction = gridPosition - vec2<f32>(base);
 	let weightsX = quadraticWeights(fraction.x);
 	let weightsY = quadraticWeights(fraction.y);
+	let isLiquidParticle =
+		particle.materialModel == MODEL_WATER ||
+		particle.materialModel == MODEL_OIL;
 	var velocity = vec2<f32>(0.0, 0.0);
 	var affine = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+	var liquidMass = 0.0;
+	var liquidVolume = 0.0;
 
 	for (var oy = 0u; oy < 3u; oy = oy + 1u) {
 		for (var ox = 0u; ox < 3u; ox = ox + 1u) {
@@ -699,12 +765,61 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 				return;
 			}
 			velocity = velocity + weight * gridVelocity;
+			if (isLiquidParticle) {
+				let nodeLiquidMass = gridNodes[nodeIndex].liquidMass;
+				let nodeLiquidVolume = gridNodes[nodeIndex].liquidVolume;
+				if (
+					!finiteFloat(nodeLiquidMass) ||
+					nodeLiquidMass < 0.0 ||
+					!finiteFloat(nodeLiquidVolume) ||
+					nodeLiquidVolume < 0.0
+				) {
+					atomicMin(&stateError[1], particleIndex);
+					atomicOr(&stateError[0], ERROR_G2P);
+					return;
+				}
+				liquidMass = liquidMass + weight * nodeLiquidMass;
+				liquidVolume = liquidVolume + weight * nodeLiquidVolume;
+			}
 			affine = affine + vec4<f32>(
 				weight * gridVelocity.x * dpos.x,
 				weight * gridVelocity.x * dpos.y,
 				weight * gridVelocity.y * dpos.x,
 				weight * gridVelocity.y * dpos.y,
 			);
+		}
+	}
+
+	if (isLiquidParticle) {
+		let particleDeterminant = particle.f.x * particle.f.w - particle.f.y * particle.f.z;
+		if (
+			!finiteFloat(liquidMass) ||
+			liquidMass <= 0.0 ||
+			!finiteFloat(liquidVolume) ||
+			liquidVolume <= 0.0 ||
+			!finiteFloat(particleDeterminant) ||
+			particleDeterminant <= 0.0
+		) {
+			atomicMin(&stateError[1], particleIndex);
+			atomicOr(&stateError[0], ERROR_G2P);
+			return;
+		}
+		let particleDensity = particle.density / particleDeterminant;
+		let localDensity = liquidMass / liquidVolume;
+		let relativeDensity = (particleDensity - localDensity) / particleDensity;
+		let separationAcceleration = relativeDensity * params.gravityAndDomain.xy;
+		velocity = velocity + params.physical.w * separationAcceleration;
+		if (
+			!finiteFloat(particleDensity) ||
+			particleDensity <= 0.0 ||
+			!finiteFloat(localDensity) ||
+			localDensity <= 0.0 ||
+			!finiteFloat(relativeDensity) ||
+			!finiteVec2(velocity)
+		) {
+			atomicMin(&stateError[1], particleIndex);
+			atomicOr(&stateError[0], ERROR_G2P);
+			return;
 		}
 	}
 

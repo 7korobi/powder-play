@@ -14,7 +14,8 @@
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"test:unit": "vitest",
-		"test": "npm run test:unit -- --run"
+		"test": "npm run test:unit -- --run",
+		"benchmark:mpm": "node scripts/benchmark-mpm.mjs"
 	},
 	"devDependencies": {
 		"@sveltejs/adapter-cloudflare": "^8.0.0",

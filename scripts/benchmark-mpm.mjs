@@ -1,0 +1,410 @@
+import { readFile, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+
+const args = new Map(process.argv.slice(2).map((argument) => {
+	const [name, ...value] = argument.replace(/^--/, '').split('=');
+	return [name, value.join('=')];
+}));
+for (const name of args.keys()) {
+	if (!['origin', 'cdp', 'profile', 'output'].includes(name)) throw new Error(`Unknown option: --${name}`);
+}
+const origin = args.get('origin') ?? 'http://127.0.0.1:4181';
+const cdpOrigin = args.get('cdp') ?? 'http://127.0.0.1:9222';
+for (const endpoint of [origin, cdpOrigin]) {
+	const url = new URL(endpoint);
+	if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) {
+		throw new Error('The benchmark only connects to local HTTP endpoints.');
+	}
+}
+const profile = args.get('profile') ?? 'stages';
+if (!['stages', 'batch'].includes(profile)) throw new Error('--profile must be stages or batch.');
+
+async function benchmark(profile) {
+	const { createMpmMlsGpuSolver, MpmMlsGpuNumericalError } = await import('/src/lib/mpm/kernels/solver.ts');
+	const { createMpmGate4Scene, GATE4_GRID } = await import('/src/lib/mpm/scenes/gate4.ts');
+	const { stepMpm } = await import('/src/lib/mpm/reference/solver.ts');
+	if (!navigator.gpu) throw new Error('WebGPU is unavailable.');
+	const adapter = await navigator.gpu.requestAdapter();
+	if (!adapter?.features.has('timestamp-query')) throw new Error('timestamp-query is required; queue wait is not a GPU timing substitute.');
+	if (adapter.info.isFallbackAdapter) throw new Error('A hardware adapter is required for this benchmark.');
+	const canvas = document.createElement('canvas');
+	canvas.width = 440;
+	canvas.height = 300;
+	document.body.replaceChildren(canvas);
+	const requestDevice = GPUAdapter.prototype.requestDevice;
+	let device;
+	let buffers;
+	let initialAllocatedBytes = 0;
+	GPUAdapter.prototype.requestDevice = async function (descriptor = {}) {
+		device = await requestDevice.call(this, {
+			...descriptor,
+			requiredFeatures: [...new Set([...(descriptor.requiredFeatures ?? []), 'timestamp-query'])]
+		});
+		buffers = new Map();
+		initialAllocatedBytes = 0;
+		const createBuffer = device.createBuffer.bind(device);
+		device.createBuffer = (descriptor) => {
+			const buffer = createBuffer(descriptor);
+			buffers.set(descriptor.label, buffer);
+			initialAllocatedBytes += descriptor.size;
+			return buffer;
+		};
+		return device;
+	};
+	let solver;
+	let querySet;
+	let resolveBuffer;
+	let staging;
+	const quantile = (values, fraction) => {
+		const sorted = [...values].sort((a, b) => a - b);
+		return sorted[Math.floor((sorted.length - 1) * fraction)];
+	};
+	const distribution = (values) => ({
+		median: quantile(values, 0.5), p95: quantile(values, 0.95),
+		min: Math.min(...values), max: Math.max(...values), samples: values.length
+	});
+	try {
+		const scene = createMpmGate4Scene();
+		const config = {
+			grid: GATE4_GRID, particleMass: 1, particleVolume: 25,
+			material: { lambda: 20, mu: 10, model: 'neo-hookean' }, capacity: 1_000_000
+		};
+		solver = await createMpmMlsGpuSolver(canvas, scene.particles, config);
+		const allocatedBytes = initialAllocatedBytes;
+		querySet = device.createQuerySet({ type: 'timestamp', count: 512 });
+		resolveBuffer = device.createBuffer({ size: 4096, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+		staging = device.createBuffer({ size: 4096, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+		let capture = null;
+		const createEncoder = device.createCommandEncoder.bind(device);
+		device.createCommandEncoder = (descriptor) => {
+			const encoder = createEncoder(descriptor);
+			if (capture === null) return encoder;
+			const recording = capture;
+			const begin = encoder.beginComputePass.bind(encoder);
+			const finish = encoder.finish.bind(encoder);
+			function timedPass(label) {
+				const index = recording.labels.length * 2;
+				if (index + 2 > 512) throw new Error('Timestamp capacity exceeded.');
+				recording.labels.push(label);
+				return begin({
+					label,
+					timestampWrites: { querySet, beginningOfPassWriteIndex: index, endOfPassWriteIndex: index + 1 }
+				});
+			}
+			encoder.beginComputePass = (descriptor = {}) => {
+				if (profile === 'batch') return timedPass(descriptor.label ?? 'unlabelled');
+				let pipeline;
+				const bindGroups = new Map();
+				// Attribution deliberately splits dispatches; batch timing uses the real pass layout.
+				return {
+					setPipeline(value) { pipeline = value; },
+					setBindGroup(index, ...parameters) { bindGroups.set(index, parameters); },
+					dispatchWorkgroups(...workgroups) {
+						if (!pipeline) throw new Error('Dispatch has no pipeline.');
+						const pass = timedPass(pipeline.label);
+						pass.setPipeline(pipeline);
+						for (const [index, parameters] of bindGroups) pass.setBindGroup(index, ...parameters);
+						pass.dispatchWorkgroups(...workgroups);
+						pass.end();
+					},
+					end() {}
+				};
+			};
+			encoder.finish = (...parameters) => {
+				const count = recording.labels.length * 2;
+				encoder.resolveQuerySet(querySet, 0, count, resolveBuffer, 0);
+				encoder.copyBufferToBuffer(resolveBuffer, 0, staging, 0, count * 8);
+				return finish(...parameters);
+			};
+			return encoder;
+		};
+		const dt = 1 / 240;
+		const gravity = { x: 0, y: 90 };
+		const stationaryWarmupMs = 600;
+		const warmUntil = performance.now() + stationaryWarmupMs;
+		let stationaryWarmupSteps = 0;
+		while (performance.now() < warmUntil) {
+			solver.stepBatch(8, dt, { x: 0, y: 0 });
+			await solver.measureQueueCompletionMs();
+			stationaryWarmupSteps += 8;
+		}
+		for (let batch = 0; batch < 8; batch += 1) {
+			solver.stepBatch(8, dt, gravity);
+			await solver.measureQueueCompletionMs();
+		}
+		const samples = [];
+		for (let sample = 0; sample < 12; sample += 1) {
+			capture = { labels: [] };
+			const started = performance.now();
+			solver.stepBatch(8, dt, gravity);
+			const cpuProfileEncodeMs = performance.now() - started;
+			const queueWaitMs = await solver.measureQueueCompletionMs();
+			const recorded = capture;
+			capture = null;
+			await staging.mapAsync(GPUMapMode.READ, 0, recorded.labels.length * 16);
+			const values = new BigUint64Array(staging.getMappedRange(0, recorded.labels.length * 16).slice(0));
+			staging.unmap();
+			const stages = {};
+			for (let index = 0; index < recorded.labels.length; index += 1) {
+				const delta = values[index * 2 + 1] - values[index * 2];
+				if (delta < 0n) throw new Error('Timestamp order is invalid.');
+				const label = recorded.labels[index];
+				stages[label] = (stages[label] ?? 0) + Number(delta) / 1e6 / 8;
+			}
+			samples.push({
+				cpuProfileEncodeMs, queueWaitMs,
+				gpuStepMs: Number(values.at(-1) - values[0]) / 1e6 / 8,
+				measuredPassCount: recorded.labels.length, stages
+			});
+		}
+		const normalCpuSamples = [];
+		for (let sample = 0; sample < 12; sample += 1) {
+			const started = performance.now();
+			solver.stepBatch(8, dt, gravity);
+			normalCpuSamples.push(performance.now() - started);
+			await solver.measureQueueCompletionMs();
+		}
+		await solver.checkNumericalStatus();
+		const performanceResult = {
+			profile,
+			config: {
+				particles: scene.particles.length, capacity: config.capacity, grid: config.grid,
+				dt, gravity, warmupSteps: 64, stationaryWarmupMs, stationaryWarmupSteps,
+				sampleBatches: 12, stepsPerBatch: 8, rendered: false
+			},
+			adapter: {
+				vendor: adapter.info.vendor, architecture: adapter.info.architecture,
+				isFallbackAdapter: adapter.info.isFallbackAdapter
+			},
+			browser: navigator.userAgent,
+			deviceFeatures: [...device.features],
+			deviceLimits: {
+				maxBufferSize: device.limits.maxBufferSize,
+				maxStorageBufferBindingSize: device.limits.maxStorageBufferBindingSize,
+				maxStorageBuffersPerShaderStage: device.limits.maxStorageBuffersPerShaderStage,
+				maxComputeWorkgroupsPerDimension: device.limits.maxComputeWorkgroupsPerDimension
+			},
+			allocatedBufferBytes: allocatedBytes,
+			gpuStepMs: distribution(samples.map((sample) => sample.gpuStepMs)),
+			cpuNormalEncodeBatchMs: distribution(normalCpuSamples),
+			cpuProfileEncodeBatchMs: distribution(samples.map((sample) => sample.cpuProfileEncodeMs)),
+			queueWaitBatchMs: distribution(samples.map((sample) => sample.queueWaitMs)),
+			measuredPassCountPerBatch: samples[0].measuredPassCount,
+			stages: Object.fromEntries(Object.keys(samples[0].stages).map((name) => [
+				name, distribution(samples.map((sample) => sample.stages[name]))
+			]))
+		};
+		querySet.destroy(); querySet = null;
+		resolveBuffer.destroy(); resolveBuffer = null;
+		staging.destroy(); staging = null;
+		solver.dispose(); solver = null;
+
+		const materials = [
+			{ model: 'neo-hookean', lambda: 20, mu: 10 },
+			{ model: 'snow', lambda: 20, mu: 10 },
+			{ model: 'water', lambda: 8, mu: 0, density: 1 },
+			{ model: 'oil', lambda: 6, mu: 0, density: 0.8 },
+			{ model: 'powder', lambda: 20, mu: 10, frictionCoefficient: 0.55 }
+		];
+		const particles = materials.flatMap((material, group) => Array.from({ length: 9 }, (_, local) => ({
+			position: { x: 4 + group * 8 + local % 3, y: 4 + Math.floor(local / 3) },
+			velocity: { x: 0.03 * group, y: -0.02 },
+			C: { m00: 0, m01: 0.001, m10: 0, m11: 0 },
+			F: { m00: 0.98, m01: 0.01, m10: 0, m11: 0.99 },
+			material, objectId: group + 1, plasticVolume: 1
+		})));
+		const parityConfig = {
+			grid: { cellsX: 48, cellsY: 16, cellSize: 1 }, particleMass: 0.1, particleVolume: 0.05,
+			material: materials[0], dt: 0.001, gravity: { x: 0, y: 0 }, capacity: 54
+		};
+		const values = (p) => [
+			p.position.x, p.position.y, p.velocity.x, p.velocity.y,
+			p.C.m00, p.C.m01, p.C.m10, p.C.m11, p.F.m00, p.F.m01, p.F.m10, p.F.m11,
+			p.plasticVolume ?? 1
+		];
+		function maxDifference(actual, expected) {
+			let maximum = 0;
+			if (actual.length !== expected.length) throw new Error('Particle count changed.');
+			for (let index = 0; index < expected.length; index += 1) {
+				const a = values(actual[index]), b = values(expected[index]);
+				for (let item = 0; item < a.length; item += 1) {
+					if (!Number.isFinite(a[item])) throw new Error('Non-finite particle state.');
+					maximum = Math.max(maximum, Math.abs(a[item] - b[item]));
+				}
+				if (actual[index].objectId !== expected[index].objectId ||
+					actual[index].material.model !== expected[index].material.model) {
+					throw new Error('Particle identity changed.');
+				}
+			}
+			return maximum;
+		}
+		solver = await createMpmMlsGpuSolver(canvas, particles, parityConfig);
+		let expected = particles;
+		for (let step = 0; step < 8; step += 1) expected = stepMpm(expected, parityConfig).particles;
+		solver.stepBatch(8, parityConfig.dt, parityConfig.gravity);
+		const batched = await solver.readParticles();
+		const maxAbsoluteError = maxDifference(batched, expected);
+		if (maxAbsoluteError > 1e-3) throw new Error(`CPU/GPU parity exceeds tolerance: ${maxAbsoluteError}`);
+		const selection = await solver.pick(batched[0].position, 0.1);
+		if (selection?.particleIndex !== 0 || selection.objectId !== 1) throw new Error('GPU picking regression.');
+		solver.beginDrag(selection, { x: selection.anchor.x + 0.1, y: selection.anchor.y }, 2);
+		solver.step(parityConfig.dt, parityConfig.gravity);
+		solver.endDrag();
+		const dragged = await solver.readParticles();
+		if (!solver.clone(selection, { x: 0.1, y: 0 }) || solver.particleCount !== 54) throw new Error('GPU cloning regression.');
+		if (solver.clone(selection, { x: 0.1, y: 0 })) throw new Error('Particle capacity was not enforced.');
+		const cloned = await solver.readParticles(Array.from({ length: 9 }, (_, index) => 45 + index));
+		for (let index = 0; index < cloned.length; index += 1) {
+			const source = dragged[index], copy = cloned[index];
+			if (copy.objectId !== 6 || copy.material.model !== source.material.model ||
+				Math.abs(copy.position.x - source.position.x - 0.1) > 1e-5 ||
+				JSON.stringify(values(copy).slice(2)) !== JSON.stringify(values(source).slice(2))) {
+				throw new Error('Clone failed to preserve particle state.');
+			}
+		}
+		solver.render();
+		await solver.measureQueueCompletionMs();
+		await solver.checkNumericalStatus();
+		solver.dispose(); solver = null;
+		solver = await createMpmMlsGpuSolver(canvas, particles, parityConfig);
+		for (let step = 0; step < 8; step += 1) solver.step(parityConfig.dt, parityConfig.gravity);
+		const singles = await solver.readParticles();
+		const batchVsSingleError = maxDifference(singles, batched);
+		if (batchVsSingleError > 1e-3) throw new Error(`Batch/single regression: ${batchVsSingleError}`);
+		solver.dispose(); solver = null;
+
+		const rollbackParticle = {
+			position: { x: 32, y: 32 }, velocity: { x: 0, y: 0 },
+			C: { m00: 0, m01: 1000, m10: 0, m11: 0 },
+			F: { m00: 1, m01: 0, m10: 0, m11: 1 }, material: materials[0], objectId: 1
+		};
+		const rollbackParticles = Array.from({ length: 129 }, (_, index) => ({
+			...rollbackParticle,
+			position: { x: 12 + index % 10 * 2, y: 12 + Math.floor(index / 10) * 2 },
+			velocity: { x: 0.03, y: 0.02 },
+			C: { m00: 0, m01: 0, m10: 0, m11: 0 }
+		}));
+		rollbackParticles[128] = rollbackParticle;
+		solver = await createMpmMlsGpuSolver(canvas, rollbackParticles, {
+			...parityConfig, grid: { cellsX: 64, cellsY: 64, cellSize: 1 }, capacity: 129
+		});
+		async function rawState(buffer) {
+			const readback = device.createBuffer({ size: buffer.size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+			try {
+				const encoder = device.createCommandEncoder();
+				encoder.copyBufferToBuffer(buffer, 0, readback, 0, buffer.size);
+				device.queue.submit([encoder.finish()]);
+				await readback.mapAsync(GPUMapMode.READ);
+				const words = Array.from(new Uint32Array(readback.getMappedRange().slice(0)));
+				readback.unmap();
+				return words;
+			} finally { readback.destroy(); }
+		}
+		const before = await rawState(buffers.get('MLS-MPM particle state A'));
+		solver.step(0.1, { x: 0, y: 0 });
+		const rollbackFlags = await solver.checkNumericalStatus().then(
+			() => { throw new Error('Expected a numerical substep-limit failure.'); },
+			(error) => {
+				if (!(error instanceof MpmMlsGpuNumericalError) || !(error.flags & 32)) throw error;
+				return error.flags;
+			}
+		);
+		for (const label of ['MLS-MPM particle state A', 'MLS-MPM particle state B']) {
+			if (JSON.stringify(await rawState(buffers.get(label))) !== JSON.stringify(before)) {
+				throw new Error('Failed GPU step did not roll back all particle state.');
+			}
+		}
+		solver.step(0.001, { x: 0, y: 0 });
+		await solver.checkNumericalStatus().then(
+			() => { throw new Error('Numerical status was unexpectedly cleared.'); },
+			(error) => {
+				if (!(error instanceof MpmMlsGpuNumericalError) || error.flags !== rollbackFlags) throw error;
+			}
+		);
+		return {
+			performance: performanceResult,
+			regression: {
+				particles: 45, steps: 8, models: materials.map((material) => material.model),
+				maxAbsoluteError, batchVsSingleError,
+				pick: true, drag: true, cloneStateAndCapacity: true, render: true,
+				rollback: true, rollbackParticles: rollbackParticles.length,
+				persistentNumericalStatus: true, rollbackFlags
+			}
+		};
+	} finally {
+		staging?.destroy(); resolveBuffer?.destroy(); querySet?.destroy(); solver?.dispose();
+		GPUAdapter.prototype.requestDevice = requestDevice;
+	}
+}
+
+const response = await fetch(`${cdpOrigin}/json/version`);
+if (!response.ok) throw new Error(`CDP connection failed: ${response.status}`);
+const version = await response.json();
+const socket = new WebSocket(version.webSocketDebuggerUrl);
+await new Promise((resolve, reject) => {
+	socket.addEventListener('open', resolve, { once: true });
+	socket.addEventListener('error', reject, { once: true });
+});
+const pending = new Map();
+let nextId = 0;
+async function readSourceHashes() {
+	const hashes = {};
+	for (const name of ['layout', 'shaders', 'solver']) {
+		const file = new URL(`../src/lib/mpm/kernels/${name}.ts`, import.meta.url);
+		hashes[name] = createHash('sha256').update(await readFile(file)).digest('hex');
+	}
+	return hashes;
+}
+const initialSourceHashes = await readSourceHashes();
+socket.addEventListener('close', () => {
+	for (const callback of pending.values()) callback.reject(new Error('The CDP connection closed during the benchmark.'));
+	pending.clear();
+});
+socket.addEventListener('message', ({ data }) => {
+	const message = JSON.parse(data);
+	if (message.id === undefined) return;
+	const callback = pending.get(message.id);
+	if (!callback) return;
+	pending.delete(message.id);
+	if (message.error) callback.reject(new Error(JSON.stringify(message.error)));
+	else callback.resolve(message.result);
+});
+function send(method, params = {}, sessionId) {
+	const id = ++nextId;
+	const result = new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+	socket.send(JSON.stringify({ id, method, params, sessionId }));
+	return result;
+}
+let targetId;
+try {
+	({ targetId } = await send('Target.createTarget', { url: `${origin}/@vite/client` }));
+	const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
+	await send('Runtime.enable', {}, sessionId);
+	let ready = false;
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		const result = await send('Runtime.evaluate', {
+			expression: `document.readyState === 'complete' && location.origin === ${JSON.stringify(origin)}`,
+			returnByValue: true
+		}, sessionId);
+		if (result.result.value === true) { ready = true; break; }
+		await new Promise((resolve) => setTimeout(resolve, 100));
+	}
+	if (!ready) throw new Error('The local source server did not load within 10 seconds.');
+	const result = await send('Runtime.evaluate', {
+		expression: `(${benchmark.toString()})(${JSON.stringify(profile)})`,
+		awaitPromise: true, returnByValue: true, timeout: 180_000
+	}, sessionId);
+	if (result.exceptionDetails) {
+		throw new Error(result.exceptionDetails.exception?.description ?? JSON.stringify(result.exceptionDetails));
+	}
+	const sourceHashes = await readSourceHashes();
+	if (JSON.stringify(sourceHashes) !== JSON.stringify(initialSourceHashes)) {
+		throw new Error('Simulation source changed while the benchmark was running; repeat the measurement.');
+	}
+	const output = JSON.stringify({ sourceHashes, ...result.result.value }, null, 2);
+	if (args.has('output')) await writeFile(args.get('output'), `${output}\n`);
+	console.log(output);
+} finally {
+	if (targetId && socket.readyState === WebSocket.OPEN) await send('Target.closeTarget', { targetId });
+	socket.close();
+}

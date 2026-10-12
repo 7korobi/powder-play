@@ -6,6 +6,18 @@
 		type MpmMlsGpuSelection
 	} from '#lib/mpm/kernels/solver.js';
 	import {
+		DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE,
+		HORIZONTAL_OSCILLATION_FREQUENCY_HZ,
+		MAX_HORIZONTAL_OSCILLATION_AMPLITUDE,
+		meanSinusoidalAcceleration
+	} from '#lib/mpm/kernels/oscillation.js';
+	import {
+		MPM_RENDER_FPS_OPTIONS,
+		MpmFramePacer,
+		type MpmRenderFps
+	} from '#lib/mpm/kernels/frame-pacer.js';
+	import { calculateMpmStepBatch } from '#lib/mpm/kernels/step-scheduler.js';
+	import {
 		stepMpm,
 		type MpmParticle,
 		type MpmStepConfig,
@@ -14,6 +26,7 @@
 	import {
 		createMpmCpuParitySample,
 		createMpmGate4Scene,
+		GATE4_CLONE_OFFSET,
 		GATE4_GRID,
 		GATE4_PARTICLE_CAPACITY,
 		GATE4_PARTICLE_COUNT
@@ -23,13 +36,17 @@
 	const WORLD_WIDTH = GRID.cellsX * GRID.cellSize;
 	const WORLD_HEIGHT = GRID.cellsY * GRID.cellSize;
 	const FIXED_STEP_SECONDS = 1 / 240;
-	const FRAME_INTERVAL_MS = 1000 / 30;
 	const MAX_FRAME_SECONDS = 0.1;
-	const MAX_STEPS_PER_FRAME = 8;
+	const MAX_SIMULATION_SPEED = 32;
+	const MAX_STEPS_PER_FRAME = Math.ceil(
+		MAX_SIMULATION_SPEED / (MPM_RENDER_FPS_OPTIONS[0] * FIXED_STEP_SECONDS)
+	);
+	const DEFAULT_RENDER_FPS: MpmRenderFps = 60;
+	const DEFAULT_SIMULATION_SPEED = 2;
+	const SIMULATION_SPEED_OPTIONS = [0.5, 1, 2, 4, 8, 16, MAX_SIMULATION_SPEED] as const;
 	const GPU_PARTICLE_CAPACITY = GATE4_PARTICLE_CAPACITY;
 	const PICK_RADIUS = 14;
 	const BRUSH_RADIUS = 24;
-	const CLONE_OFFSET: MpmVector2 = { x: 72, y: 0 };
 	const PARTICLE_MASS = 1;
 	const PARTICLE_VOLUME = 25;
 	const MATERIAL = { lambda: 20, mu: 10, model: 'neo-hookean' } as const;
@@ -37,6 +54,7 @@
 
 	type Phase = 'initializing' | 'ready' | 'error' | 'lost';
 	type GpuSolver = Awaited<ReturnType<typeof createMpmMlsGpuSolver>>;
+	let simulatedTimeSeconds = 0;
 
 	function makeStepConfig(gravityMagnitude: number, dt = FIXED_STEP_SECONDS): MpmStepConfig {
 		return {
@@ -51,14 +69,30 @@
 
 	let submittedStepCount = 0;
 	let submittedParticleSteps = 0;
-	let submittedStepCpuMilliseconds = 0;
+	let submittedBatchCount = 0;
+	let submittedBatchCpuMilliseconds = 0;
 
-	function submitStep(currentSolver: GpuSolver, gravity: MpmVector2): void {
+	function submitBatch(
+		currentSolver: GpuSolver,
+		stepCount: number,
+		verticalGravity: number,
+		oscillationAmplitude: number
+	): void {
+		const durationSeconds = stepCount * FIXED_STEP_SECONDS;
 		const startedAt = performance.now();
-		currentSolver.step(FIXED_STEP_SECONDS, gravity);
-		submittedStepCount += 1;
-		submittedParticleSteps += currentSolver.particleCount;
-		submittedStepCpuMilliseconds += performance.now() - startedAt;
+		currentSolver.stepBatch(stepCount, FIXED_STEP_SECONDS, {
+			x: meanSinusoidalAcceleration(
+				simulatedTimeSeconds,
+				durationSeconds,
+				oscillationAmplitude
+			),
+			y: verticalGravity
+		});
+		simulatedTimeSeconds += durationSeconds;
+		submittedBatchCount += 1;
+		submittedStepCount += stepCount;
+		submittedParticleSteps += currentSolver.particleCount * stepCount;
+		submittedBatchCpuMilliseconds += performance.now() - startedAt;
 	}
 
 	function errorText(error: unknown): string {
@@ -127,6 +161,9 @@
 	let phase = $state<Phase>('initializing');
 	let phaseMessage = $state('WebGPU MLS-MPM を初期化しています…');
 	let gravityMagnitude = $state(90);
+	let simulationSpeed = $state(DEFAULT_SIMULATION_SPEED);
+	let renderTargetFps: MpmRenderFps = $state(DEFAULT_RENDER_FPS);
+	let horizontalOscillationAmplitude = $state(DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE);
 	let paused = $state(false);
 	let parityMessage = $state('');
 	let parityPassed = $state<boolean | null>(null);
@@ -138,7 +175,8 @@
 	let measuredFps = $state<number | null>(null);
 	let measuredStepsPerSecond = $state<number | null>(null);
 	let measuredParticleStepsPerSecond = $state<number | null>(null);
-	let averageStepSubmitMs = $state<number | null>(null);
+	let measuredDiscardedSimSecondsPerSecond = $state<number | null>(null);
+	let averageBatchSubmitMs = $state<number | null>(null);
 	let averageQueueCompletionMs = $state<number | null>(null);
 	let selection = $state<MpmMlsGpuSelection | null>(null);
 	let interactionMessage = $state('初回の CPU/GPU 1 ステップ比較が完了すると操作できます。');
@@ -337,7 +375,7 @@
 
 		interactionIsError = false;
 		try {
-			const cloned = currentSolver.clone(currentSelection, CLONE_OFFSET);
+			const cloned = currentSolver.clone(currentSelection, GATE4_CLONE_OFFSET);
 			particleCount = currentSolver.particleCount;
 			particleCapacity = currentSolver.particleCapacity;
 			if (cloned) {
@@ -360,7 +398,12 @@
 		if (phase !== 'ready' || !paused || !solver) return;
 
 		try {
-			submitStep(solver, { x: 0, y: gravityMagnitude });
+			submitBatch(
+				solver,
+				1,
+				gravityMagnitude,
+				horizontalOscillationAmplitude
+			);
 			solver.render();
 		} catch (error) {
 			finishPointerInteraction();
@@ -397,14 +440,16 @@
 		componentMounted = true;
 		let activeSolver: GpuSolver | null = null;
 		let frameRequest: number | null = null;
-		let lastFrameTimestamp = 0;
+		const framePacer = new MpmFramePacer();
+		let lastFrameTimestamp: number | null = null;
 		let accumulator = 0;
-		let lastRenderTimestamp = 0;
+		let discardedSimulationSeconds = 0;
 		let metricsStartTimestamp: number | null = null;
 		let performanceFrameCount = 0;
 		let queueWorkPending = false;
 		let queueSampleCount = 0;
 		let queueSampleTotalMs = 0;
+		let lastNumericalStatusCheckTimestamp = 0;
 		const canvasElement = canvas;
 
 		const resizeCanvas = () => {
@@ -424,39 +469,56 @@
 			finishPointerInteraction();
 			phase = 'error';
 			phaseMessage = errorText(error);
-			console.error('GPU MLS-MPM initialization failed.', error);
+			console.error('GPU MLS-MPM runtime failed.', error);
 		}
 
 		function renderFrame(timestamp: number): void {
 			if (!mounted || !activeSolver || phase !== 'ready') return;
 			frameRequest = requestAnimationFrame(renderFrame);
-			if (timestamp - lastRenderTimestamp < FRAME_INTERVAL_MS - 1) return;
+			if (!framePacer.shouldRender(timestamp, renderTargetFps)) return;
 			if (queueWorkPending) return;
 
 			const elapsed =
-				lastFrameTimestamp === 0
+				lastFrameTimestamp === null
 					? 0
-					: Math.min((timestamp - lastFrameTimestamp) / 1000, MAX_FRAME_SECONDS);
+					: Math.min(
+							Math.max(0, (timestamp - lastFrameTimestamp) / 1000),
+							MAX_FRAME_SECONDS
+						);
 			lastFrameTimestamp = timestamp;
-			lastRenderTimestamp = timestamp;
 
 			if (!paused && document.visibilityState === 'visible') {
-				accumulator += elapsed;
-				let steps = 0;
-				while (accumulator >= FIXED_STEP_SECONDS && steps < MAX_STEPS_PER_FRAME) {
-					try {
-						submitStep(activeSolver, { x: 0, y: gravityMagnitude });
-					} catch (error) {
-						finishPointerInteraction();
-						phase = 'error';
-						phaseMessage = `シミュレーションを停止しました: ${errorText(error)}`;
-						return;
+				try {
+					const batch = calculateMpmStepBatch({
+						accumulatorSeconds: accumulator,
+						elapsedSeconds: elapsed,
+						simulationSpeed,
+						fixedStepSeconds: FIXED_STEP_SECONDS,
+						maxSteps: Math.min(
+							MAX_STEPS_PER_FRAME,
+							Math.max(
+								1,
+								Math.ceil(
+									(accumulator + simulationSpeed * elapsed) / FIXED_STEP_SECONDS
+								)
+							)
+						)
+					});
+					accumulator = batch.remainderSeconds;
+					discardedSimulationSeconds += batch.discardedSeconds;
+					if (batch.stepCount > 0) {
+						submitBatch(
+							activeSolver,
+							batch.stepCount,
+							gravityMagnitude,
+							horizontalOscillationAmplitude
+						);
 					}
-					accumulator -= FIXED_STEP_SECONDS;
-					steps += 1;
-				}
-				if (steps === MAX_STEPS_PER_FRAME && accumulator >= FIXED_STEP_SECONDS) {
-					accumulator = 0;
+				} catch (error) {
+					finishPointerInteraction();
+					phase = 'error';
+					phaseMessage = `シミュレーションを停止しました: ${errorText(error)}`;
+					return;
 				}
 			} else {
 				accumulator = 0;
@@ -479,9 +541,11 @@
 				measuredFps = performanceFrameCount * samplesPerSecond;
 				measuredStepsPerSecond = submittedStepCount * samplesPerSecond;
 				measuredParticleStepsPerSecond = submittedParticleSteps * samplesPerSecond;
-				averageStepSubmitMs =
-					submittedStepCount > 0
-						? submittedStepCpuMilliseconds / submittedStepCount
+				measuredDiscardedSimSecondsPerSecond =
+					discardedSimulationSeconds * samplesPerSecond;
+				averageBatchSubmitMs =
+					submittedBatchCount > 0
+						? submittedBatchCpuMilliseconds / submittedBatchCount
 						: null;
 				averageQueueCompletionMs =
 					queueSampleCount > 0 ? queueSampleTotalMs / queueSampleCount : null;
@@ -490,7 +554,9 @@
 				performanceFrameCount = 0;
 				submittedStepCount = 0;
 				submittedParticleSteps = 0;
-				submittedStepCpuMilliseconds = 0;
+				submittedBatchCount = 0;
+				submittedBatchCpuMilliseconds = 0;
+				discardedSimulationSeconds = 0;
 				queueSampleCount = 0;
 				queueSampleTotalMs = 0;
 			}
@@ -499,10 +565,14 @@
 			queueWorkPending = true;
 			void submittedSolver
 				.measureQueueCompletionMs()
-				.then((completionMs) => {
+				.then(async (completionMs) => {
 					if (!mounted || activeSolver !== submittedSolver) return;
 					queueSampleCount += 1;
 					queueSampleTotalMs += completionMs;
+					if (timestamp - lastNumericalStatusCheckTimestamp >= 1_000) {
+						lastNumericalStatusCheckTimestamp = timestamp;
+						await submittedSolver.checkNumericalStatus();
+					}
 				})
 				.catch((error) => {
 					if (!mounted || activeSolver !== submittedSolver) return;
@@ -514,8 +584,9 @@
 		}
 
 		function handleVisibilityChange(): void {
-			lastFrameTimestamp = 0;
+			lastFrameTimestamp = null;
 			accumulator = 0;
+			framePacer.reset();
 			if (
 				document.visibilityState !== 'visible' &&
 				(activePointerId !== null || dragActive)
@@ -587,16 +658,21 @@
 					: '初回1ステップの CPU reference 比較で粒子数または数値が一致しません。';
 				submittedStepCount = 0;
 				submittedParticleSteps = 0;
-				submittedStepCpuMilliseconds = 0;
+				submittedBatchCount = 0;
+				submittedBatchCpuMilliseconds = 0;
+				discardedSimulationSeconds = 0;
 				queueSampleCount = 0;
 				queueSampleTotalMs = 0;
+				simulatedTimeSeconds = 0;
 				metricsStartTimestamp = null;
 				performanceFrameCount = 0;
+				measuredDiscardedSimSecondsPerSecond = null;
+				averageBatchSubmitMs = null;
 				averageQueueCompletionMs = null;
 				phase = 'ready';
-				phaseMessage = 'GPU MLS-MPM を実行中です · 20,000 粒子 · 目標 30 fps';
+				phaseMessage = `GPU MLS-MPM を実行中です · ${particleCount.toLocaleString()} 粒子`;
 				interactionMessage = '準備完了。粒子をタップ／クリックして、押したままドラッグできます。';
-				lastFrameTimestamp = performance.now();
+				lastFrameTimestamp = null;
 				frameRequest = requestAnimationFrame(renderFrame);
 			} catch (error) {
 				fail(error);
@@ -644,20 +720,21 @@
 />
 
 <svelte:head>
-	<title>GPU MLS-MPM 水・油・粉体ラボ · powder-play</title>
+	<title>GPU MLS-MPM 水・油・弾性小石ラボ · powder-play</title>
 	<meta
 		name="description"
-		content="水・油・粉体の試作構成則を CPU reference と比較し、GPU 粒子操作を検証します。"
+		content="水・油と、各3粒子でできた200個の Neo-Hookean 弾性小石を CPU reference と比較し、GPU 粒子操作を検証します。"
 	/>
 </svelte:head>
 
 <main class="lab">
 	<header class="header">
 		<div>
-			<p class="eyebrow">GATE 4 · WATER / OIL / POWDER</p>
+			<p class="eyebrow">GATE 4 · WATER / OIL / ELASTIC PEBBLE</p>
 			<h1>GPU 2D MLS-MPM 混合材料ラボ</h1>
 			<p class="intro">
-				水・油・粉体の20,000粒子を WebGPU で計算します。初回ステップは材料ごとの局所粒子で CPU
+				水8,000粒子・油6,000粒子と、枠幅の0.5%（11 world units）の三粒子弾性小石200個
+				（計600粒子）を WebGPU で計算します。初回ステップは各材料の局所粒子で CPU
 				reference と比較し、描画・粒子更新量・queue 完了待ちを実測できます。
 			</p>
 		</div>
@@ -670,7 +747,7 @@
 	<section class="panel" aria-labelledby="simulation-title">
 		<div class="panel-heading">
 			<div>
-				<h2 id="simulation-title">水・油・粉体の20,000粒子シーン</h2>
+				<h2 id="simulation-title">水・油・200個の弾性小石・14,600粒子シーン</h2>
 				<p>
 					{particleCount} / {particleCapacity} 粒子 · {GRID.cellsX} × {GRID.cellsY} grid
 				</p>
@@ -680,71 +757,114 @@
 			</p>
 		</div>
 
-		<div class="canvas-frame">
-			<canvas
-				bind:this={canvas}
-				tabindex="0"
-				aria-label="GPU 上で計算する水・油の弱圧縮性流体と粉体の MLS-MPM シミュレーション"
-				aria-describedby="interaction-instructions interaction-status"
-				onpointerdown={handlePointerDown}
-				onlostpointercapture={handlePointerCancel}
-			>
-				WebGPU canvas に対応したブラウザーが必要です。
-			</canvas>
+		<div class="simulation-layout">
+			<section class="simulation-controls" aria-label="シミュレーション操作">
+				<div class="controls">
+					<label class="gravity-control">
+						<span>重力</span>
+						<input
+							type="range"
+							min="0"
+							max="180"
+							step="5"
+							bind:value={gravityMagnitude}
+							disabled={phase !== 'ready'}
+							aria-label="重力の大きさ"
+						/>
+						<output>{gravityMagnitude}</output>
+					</label>
+					<label class="simulation-speed-control">
+						<span>速度</span>
+						<select
+							bind:value={simulationSpeed}
+							disabled={phase !== 'ready'}
+							aria-label="シミュレーション速度倍率"
+						>
+							{#each SIMULATION_SPEED_OPTIONS as speed}
+								<option value={speed}>{speed}×</option>
+							{/each}
+						</select>
+						<output>{simulationSpeed.toFixed(2)}×</output>
+					</label>
+					<label class="render-fps-control">
+						<span>描画目標FPS</span>
+						<select
+							bind:value={renderTargetFps}
+							disabled={phase !== 'ready'}
+							aria-label="描画目標フレームレート"
+						>
+							{#each MPM_RENDER_FPS_OPTIONS as fps}
+								<option value={fps}>{fps} fps</option>
+							{/each}
+						</select>
+						<output>{renderTargetFps} fps</output>
+					</label>
+					<label class="rocking-control">
+						<span>左右揺れ · {HORIZONTAL_OSCILLATION_FREQUENCY_HZ} Hz</span>
+						<input
+							type="range"
+							min="0"
+							max={MAX_HORIZONTAL_OSCILLATION_AMPLITUDE}
+							step="10"
+							bind:value={horizontalOscillationAmplitude}
+							disabled={phase !== 'ready'}
+							aria-label="左右揺れの加速度"
+							aria-valuetext={`±${horizontalOscillationAmplitude} world units/s²`}
+						/>
+						<output>±{horizontalOscillationAmplitude}</output>
+					</label>
+					<div class="buttons">
+						<button
+							type="button"
+							onclick={togglePaused}
+							disabled={phase !== 'ready'}
+							aria-pressed={paused}
+						>
+							{paused ? '再開' : '一時停止'}
+						</button>
+						<button
+							type="button"
+							class="secondary"
+							onclick={stepOnce}
+							disabled={phase !== 'ready' || !paused || stateCheckPending}
+						>
+							1 ステップ
+						</button>
+						<button
+							type="button"
+							class="secondary"
+							onclick={checkGpuState}
+							disabled={phase !== 'ready' || !paused || stateCheckPending}
+						>
+							{stateCheckPending ? '確認中…' : '状態を確認'}
+						</button>
+						<button
+							type="button"
+							class="secondary"
+							onclick={cloneSelection}
+							disabled={phase !== 'ready' || !selection || activePointerId !== null || dragActive}
+							aria-label={`選択オブジェクトを複製（+${GATE4_CLONE_OFFSET.x}, ${GATE4_CLONE_OFFSET.y}）`}
+							title={`選択オブジェクトを複製（+${GATE4_CLONE_OFFSET.x}, ${GATE4_CLONE_OFFSET.y}）`}
+						>
+							選択を複製
+						</button>
+					</div>
+				</div>
+			</section>
+
+			<div class="canvas-frame">
+				<canvas
+					bind:this={canvas}
+					tabindex="0"
+					aria-label="GPU 上で計算する水・油の弱圧縮性流体と200個の三粒子弾性小石の MLS-MPM シミュレーション"
+					aria-describedby="interaction-instructions interaction-status"
+					onpointerdown={handlePointerDown}
+					onlostpointercapture={handlePointerCancel}
+				>
+					WebGPU canvas に対応したブラウザーが必要です。
+				</canvas>
+			</div>
 		</div>
-
-		<p class="material-legend">
-			<span><i class="water-swatch"></i> 水（基準密度 0.04）</span>
-			<span><i class="oil-swatch"></i> 油（基準密度 0.032）</span>
-			<span><i class="powder-swatch"></i> 粉体（摩擦係数 0.55）</span>
-			水・油はせん断応力を持たず体積圧力だけを持つ試作モデルです。水・油の界面維持や浮沈は未実装です。
-		</p>
-
-		<section class="performance" aria-labelledby="performance-title">
-			<h2 id="performance-title">GPU 実測性能（直近1秒）</h2>
-			<dl class="performance-metrics">
-				<div>
-					<dt>描画</dt>
-					<dd>
-						{measuredFps === null ? '計測中' : `${measuredFps.toFixed(1)} FPS`}
-					</dd>
-				</div>
-				<div>
-					<dt>シミュレーション</dt>
-					<dd>
-						{measuredStepsPerSecond === null
-							? '計測中'
-							: `${measuredStepsPerSecond.toFixed(1)} steps/s`}
-					</dd>
-				</div>
-				<div>
-					<dt>粒子更新量（submit 換算）</dt>
-					<dd>
-						{measuredParticleStepsPerSecond === null
-							? '計測中'
-							: `${Math.round(measuredParticleStepsPerSecond)} particle-steps/s`}
-					</dd>
-				</div>
-				<div>
-					<dt>CPU step submit 平均</dt>
-					<dd>
-						{averageStepSubmitMs === null ? '—' : `${averageStepSubmitMs.toFixed(2)} ms`}
-					</dd>
-				</div>
-				<div>
-					<dt>GPU queue 完了待ち平均</dt>
-					<dd>
-						{averageQueueCompletionMs === null
-							? '計測中'
-							: `${averageQueueCompletionMs.toFixed(2)} ms`}
-					</dd>
-				</div>
-			</dl>
-			<p>
-				queue 完了待ちは WebGPU の submit 後から処理完了までの時間で、GPU 単体の実行時間ではありません。
-				完了を待ってから次の frame を送信し、遅い端末で GPU queue が無制限に膨らまないようにします。
-			</p>
-		</section>
 
 		<div class="interaction-controls" aria-labelledby="interaction-title">
 			<h2 id="interaction-title">粒子操作</h2>
@@ -752,19 +872,6 @@
 				キャンバス内をタップ／クリックして選択し、押したままドラッグすると半径 {BRUSH_RADIUS}
 				の範囲に力を加えます。Escape キー、ポインターキャンセル、またはページ非表示で操作を終了します。
 			</p>
-			<div class="interaction-actions">
-				<button
-					type="button"
-					class="secondary"
-					onclick={cloneSelection}
-					disabled={phase !== 'ready' || !selection || activePointerId !== null || dragActive}
-				>
-					選択オブジェクトを複製（+{CLONE_OFFSET.x}, {CLONE_OFFSET.y}）
-				</button>
-				<p class="particle-count" aria-label="現在の粒子数と容量">
-					粒子数 {particleCount} / {particleCapacity}（使用数 / GPU 容量）
-				</p>
-			</div>
 			<p
 				id="interaction-status"
 				class="interaction-status"
@@ -777,6 +884,83 @@
 			</p>
 		</div>
 
+		<p class="material-legend">
+			<span><i class="water-swatch"></i> 水（密度 0.02・圧縮係数 40,000）</span>
+			<span><i class="oil-swatch"></i> 油（密度 0.016・圧縮係数 30,000）</span>
+			<span><i class="pebble-swatch"></i> 弾性小石200個（各3粒子・Neo-Hookean・λ 20・μ 10）</span>
+			小石は一辺・水平幅11 world units（枠幅の0.5%）の正三角形で、20×10に中心間隔20 world unitsで並べます。各三角形は別々の弾性 object です。実接触・非貫入モデルではないため、落下時の相互貫通や長時間の形状維持は未検証です。水・油の相対沈降・浮上は局所液体密度から近似し、界面張力・非混和性は未実装です。
+		</p>
+
+		<section class="performance" aria-labelledby="performance-title">
+			<h2 id="performance-title">GPU 実測性能（直近1秒）</h2>
+			<dl class="performance-metrics">
+				<div>
+					<dt>描画</dt>
+					<dd>
+						{measuredFps === null ? '計測中' : `${measuredFps.toFixed(1)} FPS`}
+					</dd>
+				</div>
+				<div>
+					<dt>描画目標（上限）</dt>
+					<dd>{renderTargetFps} FPS</dd>
+				</div>
+				<div>
+					<dt>シミュレーション</dt>
+					<dd>
+						{measuredStepsPerSecond === null
+							? '計測中'
+							: `${measuredStepsPerSecond.toFixed(1)} steps/s`}
+					</dd>
+				</div>
+				<div>
+					<dt>実効時間倍率</dt>
+					<dd>
+						{measuredStepsPerSecond === null
+							? '計測中'
+							: `${(measuredStepsPerSecond * FIXED_STEP_SECONDS).toFixed(2)}×`}
+					</dd>
+				</div>
+				<div>
+					<dt>上限で破棄した時間</dt>
+					<dd>
+						{measuredDiscardedSimSecondsPerSecond === null
+							? '計測中'
+							: `${measuredDiscardedSimSecondsPerSecond.toFixed(2)} sim s/s`}
+					</dd>
+				</div>
+				<div>
+					<dt>粒子更新量（submit 換算）</dt>
+					<dd>
+						{measuredParticleStepsPerSecond === null
+							? '計測中'
+							: `${Math.round(measuredParticleStepsPerSecond)} particle-steps/s`}
+					</dd>
+				</div>
+				<div>
+					<dt>CPU batch submit 平均</dt>
+					<dd>
+						{averageBatchSubmitMs === null
+							? '—'
+							: `${averageBatchSubmitMs.toFixed(2)} ms`}
+					</dd>
+				</div>
+				<div>
+					<dt>GPU queue 完了待ち平均</dt>
+					<dd>
+						{averageQueueCompletionMs === null
+							? '計測中'
+							: `${averageQueueCompletionMs.toFixed(2)} ms`}
+					</dd>
+				</div>
+			</dl>
+			<p>
+				描画目標は15・30・60・90・120 FPSから選択できます。実際の描画FPSはディスプレイの更新頻度と GPU 処理時間に制約されます。
+				固定刻みは 1/240 秒のまま、複数ステップを1つの GPU batch にまとめ、フレーム間隔に応じて最大32×のシミュレーション速度を保てるようにします。
+				上限を超えたシミュレーション時間は破棄し、実効時間倍率と破棄量に反映します。
+				左右揺れはシミュレーション時間に同期し、batch区間の平均加速度を適用します（0で停止）。queue 完了待ちは GPU 単体の実行時間ではなく、完了を待ってから次の frame を送信します。数値異常フラグは1秒ごとに小さな状態だけを読み戻して監視します。
+			</p>
+		</section>
+
 		{#if parityMessage}
 			<p class="parity" class:passed={parityPassed} class:failed={parityPassed === false} role="status">
 				{parityMessage}
@@ -788,49 +972,15 @@
 			</p>
 		{/if}
 
-		<div class="controls">
-			<label class="gravity-control">
-				<span>重力</span>
-				<input
-					type="range"
-					min="0"
-					max="180"
-					step="5"
-					bind:value={gravityMagnitude}
-					disabled={phase !== 'ready'}
-					aria-label="重力の大きさ"
-				/>
-				<output>{gravityMagnitude}</output>
-			</label>
-			<div class="buttons">
-				<button type="button" onclick={togglePaused} disabled={phase !== 'ready'}>
-					{paused ? '再開' : '一時停止'}
-				</button>
-				<button
-					type="button"
-					class="secondary"
-					onclick={stepOnce}
-					disabled={phase !== 'ready' || !paused || stateCheckPending}
-				>
-					1 ステップ
-				</button>
-				<button
-					type="button"
-					class="secondary"
-					onclick={checkGpuState}
-					disabled={phase !== 'ready' || !paused || stateCheckPending}
-				>
-					{stateCheckPending ? '確認中…' : '状態を確認'}
-				</button>
-			</div>
-		</div>
 	</section>
 
 	<aside class="note">
-		<strong>検証範囲:</strong> P2G・grid update・G2Pで水・油の弱圧縮性EOSと粉体のDrucker–Prager風
-		せん断降伏を粒子ごとに計算します。objectIdによる選択・力ベースドラッグ・複製は密度・材料状態も保持します。
-		材料間の明示的接触、界面張力・非混和性、浮沈、実粉体の校正、長時間安定性は未実装または未検証です。
-		初回比較は材料ごとの局所サンプルだけを GPU から読み戻します。粒子状態の全量 GPU readback は一時停止中の明示的な状態確認時だけです。
+		<strong>検証範囲:</strong> P2G・grid update・G2Pで水・油の弱圧縮性EOSと200個の三粒子 Neo-Hookean 弾性小石を
+		計算します。objectIdによる選択・力ベースドラッグ・複製は密度・材料状態も保持します。
+		水・油の局所密度差による相対沈降・浮上は近似実装ですが、混合時のGPU挙動は未検証です。
+			水・油の圧縮係数は従来比10倍です。液体の変形面積比 det(F) は0.5〜2に制限します。
+			小石1個は約1.1格子セル幅で、格子上の形状解像度・長時間の弾性復元・相互接触は未検証です。材料間の明示的接触、界面張力・非混和性、長時間安定性は未実装または未検証です。
+		初回比較は材料ごとの局所サンプルだけを GPU から読み戻します。数値異常フラグは1秒ごとに状態のみを読み取り、粒子状態の全量 GPU readback は一時停止中の明示的な状態確認時だけです。
 	</aside>
 </main>
 
@@ -918,6 +1068,19 @@
 		padding: 1rem;
 	}
 
+	.simulation-layout {
+		display: grid;
+		grid-template-areas: 'canvas controls';
+		grid-template-columns: minmax(0, 1fr) minmax(17rem, 20rem);
+		align-items: start;
+		gap: 1rem;
+	}
+
+	.simulation-controls {
+		grid-area: controls;
+		min-width: 0;
+	}
+
 	.panel-heading {
 		display: flex;
 		align-items: flex-start;
@@ -943,7 +1106,9 @@
 	}
 
 	.canvas-frame {
+		grid-area: canvas;
 		overflow: hidden;
+		min-width: 0;
 		width: 100%;
 		border: 1px solid #41576d;
 		border-radius: 0.55rem;
@@ -1026,8 +1191,8 @@
 		background: #f2bf38;
 	}
 
-	.powder-swatch {
-		background: #b87a4d;
+	.pebble-swatch {
+		background: #47c7b8;
 	}
 
 	canvas {
@@ -1043,7 +1208,7 @@
 	}
 
 	.interaction-controls {
-		margin-top: 1rem;
+		margin-top: 0.75rem;
 		padding-top: 1rem;
 		border-top: 1px solid #31445a;
 	}
@@ -1056,18 +1221,6 @@
 		margin-bottom: 0;
 		color: #b8c7d8;
 		line-height: 1.5;
-	}
-
-	.interaction-actions {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 0.75rem;
-		margin-top: 0.75rem;
-	}
-
-	.interaction-actions .particle-count {
-		font-variant-numeric: tabular-nums;
 	}
 
 	.interaction-status {
@@ -1103,19 +1256,70 @@
 	}
 
 	.controls {
-		display: flex;
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
 		align-items: center;
-		justify-content: space-between;
-		gap: 1rem;
-		margin-top: 1rem;
+		gap: 0.75rem;
 	}
 
-	.gravity-control {
+	.gravity-control,
+	.rocking-control,
+	.simulation-speed-control,
+	.render-fps-control {
 		display: grid;
-		grid-template-columns: auto minmax(8rem, 1fr) 3ch;
+		grid-template-columns: minmax(0, 1fr) auto;
 		align-items: center;
-		gap: 0.65rem;
-		width: min(100%, 24rem);
+		gap: 0.35rem 0.65rem;
+		min-width: 0;
+	}
+
+	.gravity-control > span,
+	.rocking-control > span,
+	.simulation-speed-control > span,
+	.render-fps-control > span {
+		grid-column: 1;
+		grid-row: 1;
+	}
+
+	.gravity-control input,
+	.rocking-control input,
+	.simulation-speed-control select,
+	.render-fps-control select {
+		grid-column: 1 / -1;
+		grid-row: 2;
+		width: 100%;
+		min-width: 0;
+	}
+
+	.gravity-control input,
+	.rocking-control input {
+		margin: 0;
+	}
+
+	.gravity-control output,
+	.rocking-control output,
+	.simulation-speed-control output,
+	.render-fps-control output {
+		grid-column: 2;
+		grid-row: 1;
+	}
+
+	.simulation-speed-control select,
+	.render-fps-control select {
+		box-sizing: border-box;
+		min-height: 2.75rem;
+		padding: 0.45rem 0.6rem;
+		border: 1px solid #31445a;
+		border-radius: 0.45rem;
+		color: inherit;
+		background: #0b1725;
+		font: inherit;
+	}
+
+	.simulation-speed-control select:focus-visible,
+	.render-fps-control select:focus-visible {
+		outline: 3px solid #8ec9ff;
+		outline-offset: 2px;
 	}
 
 	output {
@@ -1124,9 +1328,9 @@
 	}
 
 	.buttons {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.6rem;
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 0.55rem;
 	}
 
 	button {
@@ -1150,6 +1354,13 @@
 		opacity: 0.5;
 	}
 
+	.buttons button {
+		width: 100%;
+		min-width: 0;
+		padding-right: 0.4rem;
+		padding-left: 0.4rem;
+	}
+
 	.note {
 		margin-top: 1rem;
 		padding: 0.9rem 1rem;
@@ -1161,10 +1372,26 @@
 		color: #e8f1fa;
 	}
 
+	@media (max-width: 820px) {
+		.simulation-layout {
+			grid-template-areas:
+				'controls'
+				'canvas';
+			grid-template-columns: minmax(0, 1fr);
+		}
+
+		.controls {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+
+		.rocking-control {
+			grid-column: 1 / -1;
+		}
+	}
+
 	@media (max-width: 620px) {
 		.header,
-		.panel-heading,
-		.controls {
+		.panel-heading {
 			flex-direction: column;
 			align-items: stretch;
 		}
@@ -1178,17 +1405,5 @@
 			text-align: left;
 		}
 
-		.interaction-actions {
-			align-items: stretch;
-			flex-direction: column;
-		}
-
-		.gravity-control {
-			width: 100%;
-		}
-
-		.buttons button {
-			flex: 1;
-		}
 	}
 </style>

@@ -30,6 +30,7 @@ export interface MpmMlsGpuBufferLayout {
 	readonly particleCapacity: number;
 	readonly particleStateBytes: number;
 	readonly particleBufferBytes: number;
+	readonly preparedAffineBytes: number;
 	readonly objectIdBufferBytes: number;
 	readonly bucketHeadBytes: number;
 	readonly bucketNextBytes: number;
@@ -65,6 +66,7 @@ export interface ValidatedMpmMlsGpuInput {
 
 export const PARTICLE_FLOATS = 20;
 export const PARTICLE_STRIDE_BYTES = PARTICLE_FLOATS * Float32Array.BYTES_PER_ELEMENT;
+export const PREPARED_AFFINE_STRIDE_BYTES = 4 * Float32Array.BYTES_PER_ELEMENT;
 export const OBJECT_ID_STRIDE_BYTES = Uint32Array.BYTES_PER_ELEMENT;
 export const SIMULATION_PARAMS_BYTES = 80;
 export const RENDER_PARAMS_BYTES = 16;
@@ -76,7 +78,7 @@ export const NUMERICAL_STATUS_BYTES =
 const UINT32_MAX = 0xffff_ffff;
 const INT32_MAX = 0x7fff_ffff;
 const MAX_FLOAT32 = 3.4028234663852886e38;
-const GRID_NODE_STRIDE_BYTES = 24;
+const GRID_NODE_STRIDE_BYTES = 32;
 
 export function validateMpmMlsGpuInput(
 	particles: readonly MpmParticle[],
@@ -392,6 +394,10 @@ export function calculateMpmMlsGpuBufferLayout(
 		'particle state capacity size'
 	);
 	const particleBufferBytes = Math.max(PARTICLE_STRIDE_BYTES, capacityStateBytes);
+	const preparedAffineBytes = Math.max(
+		PREPARED_AFFINE_STRIDE_BYTES,
+		safeProduct(state.particleCapacity, PREPARED_AFFINE_STRIDE_BYTES, 'prepared affine buffer size')
+	);
 	const objectIdBufferBytes = Math.max(
 		OBJECT_ID_STRIDE_BYTES,
 		safeProduct(state.particleCapacity, OBJECT_ID_STRIDE_BYTES, 'particle object id buffer size')
@@ -427,12 +433,13 @@ export function calculateMpmMlsGpuBufferLayout(
 	if (limits.maxUniformBufferBindingSize < SIMULATION_PARAMS_BYTES) {
 		throw new RangeError('GPU maxUniformBufferBindingSize is too small for simulation parameters');
 	}
-	if (limits.maxStorageBuffersPerShaderStage < 5) {
-		throw new RangeError('GPU supports fewer than five storage buffers per shader stage');
+	if (limits.maxStorageBuffersPerShaderStage < 6) {
+		throw new RangeError('GPU supports fewer than six storage buffers per shader stage');
 	}
 
 	const buffers = [
 		['particle buffers', particleBufferBytes],
+		['prepared affine buffer', preparedAffineBytes],
 		['particle object ids', objectIdBufferBytes],
 		['bucket heads', bucketHeadBytes],
 		['bucket links', bucketNextBytes],
@@ -450,6 +457,7 @@ export function calculateMpmMlsGpuBufferLayout(
 
 	const storageBuffers = [
 		['particle buffers', particleBufferBytes],
+		['prepared affine buffer', preparedAffineBytes],
 		['particle object ids', objectIdBufferBytes],
 		['bucket heads', bucketHeadBytes],
 		['bucket links', bucketNextBytes],
@@ -483,6 +491,7 @@ export function calculateMpmMlsGpuBufferLayout(
 		particleCapacity: state.particleCapacity,
 		particleStateBytes,
 		particleBufferBytes,
+		preparedAffineBytes,
 		objectIdBufferBytes,
 		bucketHeadBytes,
 		bucketNextBytes,
