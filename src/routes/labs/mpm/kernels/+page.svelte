@@ -3,6 +3,7 @@
 	import { encodeMpmConstitutiveModel } from '#lib/mpm/materials.js';
 	import {
 		createMpmMlsGpuSolver,
+		type MpmMlsGpuRenderMode,
 		type MpmMlsGpuSelection
 	} from '#lib/mpm/kernels/solver.js';
 	import {
@@ -29,7 +30,8 @@
 		GATE4_CLONE_OFFSET,
 		GATE4_GRID,
 		GATE4_PARTICLE_CAPACITY,
-		GATE4_PARTICLE_COUNT
+		GATE4_PARTICLE_COUNT,
+		GATE4_PEBBLE_EDGE_LENGTH
 	} from '#lib/mpm/scenes/gate4.js';
 
 	const GRID = GATE4_GRID;
@@ -50,7 +52,9 @@
 	const PARTICLE_MASS = 1;
 	const PARTICLE_VOLUME = 25;
 	const MATERIAL = { lambda: 20, mu: 10, model: 'neo-hookean' } as const;
-	const PARITY_TOLERANCE = 0.02;
+	const PARITY_ABSOLUTE_TOLERANCE = 0.02;
+	const PARITY_VELOCITY_ABSOLUTE_TOLERANCE = 0.025;
+	const PARITY_VELOCITY_RELATIVE_TOLERANCE = 0.0005;
 
 	type Phase = 'initializing' | 'ready' | 'error' | 'lost';
 	type GpuSolver = Awaited<ReturnType<typeof createMpmMlsGpuSolver>>;
@@ -62,6 +66,7 @@
 			grid: GRID,
 			particleMass: PARTICLE_MASS,
 			particleVolume: PARTICLE_VOLUME,
+			bondRestLength: GATE4_PEBBLE_EDGE_LENGTH,
 			material: MATERIAL,
 			gravity: { x: 0, y: gravityMagnitude }
 		};
@@ -156,6 +161,34 @@
 		return maximum;
 	}
 
+	function particleDifferenceWithinTolerance(
+		actual: readonly MpmParticle[],
+		expected: readonly MpmParticle[]
+	): boolean {
+		if (actual.length !== expected.length) return false;
+
+		for (let index = 0; index < actual.length; index += 1) {
+			const actualValues = particleValues(actual[index]);
+			const expectedValues = particleValues(expected[index]);
+
+			for (let valueIndex = 0; valueIndex < actualValues.length; valueIndex += 1) {
+				const actualValue = actualValues[valueIndex];
+				const expectedValue = expectedValues[valueIndex];
+				if (!Number.isFinite(actualValue) || !Number.isFinite(expectedValue)) {
+					return false;
+				}
+				const isVelocity = valueIndex === 2 || valueIndex === 3;
+				const tolerance = isVelocity
+					? PARITY_VELOCITY_ABSOLUTE_TOLERANCE +
+						PARITY_VELOCITY_RELATIVE_TOLERANCE * Math.abs(expectedValue)
+					: PARITY_ABSOLUTE_TOLERANCE;
+				if (Math.abs(actualValue - expectedValue) > tolerance) return false;
+			}
+		}
+
+		return true;
+	}
+
 	let canvas: HTMLCanvasElement | undefined;
 	let solver: GpuSolver | null = null;
 	let phase = $state<Phase>('initializing');
@@ -178,6 +211,7 @@
 	let measuredDiscardedSimSecondsPerSecond = $state<number | null>(null);
 	let averageBatchSubmitMs = $state<number | null>(null);
 	let averageQueueCompletionMs = $state<number | null>(null);
+	let renderMode = $state<MpmMlsGpuRenderMode>('surface');
 	let selection = $state<MpmMlsGpuSelection | null>(null);
 	let interactionMessage = $state('初回の CPU/GPU 1 ステップ比較が完了すると操作できます。');
 	let interactionIsError = $state(false);
@@ -404,7 +438,7 @@
 				gravityMagnitude,
 				horizontalOscillationAmplitude
 			);
-			solver.render();
+			solver.render(renderMode);
 		} catch (error) {
 			finishPointerInteraction();
 			phase = 'error';
@@ -420,9 +454,9 @@
 		stateCheckIsError = false;
 		stateCheckMessage = 'GPU 数値状態を読み取り中…';
 		try {
-			const particles = await currentSolver.readParticles();
+			await currentSolver.checkNumericalStatus();
 			if (solver !== currentSolver || phase !== 'ready') return;
-			stateCheckMessage = `${particles.length} 粒子の GPU 数値状態は正常です。`;
+			stateCheckMessage = 'GPU 数値状態は正常です。';
 		} catch (error) {
 			if (solver !== currentSolver || phase !== 'ready') return;
 			stateCheckIsError = true;
@@ -525,7 +559,7 @@
 			}
 
 			try {
-				activeSolver.render();
+				activeSolver.render(renderMode);
 			} catch (error) {
 				finishPointerInteraction();
 				phase = 'error';
@@ -650,10 +684,10 @@
 					(index) => expectedSample[index]
 				);
 				const maxError = maxParticleDifference(actual, expected);
-				parityPassed = maxError <= PARITY_TOLERANCE;
+				parityPassed = particleDifferenceWithinTolerance(actual, expected);
 				parityMessage = Number.isFinite(maxError)
 					? `初回1ステップ・各材料中央3粒子の CPU reference 比較: 最大絶対誤差 ${maxError.toExponential(2)} ${
-							parityPassed ? '· 許容範囲内' : '· 許容範囲外'
+							parityPassed ? '· 誤差基準内' : '· 誤差基準超過'
 						}`
 					: '初回1ステップの CPU reference 比較で粒子数または数値が一致しません。';
 				submittedStepCount = 0;
@@ -734,8 +768,9 @@
 			<h1>GPU 2D MLS-MPM 混合材料ラボ</h1>
 			<p class="intro">
 				水8,000粒子・油6,000粒子と、枠幅の3%（66 world units）の三粒子弾性小石200個
-				（計600粒子）を WebGPU で計算します。初期速度は水・油の各成分±12、小石の各頂点±24
-				world units/s の範囲で粒子ごとにランダムに与えます。初回ステップは各材料の局所粒子で
+				（計600粒子）を WebGPU で計算します。初期速度は水・油の各成分±60、小石の各頂点±120
+				world units/s の範囲で粒子ごとにランダムに与えます。小石頂点の辺長制約、水・油の相別格子接触、
+				液体と小石の双方向接触、小石同士の三角形接触を GPU で解きます。初回ステップは各材料の局所粒子で
 				CPU reference と比較し、描画・粒子更新量・queue 完了待ちを実測できます。
 			</p>
 		</div>
@@ -786,6 +821,18 @@
 							{/each}
 						</select>
 						<output>{simulationSpeed.toFixed(2)}×</output>
+					</label>
+					<label class="display-mode-control">
+						<span>表示モード</span>
+						<select
+							bind:value={renderMode}
+							disabled={phase !== 'ready'}
+							aria-label="表示モード"
+							aria-describedby="render-mode-description"
+						>
+							<option value="surface">水・油の自由表面</option>
+							<option value="particles">粒子マーカー（診断）</option>
+						</select>
 					</label>
 					<label class="render-fps-control">
 						<span>描画目標FPS</span>
@@ -851,14 +898,19 @@
 						</button>
 					</div>
 				</div>
+				<p id="render-mode-description" class="render-mode-note">
+					自由表面は粒子の現在面積から GPU 上で作る表示専用フィールドです。青は水、金色は油を示し、表面表示では液体の粒子マーカーを重ねません。粒子マーカー（診断）では全材料の粒子位置を表示します。表示色・境界は物理的な表面張力や界面曲率を表しません。材料間接触は表示場とは別の物理 pass で解きます。
+				</p>
 			</section>
 
 			<div class="canvas-frame">
 				<canvas
 					bind:this={canvas}
 					tabindex="0"
-					aria-label="GPU 上で計算する水・油の弱圧縮性流体と200個の三粒子弾性小石の MLS-MPM シミュレーション"
-					aria-describedby="interaction-instructions interaction-status"
+					aria-label={`GPU MLS-MPM シミュレーション。現在の表示: ${
+						renderMode === 'surface' ? '水・油の自由表面' : '粒子マーカー診断'
+					}`}
+					aria-describedby="interaction-instructions interaction-status render-mode-description"
 					onpointerdown={handlePointerDown}
 					onlostpointercapture={handlePointerCancel}
 				>
@@ -889,7 +941,7 @@
 			<span><i class="water-swatch"></i> 水（密度 0.02・圧縮係数 40,000）</span>
 			<span><i class="oil-swatch"></i> 油（密度 0.016・圧縮係数 30,000）</span>
 			<span><i class="pebble-swatch"></i> 弾性小石200個（各3粒子・Neo-Hookean・λ 20・μ 10）</span>
-			初期速度は水・油の各成分±12、小石の各頂点±24 world units/s の独立した擬似乱数です。小石頂点ごとの速度差により回転運動も初期化されます。小石は一辺・水平幅66 world units（枠幅の3%）の正三角形で、14列×15行の並び（最終行は4個）、中心間隔68 world unitsで配置します。各三角形は別々の弾性 object です。3粒子の頂点配置は約6.6格子セル幅で、粒子同士を結ぶ明示的な弾性結合・接触モデルではありません。落下時の相互貫通や長時間の形状維持は未検証です。水・油の相対沈降・浮上は局所液体密度から近似し、界面張力・非混和性は未実装です。
+			初期速度は水・油の各成分±60、小石の各頂点±120 world units/s の独立した擬似乱数です。小石頂点ごとの速度差により回転運動も初期化されます。小石は一辺・水平幅66 world units（枠幅の3%）の正三角形で、14列×15行の並び（最終行は4個）、中心間隔68 world unitsで配置します。各三角形は別々の弾性 object です。Neo-Hookean 粒子に3辺の位置制約を加え、液体粒子は三角形の符号付き距離場で投影し、法線 impulse を小石頂点へ反力として返します。小石同士は三角形接触で貫入を補正します。水と油は別々の格子速度場を持ち、相別体積勾配に沿う法線接触を解きます。接線摩擦・表面張力・濡れ・完全な界面分離・連続衝突検出は未実装で、長時間の安定性も未検証です。
 		</p>
 
 		<section class="performance" aria-labelledby="performance-title">
@@ -922,7 +974,7 @@
 					</dd>
 				</div>
 				<div>
-					<dt>上限で破棄した時間</dt>
+					<dt>実効時間倍率</dt>
 					<dd>
 						{measuredDiscardedSimSecondsPerSecond === null
 							? '計測中'
@@ -977,11 +1029,12 @@
 
 	<aside class="note">
 		<strong>検証範囲:</strong> P2G・grid update・G2Pで水・油の弱圧縮性EOSと200個の三粒子 Neo-Hookean 弾性小石を
-		計算します。objectIdによる選択・力ベースドラッグ・複製は密度・材料状態も保持します。
-		水・油の局所密度差による相対沈降・浮上は近似実装ですが、混合時のGPU挙動は未検証です。
-			水・油の圧縮係数は従来比10倍です。液体の変形面積比 det(F) は0.5〜2に制限します。
-			小石の頂点間隔は約6.6格子セル幅です。3粒子だけでは一体の弾性変形を表現できず、長時間の形状維持・相互接触も未検証です。材料間の明示的接触、界面張力・非混和性、長時間安定性は未実装または未検証です。
-		初回比較は材料ごとの局所サンプルだけを GPU から読み戻します。数値異常フラグは1秒ごとに状態のみを読み取り、粒子状態の全量 GPU readback は一時停止中の明示的な状態確認時だけです。
+		計算します。水–油の法線 impulse、小石–液体の符号付き距離接触と両側反力、小石–小石の三角形接触、各小石の辺長制約を含みます。objectIdによる選択・力ベースドラッグ・複製は密度・材料・結合情報も保持します。
+		水・油の局所密度差による相対沈降・浮上は近似実装です。水と油が静止状態ですでに強く混合している場合の完全な分離は保証しません。
+		水・油の圧縮係数は従来比10倍です。液体の変形面積比 det(F) は0.5〜2に制限します。
+		小石の頂点間隔は約6.6格子セル幅です。各三角形は3点と辺長制約による離散近似であり、連続体メッシュではありません。接線摩擦・表面張力・濡れ・連続衝突検出、長時間安定性は未実装または未検証です。
+		初回CPU/GPU比較は材料ごとの局所サンプルです。数値異常フラグは1秒ごとに状態のみを読み取り、粒子状態の全量 GPU readback は一時停止中の明示的な状態確認時だけです。
+		CPU/GPU比較はCPUの倍精度とGPUの単精度による差を考慮し、位置・変形などは絶対誤差0.02、速度は絶対誤差0.025に参照速度の0.05%を加えた基準で判定します。表示される最大絶対誤差は判定基準とは別にそのまま表示します。
 	</aside>
 </main>
 
@@ -1266,6 +1319,7 @@
 	.gravity-control,
 	.rocking-control,
 	.simulation-speed-control,
+	.display-mode-control,
 	.render-fps-control {
 		display: grid;
 		grid-template-columns: minmax(0, 1fr) auto;
@@ -1277,6 +1331,7 @@
 	.gravity-control > span,
 	.rocking-control > span,
 	.simulation-speed-control > span,
+	.display-mode-control > span,
 	.render-fps-control > span {
 		grid-column: 1;
 		grid-row: 1;
@@ -1285,6 +1340,7 @@
 	.gravity-control input,
 	.rocking-control input,
 	.simulation-speed-control select,
+	.display-mode-control select,
 	.render-fps-control select {
 		grid-column: 1 / -1;
 		grid-row: 2;
@@ -1306,6 +1362,7 @@
 	}
 
 	.simulation-speed-control select,
+	.display-mode-control select,
 	.render-fps-control select {
 		box-sizing: border-box;
 		min-height: 2.75rem;
@@ -1318,9 +1375,17 @@
 	}
 
 	.simulation-speed-control select:focus-visible,
+	.display-mode-control select:focus-visible,
 	.render-fps-control select:focus-visible {
 		outline: 3px solid #8ec9ff;
 		outline-offset: 2px;
+	}
+
+	.render-mode-note {
+		margin: 0.65rem 0 0;
+		color: #b8c7d8;
+		font-size: 0.84rem;
+		line-height: 1.5;
 	}
 
 	output {

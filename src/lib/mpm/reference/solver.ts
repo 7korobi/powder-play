@@ -21,6 +21,7 @@ export interface MpmParticle {
 	readonly C: MpmMatrix2;
 	readonly F: MpmMatrix2;
 	readonly objectId?: number;
+	readonly bondedTriangleVertex?: 0 | 1 | 2;
 	readonly plasticVolume?: number;
 	readonly volume?: number;
 	readonly material?: MpmMaterialParameters;
@@ -61,6 +62,8 @@ export interface MpmStepConfig {
 	readonly grid: MpmGridParameters;
 	readonly particleMass: number;
 	readonly particleVolume: number;
+	readonly bondRestLength?: number;
+	readonly bondStiffness?: number;
 	readonly material: MpmMaterialParameters;
 	readonly gravity: MpmVector2;
 }
@@ -84,6 +87,8 @@ interface ValidatedConfig {
 	readonly grid: MpmGridParameters;
 	readonly particleMass: number;
 	readonly particleVolume: number;
+	readonly bondRestLength: number | undefined;
+	readonly bondStiffness: number;
 	readonly material: MpmMaterialParameters;
 	readonly gravity: MpmVector2;
 	readonly domainWidth: number;
@@ -100,8 +105,32 @@ interface GridNode {
 	momentumY: number;
 	velocityX: number;
 	velocityY: number;
-	liquidMass: number;
-	liquidVolume: number;
+	waterMass: number;
+	waterMomentumX: number;
+	waterMomentumY: number;
+	waterVelocityX: number;
+	waterVelocityY: number;
+	waterVolume: number;
+	oilMass: number;
+	oilMomentumX: number;
+	oilMomentumY: number;
+	oilVelocityX: number;
+	oilVelocityY: number;
+	oilVolume: number;
+}
+
+interface TriangleContactField {
+	readonly bodyStart: number;
+	readonly signedDistance: number;
+	readonly normal: MpmVector2;
+	readonly barycentric: readonly [number, number, number];
+	impulseX: number;
+	impulseY: number;
+}
+
+interface TriangleField {
+	readonly nodes: ReadonlyMap<string, TriangleContactField>;
+	readonly nodesByBody: ReadonlyMap<number, readonly TriangleContactField[]>;
 }
 
 interface ParticlePhysicalState {
@@ -136,6 +165,11 @@ const MAX_LIQUID_DETERMINANT = 2;
 const MIN_POWDER_DETERMINANT = 0.5;
 const MAX_DEFORMATION_INCREMENT = 0.25;
 const MAX_DEFORMATION_SUBSTEPS = 64;
+export const DEFAULT_BONDED_TRIANGLE_STIFFNESS = 0.35;
+const BONDED_TRIANGLE_SOLVER_ITERATIONS = 2;
+const TRIANGLE_CONTACT_SKIN_CELLS = 0.1;
+const TRIANGLE_FIELD_BAND_CELLS = 2;
+const GRID_CONTACT_REACH_CELLS = 0.75;
 
 export function stepMpm(
 	particles: readonly MpmParticle[],
@@ -143,6 +177,7 @@ export function stepMpm(
 ): MpmStepResult {
 	const validated = validateConfig(config);
 	validateParticles(particles, validated);
+	const bondedBodyStarts = collectBondedBodyStarts(particles, validated);
 	const particleStates = particles.map((particle) => resolveParticleState(particle, validated));
 
 	const inputMass = totalMass(particleStates, 'input mass');
@@ -191,8 +226,18 @@ export function stepMpm(
 						momentumY: 0,
 						velocityX: 0,
 						velocityY: 0,
-						liquidMass: 0,
-						liquidVolume: 0
+						waterMass: 0,
+						waterMomentumX: 0,
+						waterMomentumY: 0,
+						waterVelocityX: 0,
+						waterVelocityY: 0,
+						waterVolume: 0,
+						oilMass: 0,
+						oilMomentumX: 0,
+						oilMomentumY: 0,
+						oilVelocityX: 0,
+						oilVelocityY: 0,
+						oilVolume: 0
 					};
 					grid.set(key, node);
 				}
@@ -207,18 +252,26 @@ export function stepMpm(
 					state.mass * particle.velocity.y +
 					affine.m10 * dposX +
 					affine.m11 * dposY;
-				node.mass += weight * state.mass;
-				node.momentumX += weight * particleMomentumX;
-				node.momentumY += weight * particleMomentumY;
-				if (isLiquid) {
-					node.liquidMass += weight * state.mass;
-					node.liquidVolume += weight * liquidVolume;
-					assertComputedFinite(node.liquidMass, 'liquid grid mass');
-					assertComputedFinite(node.liquidVolume, 'liquid grid volume');
+				if (state.material.model === 'water') {
+					node.waterMass += weight * state.mass;
+					node.waterMomentumX += weight * particleMomentumX;
+					node.waterMomentumY += weight * particleMomentumY;
+					node.waterVolume += weight * liquidVolume;
+					assertComputedFinite(node.waterMass, 'water grid mass');
+					assertComputedFinite(node.waterVolume, 'water grid volume');
+				} else if (state.material.model === 'oil') {
+					node.oilMass += weight * state.mass;
+					node.oilMomentumX += weight * particleMomentumX;
+					node.oilMomentumY += weight * particleMomentumY;
+					node.oilVolume += weight * liquidVolume;
+					assertComputedFinite(node.oilMass, 'oil grid mass');
+					assertComputedFinite(node.oilVolume, 'oil grid volume');
+				} else {
+					node.mass += weight * state.mass;
+					node.momentumX += weight * particleMomentumX;
+					node.momentumY += weight * particleMomentumY;
 				}
-				assertComputedFinite(node.mass, 'grid node mass');
-				assertComputedFinite(node.momentumX, 'grid node momentum');
-				assertComputedFinite(node.momentumY, 'grid node momentum');
+				assertGridNodeFinite(node);
 			}
 		}
 	}
@@ -227,27 +280,87 @@ export function stepMpm(
 	let gridMomentumX = 0;
 	let gridMomentumY = 0;
 	for (const node of grid.values()) {
-		gridMass += node.mass;
-		gridMomentumX += node.momentumX;
-		gridMomentumY += node.momentumY;
+		gridMass += node.mass + node.waterMass + node.oilMass;
+		gridMomentumX += node.momentumX + node.waterMomentumX + node.oilMomentumX;
+		gridMomentumY += node.momentumY + node.waterMomentumY + node.oilMomentumY;
 	}
 	assertComputedFinite(gridMass, 'grid mass');
 	assertComputedFinite(gridMomentumX, 'grid momentum');
 	assertComputedFinite(gridMomentumY, 'grid momentum');
 
+	const triangleField = buildTriangleField(
+		bondedBodyStarts,
+		particles,
+		validated
+	);
 	for (const node of grid.values()) {
-		if (node.mass <= 0) {
-			throw new RangeError('grid nodes must have positive mass');
+		const solidVelocity = updateGridVelocity(
+			node.mass,
+			node.momentumX,
+			node.momentumY,
+			validated
+		);
+		const waterVelocity = updateGridVelocity(
+			node.waterMass,
+			node.waterMomentumX,
+			node.waterMomentumY,
+			validated
+		);
+		const oilVelocity = updateGridVelocity(
+			node.oilMass,
+			node.oilMomentumX,
+			node.oilMomentumY,
+			validated
+		);
+		node.velocityX = solidVelocity.x;
+		node.velocityY = solidVelocity.y;
+		node.waterVelocityX = waterVelocity.x;
+		node.waterVelocityY = waterVelocity.y;
+		node.oilVelocityX = oilVelocity.x;
+		node.oilVelocityY = oilVelocity.y;
+		solveLiquidGridContact(node, grid, validated);
+		const triangleContact = triangleField.nodes.get(
+			gridNodeKey(node.xIndex, node.yIndex)
+		);
+		if (triangleContact) {
+			solveFluidTriangleGridContact(
+				node,
+				triangleContact,
+				particles,
+				validated
+			);
 		}
-		let velocityX = node.momentumX / node.mass + validated.dt * validated.gravity.x;
-		let velocityY = node.momentumY / node.mass + validated.dt * validated.gravity.y;
-		assertComputedFinite(velocityX, 'grid velocity');
-		assertComputedFinite(velocityY, 'grid velocity');
-
-		velocityX = applyWallCushion(velocityX, node.xIndex, validated.grid.cellsX);
-		velocityY = applyWallCushion(velocityY, node.yIndex, validated.grid.cellsY);
-		node.velocityX = velocityX;
-		node.velocityY = velocityY;
+		node.velocityX = applyWallCushion(
+			node.velocityX,
+			node.xIndex,
+			validated.grid.cellsX
+		);
+		node.velocityY = applyWallCushion(
+			node.velocityY,
+			node.yIndex,
+			validated.grid.cellsY
+		);
+		node.waterVelocityX = applyWallCushion(
+			node.waterVelocityX,
+			node.xIndex,
+			validated.grid.cellsX
+		);
+		node.waterVelocityY = applyWallCushion(
+			node.waterVelocityY,
+			node.yIndex,
+			validated.grid.cellsY
+		);
+		node.oilVelocityX = applyWallCushion(
+			node.oilVelocityX,
+			node.xIndex,
+			validated.grid.cellsX
+		);
+		node.oilVelocityY = applyWallCushion(
+			node.oilVelocityY,
+			node.yIndex,
+			validated.grid.cellsY
+		);
+		assertGridNodeFinite(node);
 	}
 
 	const outputParticles = particles.map((particle, index) => {
@@ -262,7 +375,9 @@ export function stepMpm(
 		let c11 = 0;
 		let localLiquidMass = 0;
 		let localLiquidVolume = 0;
-		const isLiquid = state.material.model === 'water' || state.material.model === 'oil';
+		const isWater = state.material.model === 'water';
+		const isOil = state.material.model === 'oil';
+		const isLiquid = isWater || isOil;
 
 		for (let oy = 0; oy < 3; oy++) {
 			for (let ox = 0; ox < 3; ox++) {
@@ -276,16 +391,29 @@ export function stepMpm(
 				}
 				const dposX = (ox - stencil.fx) * dx;
 				const dposY = (oy - stencil.fy) * dx;
-				velocityX += weight * node.velocityX;
-				velocityY += weight * node.velocityY;
-				if (isLiquid) {
-					localLiquidMass += weight * node.liquidMass;
-					localLiquidVolume += weight * node.liquidVolume;
+				const nodeVelocityX = isWater
+					? node.waterVelocityX
+					: isOil
+						? node.oilVelocityX
+						: node.velocityX;
+				const nodeVelocityY = isWater
+					? node.waterVelocityY
+					: isOil
+						? node.oilVelocityY
+						: node.velocityY;
+				velocityX += weight * nodeVelocityX;
+				velocityY += weight * nodeVelocityY;
+				if (isWater) {
+					localLiquidMass += weight * (node.waterMass + node.oilMass);
+					localLiquidVolume += weight * (node.waterVolume + node.oilVolume);
+				} else if (isOil) {
+					localLiquidMass += weight * (node.waterMass + node.oilMass);
+					localLiquidVolume += weight * (node.waterVolume + node.oilVolume);
 				}
-				c00 += weight * node.velocityX * dposX;
-				c01 += weight * node.velocityX * dposY;
-				c10 += weight * node.velocityY * dposX;
-				c11 += weight * node.velocityY * dposY;
+				c00 += weight * nodeVelocityX * dposX;
+				c01 += weight * nodeVelocityX * dposY;
+				c10 += weight * nodeVelocityY * dposX;
+				c11 += weight * nodeVelocityY * dposY;
 			}
 		}
 
@@ -340,18 +468,57 @@ export function stepMpm(
 		assertComputedFinite(nextY, 'particle position');
 		const boundedX = confineAxis(nextX, velocityX, validated.domainWidth);
 		const boundedY = confineAxis(nextY, velocityY, validated.domainHeight);
+		const projectedPosition = isLiquid
+			? projectParticleOutsideTriangles(
+					{ x: boundedX.position, y: boundedY.position },
+					Math.sqrt((state.volume * determinant(F)) / Math.PI),
+					triangleField,
+					validated
+				)
+			: { x: boundedX.position, y: boundedY.position };
+		const finalX = confineAxis(
+			projectedPosition.x,
+			boundedX.velocity,
+			validated.domainWidth
+		);
+		const finalY = confineAxis(
+			projectedPosition.y,
+			boundedY.velocity,
+			validated.domainHeight
+		);
 
 		return {
-			position: { x: boundedX.position, y: boundedY.position },
-			velocity: { x: boundedX.velocity, y: boundedY.velocity },
+			position: { x: finalX.position, y: finalY.position },
+			velocity: { x: finalX.velocity, y: finalY.velocity },
 			C,
 			F,
 			objectId: particle.objectId,
+			...(particle.bondedTriangleVertex === undefined
+				? {}
+				: { bondedTriangleVertex: particle.bondedTriangleVertex }),
 			plasticVolume: nextPlasticVolume,
 			volume: state.volume,
 			material: state.material
 		};
 	});
+
+	applyTriangleContactImpulses(
+		outputParticles,
+		triangleField,
+		bondedBodyStarts,
+		particleStates
+	);
+	enforceBondedTriangleConstraints(
+		outputParticles,
+		bondedBodyStarts,
+		validated
+	);
+	resolveBondedTriangleContacts(
+		particles,
+		outputParticles,
+		bondedBodyStarts,
+		validated
+	);
 
 	const outputMass = totalMass(particleStates, 'output mass');
 	assertComputedFinite(outputMass, 'output mass');
@@ -389,6 +556,11 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 	const cellSize = grid.cellSize;
 	const particleMass = raw.particleMass;
 	const particleVolume = raw.particleVolume;
+	const bondRestLength = raw.bondRestLength;
+	const bondStiffness =
+		raw.bondStiffness === undefined
+			? DEFAULT_BONDED_TRIANGLE_STIFFNESS
+			: raw.bondStiffness;
 	const lambda = material.lambda;
 	const mu = material.mu;
 	const gravity = raw.gravity;
@@ -399,6 +571,7 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 	assertFiniteNumber(cellSize, 'grid.cellSize');
 	assertFiniteNumber(particleMass, 'particleMass');
 	assertFiniteNumber(particleVolume, 'particleVolume');
+	assertFiniteNumber(bondStiffness, 'bondStiffness');
 	assertFiniteNumber(lambda, 'material.lambda');
 	assertFiniteNumber(mu, 'material.mu');
 	assertVector(gravity, 'gravity');
@@ -413,6 +586,15 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 	if (cellSize <= 0) throw new RangeError('grid.cellSize must be greater than zero');
 	if (particleMass <= 0) throw new RangeError('particleMass must be greater than zero');
 	if (particleVolume <= 0) throw new RangeError('particleVolume must be greater than zero');
+	if (bondRestLength !== undefined) {
+		assertFiniteNumber(bondRestLength, 'bondRestLength');
+		if (bondRestLength <= 0) {
+			throw new RangeError('bondRestLength must be greater than zero');
+		}
+	}
+	if (bondStiffness <= 0 || bondStiffness > 1) {
+		throw new RangeError('bondStiffness must be greater than zero and at most one');
+	}
 	const domainWidth = cellsX * cellSize;
 	const domainHeight = cellsY * cellSize;
 	const cellSizeSquared = cellSize * cellSize;
@@ -444,6 +626,8 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 		grid: { cellsX, cellsY, cellSize },
 		particleMass,
 		particleVolume,
+		bondRestLength,
+		bondStiffness,
 		material,
 		gravity: { x: gravity.x, y: gravity.y },
 		domainWidth,
@@ -490,6 +674,17 @@ function validateParticles(
 			}
 		}
 		if (
+			value.bondedTriangleVertex !== undefined &&
+			(typeof value.bondedTriangleVertex !== 'number' ||
+				!Number.isSafeInteger(value.bondedTriangleVertex) ||
+				value.bondedTriangleVertex < 0 ||
+				value.bondedTriangleVertex > 2)
+		) {
+			throw new RangeError(
+				`particles[${index}].bondedTriangleVertex must be 0, 1, or 2`
+			);
+		}
+		if (
 			particle.position.x < 0 ||
 			particle.position.x > config.domainWidth ||
 			particle.position.y < 0 ||
@@ -502,6 +697,648 @@ function validateParticles(
 			throw new RangeError(`particles[${index}].F must have a finite positive determinant`);
 		}
 	}
+}
+
+function collectBondedBodyStarts(
+	particles: readonly MpmParticle[],
+	config: ValidatedConfig
+): number[] {
+	const starts: number[] = [];
+	for (let index = 0; index < particles.length; index += 1) {
+		const particle = particles[index];
+		if (particle.bondedTriangleVertex === undefined) continue;
+		if (particle.bondedTriangleVertex !== 0) {
+			throw new RangeError(
+				`particles[${index}].bondedTriangleVertex must start each triangle at zero`
+			);
+		}
+		if (config.bondRestLength === undefined) {
+			throw new RangeError('bondRestLength is required for bonded triangle particles');
+		}
+		if (index + 2 >= particles.length) {
+			throw new RangeError(`bonded triangle at particle ${index} is incomplete`);
+		}
+		const objectId = particle.objectId ?? 0;
+		for (let vertex = 0; vertex < 3; vertex += 1) {
+			const member = particles[index + vertex];
+			if (
+				member.bondedTriangleVertex !== vertex ||
+				(member.objectId ?? 0) !== objectId
+			) {
+				throw new RangeError(
+					`bonded triangle at particle ${index} must contain contiguous vertices 0, 1, and 2 of one object`
+				);
+			}
+			const material = particleMaterial(member, config.material);
+			if (material.model === 'water' || material.model === 'oil') {
+				throw new RangeError('bonded triangle vertices must use a solid material');
+			}
+		}
+		starts.push(index);
+		index += 2;
+	}
+	return starts;
+}
+
+function buildTriangleField(
+	bodyStarts: readonly number[],
+	particles: readonly MpmParticle[],
+	config: ValidatedConfig
+): TriangleField {
+	const nodes = new Map<string, TriangleContactField>();
+	const nodesByBody = new Map<number, TriangleContactField[]>();
+	if (bodyStarts.length === 0) return { nodes, nodesByBody };
+
+	const { cellsX, cellsY, cellSize } = config.grid;
+	const maxDistance = cellSize * TRIANGLE_FIELD_BAND_CELLS;
+	for (let yIndex = -1; yIndex <= cellsY + 1; yIndex += 1) {
+		for (let xIndex = -1; xIndex <= cellsX + 1; xIndex += 1) {
+			const point = { x: xIndex * cellSize, y: yIndex * cellSize };
+			let nearest: TriangleContactField | undefined;
+			for (const bodyStart of bodyStarts) {
+				const triangle = getTriangleVertices(particles, bodyStart);
+				if (
+					point.x < Math.min(triangle[0].x, triangle[1].x, triangle[2].x) - maxDistance ||
+					point.x > Math.max(triangle[0].x, triangle[1].x, triangle[2].x) + maxDistance ||
+					point.y < Math.min(triangle[0].y, triangle[1].y, triangle[2].y) - maxDistance ||
+					point.y > Math.max(triangle[0].y, triangle[1].y, triangle[2].y) + maxDistance
+				) {
+					continue;
+				}
+				const sample = triangleDistanceSample(point, triangle);
+				if (
+					sample.signedDistance <= maxDistance &&
+					(nearest === undefined ||
+						sample.signedDistance < nearest.signedDistance)
+				) {
+					nearest = {
+						bodyStart,
+						signedDistance: sample.signedDistance,
+						normal: sample.normal,
+						barycentric: sample.barycentric,
+						impulseX: 0,
+						impulseY: 0
+					};
+				}
+			}
+			if (nearest) {
+				nodes.set(gridNodeKey(xIndex, yIndex), nearest);
+				const bodyNodes = nodesByBody.get(nearest.bodyStart) ?? [];
+				bodyNodes.push(nearest);
+				nodesByBody.set(nearest.bodyStart, bodyNodes);
+			}
+		}
+	}
+	return { nodes, nodesByBody };
+}
+
+function getTriangleVertices(
+	particles: readonly MpmParticle[],
+	start: number
+): readonly [MpmVector2, MpmVector2, MpmVector2] {
+	return [
+		particles[start].position,
+		particles[start + 1].position,
+		particles[start + 2].position
+	];
+}
+
+function triangleDistanceSample(
+	point: MpmVector2,
+	vertices: readonly [MpmVector2, MpmVector2, MpmVector2]
+): {
+	readonly signedDistance: number;
+	readonly normal: MpmVector2;
+	readonly barycentric: readonly [number, number, number];
+} {
+	const [a, b, c] = vertices;
+	const signedArea = cross2(subtractVector(b, a), subtractVector(c, a));
+	if (!Number.isFinite(signedArea) || Math.abs(signedArea) <= 1e-10) {
+		throw new RangeError('bonded triangle became degenerate');
+	}
+	const crosses = [
+		cross2(subtractVector(b, a), subtractVector(point, a)),
+		cross2(subtractVector(c, b), subtractVector(point, b)),
+		cross2(subtractVector(a, c), subtractVector(point, c))
+	];
+	const inside =
+		signedArea > 0
+			? crosses.every((value) => value >= -1e-10)
+			: crosses.every((value) => value <= 1e-10);
+	const edges = [
+		{ start: a, end: b, barycentric: (t: number) => [1 - t, t, 0] as const },
+		{ start: b, end: c, barycentric: (t: number) => [0, 1 - t, t] as const },
+		{ start: c, end: a, barycentric: (t: number) => [t, 0, 1 - t] as const }
+	] as const;
+
+	let closestDistanceSquared = Number.POSITIVE_INFINITY;
+	let closestPoint: MpmVector2 = a;
+	let closestNormal: MpmVector2 = { x: 0, y: 0 };
+	let barycentric: readonly [number, number, number] = [1, 0, 0];
+	for (const edge of edges) {
+		const direction = subtractVector(edge.end, edge.start);
+		const lengthSquared = dot2(direction, direction);
+		const t = Math.max(
+			0,
+			Math.min(
+				1,
+				dot2(subtractVector(point, edge.start), direction) / lengthSquared
+			)
+		);
+		const candidate = addVector(edge.start, scaleVector(direction, t));
+		const difference = subtractVector(point, candidate);
+		const distanceSquared = dot2(difference, difference);
+		if (distanceSquared >= closestDistanceSquared) continue;
+		closestDistanceSquared = distanceSquared;
+		closestPoint = candidate;
+		barycentric = edge.barycentric(t);
+		if (distanceSquared > 1e-20 && !inside) {
+			const distance = Math.sqrt(distanceSquared);
+			closestNormal = scaleVector(difference, 1 / distance);
+		} else {
+			const orientation = signedArea > 0 ? 1 : -1;
+			const outward = {
+				x: orientation * direction.y,
+				y: -orientation * direction.x
+			};
+			const edgeLength = Math.sqrt(lengthSquared);
+			closestNormal = scaleVector(outward, 1 / edgeLength);
+		}
+	}
+	const distance = Math.sqrt(closestDistanceSquared);
+	if (!Number.isFinite(distance) || !isFiniteVector(closestNormal)) {
+		throw new RangeError('bonded triangle contact field became non-finite');
+	}
+	return {
+		signedDistance: inside ? -distance : distance,
+		normal: closestNormal,
+		barycentric
+	};
+}
+
+function solveLiquidGridContact(
+	node: GridNode,
+	grid: ReadonlyMap<string, GridNode>,
+	config: ValidatedConfig
+): void {
+	if (
+		node.waterMass <= 0 ||
+		node.oilMass <= 0 ||
+		node.waterVolume <= 0 ||
+		node.oilVolume <= 0 ||
+		node.xIndex < 0 ||
+		node.xIndex > config.grid.cellsX ||
+		node.yIndex < 0 ||
+		node.yIndex > config.grid.cellsY
+	) {
+		return;
+	}
+
+	const waterGradient = volumeGradient(grid, node.xIndex, node.yIndex, 'water', config.grid.cellSize);
+	const oilGradient = volumeGradient(grid, node.xIndex, node.yIndex, 'oil', config.grid.cellSize);
+	const gradient = {
+		x: oilGradient.x - waterGradient.x,
+		y: oilGradient.y - waterGradient.y
+	};
+	const gradientLength = Math.hypot(gradient.x, gradient.y);
+	if (!Number.isFinite(gradientLength) || gradientLength <= 1e-12) return;
+	const normal = scaleVector(gradient, 1 / gradientLength);
+	const relativeNormalVelocity =
+		(node.oilVelocityX - node.waterVelocityX) * normal.x +
+		(node.oilVelocityY - node.waterVelocityY) * normal.y;
+	if (relativeNormalVelocity >= 0) return;
+	const impulse =
+		-relativeNormalVelocity /
+		(1 / node.waterMass + 1 / node.oilMass);
+	node.waterVelocityX -= (impulse / node.waterMass) * normal.x;
+	node.waterVelocityY -= (impulse / node.waterMass) * normal.y;
+	node.oilVelocityX += (impulse / node.oilMass) * normal.x;
+	node.oilVelocityY += (impulse / node.oilMass) * normal.y;
+}
+
+function volumeGradient(
+	grid: ReadonlyMap<string, GridNode>,
+	xIndex: number,
+	yIndex: number,
+	phase: 'water' | 'oil',
+	cellSize: number
+): MpmVector2 {
+	const volumeAt = (x: number, y: number): number => {
+		const node = grid.get(gridNodeKey(x, y));
+		return node === undefined
+			? 0
+			: phase === 'water'
+				? node.waterVolume
+				: node.oilVolume;
+	};
+	const scale = 1 / (2 * cellSize * cellSize);
+	return {
+		x: (volumeAt(xIndex + 1, yIndex) - volumeAt(xIndex - 1, yIndex)) * scale,
+		y: (volumeAt(xIndex, yIndex + 1) - volumeAt(xIndex, yIndex - 1)) * scale
+	};
+}
+
+function solveFluidTriangleGridContact(
+	node: GridNode,
+	field: TriangleContactField,
+	particles: readonly MpmParticle[],
+	config: ValidatedConfig
+): void {
+	const radius = Math.sqrt(config.particleVolume / Math.PI);
+	const contactReach = radius + GRID_CONTACT_REACH_CELLS * config.grid.cellSize;
+	if (field.signedDistance > contactReach) return;
+	const bodyStart = field.bodyStart;
+	const barycentric = field.barycentric;
+	const surfaceVelocity = { x: 0, y: 0 };
+	let inverseBodyMass = 0;
+	for (let vertex = 0; vertex < 3; vertex += 1) {
+		const weight = barycentric[vertex];
+		surfaceVelocity.x += weight * particles[bodyStart + vertex].velocity.x;
+		surfaceVelocity.y += weight * particles[bodyStart + vertex].velocity.y;
+		inverseBodyMass += (weight * weight) / config.particleMass;
+	}
+	if (inverseBodyMass <= 0) return;
+
+	if (node.waterMass > 0) {
+		const relative =
+			(node.waterVelocityX - surfaceVelocity.x) * field.normal.x +
+			(node.waterVelocityY - surfaceVelocity.y) * field.normal.y;
+		if (relative < 0) {
+			const impulse = -relative / (1 / node.waterMass + inverseBodyMass);
+			node.waterVelocityX += (impulse / node.waterMass) * field.normal.x;
+			node.waterVelocityY += (impulse / node.waterMass) * field.normal.y;
+			field.impulseX -= impulse * field.normal.x;
+			field.impulseY -= impulse * field.normal.y;
+		}
+	}
+	if (node.oilMass > 0) {
+		const relative =
+			(node.oilVelocityX - surfaceVelocity.x) * field.normal.x +
+			(node.oilVelocityY - surfaceVelocity.y) * field.normal.y;
+		if (relative < 0) {
+			const impulse = -relative / (1 / node.oilMass + inverseBodyMass);
+			node.oilVelocityX += (impulse / node.oilMass) * field.normal.x;
+			node.oilVelocityY += (impulse / node.oilMass) * field.normal.y;
+			field.impulseX -= impulse * field.normal.x;
+			field.impulseY -= impulse * field.normal.y;
+		}
+	}
+}
+
+function updateGridVelocity(
+	mass: number,
+	momentumX: number,
+	momentumY: number,
+	config: ValidatedConfig
+): MpmVector2 {
+	if (mass <= 0) return { x: 0, y: 0 };
+	const velocity = {
+		x: momentumX / mass + config.dt * config.gravity.x,
+		y: momentumY / mass + config.dt * config.gravity.y
+	};
+	assertComputedFinite(velocity.x, 'grid velocity');
+	assertComputedFinite(velocity.y, 'grid velocity');
+	return {
+		x: velocity.x,
+		y: velocity.y
+	};
+}
+
+function projectParticleOutsideTriangles(
+	position: MpmVector2,
+	radius: number,
+	triangleField: TriangleField,
+	config: ValidatedConfig
+): MpmVector2 {
+	if (triangleField.nodes.size === 0) return position;
+	const stencil = particleStencil(position, config.grid.cellSize);
+	const band = config.grid.cellSize * TRIANGLE_FIELD_BAND_CELLS;
+	let signedDistance = 0;
+	let closestBodyStart: number | undefined;
+	let closestDistance = Number.POSITIVE_INFINITY;
+	let selectedNormal: MpmVector2 | undefined;
+	for (let oy = 0; oy < 3; oy += 1) {
+		for (let ox = 0; ox < 3; ox += 1) {
+			const weight = stencil.weightsX[ox] * stencil.weightsY[oy];
+			const field = triangleField.nodes.get(
+				gridNodeKey(stencil.baseX + ox, stencil.baseY + oy)
+			);
+			signedDistance += weight * (field?.signedDistance ?? band);
+			if (field && field.signedDistance < closestDistance) {
+				closestDistance = field.signedDistance;
+				closestBodyStart = field.bodyStart;
+				selectedNormal = field.normal;
+			}
+		}
+	}
+	if (closestBodyStart === undefined || signedDistance >= radius) return position;
+	let normalX = 0;
+	let normalY = 0;
+	for (let oy = 0; oy < 3; oy += 1) {
+		for (let ox = 0; ox < 3; ox += 1) {
+			const weight = stencil.weightsX[ox] * stencil.weightsY[oy];
+			const field = triangleField.nodes.get(
+				gridNodeKey(stencil.baseX + ox, stencil.baseY + oy)
+			);
+			if (!field || field.bodyStart !== closestBodyStart) continue;
+			normalX += weight * field.normal.x;
+			normalY += weight * field.normal.y;
+		}
+	}
+	const normalLength = Math.hypot(normalX, normalY);
+	const normal =
+		normalLength > 1e-12 && Number.isFinite(normalLength)
+			? { x: normalX / normalLength, y: normalY / normalLength }
+			: selectedNormal;
+	if (!normal) return position;
+	const correction = radius - signedDistance;
+	const projected = {
+		x: position.x + correction * normal.x,
+		y: position.y + correction * normal.y
+	};
+	assertComputedFinite(projected.x, 'triangle contact projection x');
+	assertComputedFinite(projected.y, 'triangle contact projection y');
+	return projected;
+}
+
+function applyTriangleContactImpulses(
+	outputParticles: MpmParticle[],
+	triangleField: TriangleField,
+	bodyStarts: readonly number[],
+	particleStates: readonly ParticlePhysicalState[]
+): void {
+	for (const bodyStart of bodyStarts) {
+		const impulses = [0, 0, 0].map(() => ({ x: 0, y: 0 }));
+		for (const field of triangleField.nodesByBody.get(bodyStart) ?? []) {
+			for (let vertex = 0; vertex < 3; vertex += 1) {
+				const weight = field.barycentric[vertex];
+				impulses[vertex].x += weight * field.impulseX;
+				impulses[vertex].y += weight * field.impulseY;
+			}
+		}
+		for (let vertex = 0; vertex < 3; vertex += 1) {
+			const index = bodyStart + vertex;
+			const particle = outputParticles[index];
+			const mass = particleStates[index].mass;
+			outputParticles[index] = {
+				...particle,
+				velocity: {
+					x: particle.velocity.x + impulses[vertex].x / mass,
+					y: particle.velocity.y + impulses[vertex].y / mass
+				}
+			};
+			assertComputedFinite(outputParticles[index].velocity.x, 'triangle reaction velocity x');
+			assertComputedFinite(outputParticles[index].velocity.y, 'triangle reaction velocity y');
+		}
+	}
+}
+
+function enforceBondedTriangleConstraints(
+	outputParticles: MpmParticle[],
+	bodyStarts: readonly number[],
+	config: ValidatedConfig
+): void {
+	if (bodyStarts.length === 0) return;
+	const restLength = config.bondRestLength;
+	if (restLength === undefined) {
+		throw new RangeError('bondRestLength is required for bonded triangle particles');
+	}
+	const stiffness = config.bondStiffness;
+	for (const bodyStart of bodyStarts) {
+		const original = getTriangleVertices(outputParticles, bodyStart);
+		const positions: MpmVector2[] = original.map(({ x, y }) => ({ x, y }));
+		const edges = [
+			[0, 1],
+			[1, 2],
+			[2, 0]
+		] as const;
+		for (let iteration = 0; iteration < BONDED_TRIANGLE_SOLVER_ITERATIONS; iteration += 1) {
+			for (const [first, second] of edges) {
+				const difference = subtractVector(positions[second], positions[first]);
+				const distance = Math.hypot(difference.x, difference.y);
+				if (!Number.isFinite(distance) || distance <= 1e-10) {
+					throw new RangeError(`bonded triangle at particle ${bodyStart} collapsed`);
+				}
+				const correction = scaleVector(
+					difference,
+					((distance - restLength) * stiffness * 0.5) / distance
+				);
+				positions[first] = addVector(positions[first], correction);
+				positions[second] = subtractVector(positions[second], correction);
+			}
+		}
+		for (let vertex = 0; vertex < 3; vertex += 1) {
+			const index = bodyStart + vertex;
+			const particle = outputParticles[index];
+			const displacement = subtractVector(positions[vertex], original[vertex]);
+			const velocity = {
+				x: particle.velocity.x + displacement.x / config.dt,
+				y: particle.velocity.y + displacement.y / config.dt
+			};
+			const boundedX = confineAxis(
+				positions[vertex].x,
+				velocity.x,
+				config.domainWidth
+			);
+			const boundedY = confineAxis(
+				positions[vertex].y,
+				velocity.y,
+				config.domainHeight
+			);
+			outputParticles[index] = {
+				...particle,
+				position: { x: boundedX.position, y: boundedY.position },
+				velocity: { x: boundedX.velocity, y: boundedY.velocity }
+			};
+		}
+	}
+}
+
+function resolveBondedTriangleContacts(
+	inputParticles: readonly MpmParticle[],
+	outputParticles: MpmParticle[],
+	bodyStarts: readonly number[],
+	config: ValidatedConfig
+): void {
+	if (bodyStarts.length < 2) return;
+	const skin = config.grid.cellSize * TRIANGLE_CONTACT_SKIN_CELLS;
+	for (const bodyStart of bodyStarts) {
+		const bodyId = inputParticles[bodyStart].objectId;
+		const currentTriangle = getTriangleVertices(inputParticles, bodyStart);
+		const currentVelocity = triangleMeanVelocity(inputParticles, bodyStart);
+		let correctionX = 0;
+		let correctionY = 0;
+		let impulseX = 0;
+		let impulseY = 0;
+		const bodyMass = 3 * config.particleMass;
+
+		for (const otherStart of bodyStarts) {
+			if (
+				otherStart === bodyStart ||
+				inputParticles[otherStart].objectId === bodyId
+			) {
+				continue;
+			}
+			const contact = trianglePairContact(
+				currentTriangle,
+				getTriangleVertices(inputParticles, otherStart),
+				skin
+			);
+			if (!contact) continue;
+			const otherVelocity = triangleMeanVelocity(inputParticles, otherStart);
+			const relativeNormalVelocity =
+				(currentVelocity.x - otherVelocity.x) * contact.normal.x +
+				(currentVelocity.y - otherVelocity.y) * contact.normal.y;
+			if (relativeNormalVelocity < 0) {
+				const impulse =
+					-relativeNormalVelocity / (2 / bodyMass);
+				impulseX += (impulse / bodyMass) * contact.normal.x;
+				impulseY += (impulse / bodyMass) * contact.normal.y;
+			}
+			correctionX += contact.penetration * 0.5 * contact.normal.x;
+			correctionY += contact.penetration * 0.5 * contact.normal.y;
+		}
+
+		for (let vertex = 0; vertex < 3; vertex += 1) {
+			const index = bodyStart + vertex;
+			const particle = outputParticles[index];
+			const boundedX = confineAxis(
+				particle.position.x + correctionX,
+				particle.velocity.x + impulseX,
+				config.domainWidth
+			);
+			const boundedY = confineAxis(
+				particle.position.y + correctionY,
+				particle.velocity.y + impulseY,
+				config.domainHeight
+			);
+			outputParticles[index] = {
+				...particle,
+				position: { x: boundedX.position, y: boundedY.position },
+				velocity: { x: boundedX.velocity, y: boundedY.velocity }
+			};
+		}
+	}
+}
+
+function trianglePairContact(
+	triangleA: readonly [MpmVector2, MpmVector2, MpmVector2],
+	triangleB: readonly [MpmVector2, MpmVector2, MpmVector2],
+	skin: number
+): { readonly normal: MpmVector2; readonly penetration: number } | undefined {
+	let separated = false;
+	let largestGap = Number.NEGATIVE_INFINITY;
+	let smallestOverlap = Number.POSITIVE_INFINITY;
+	let contactAxis: MpmVector2 | undefined;
+	for (const triangle of [triangleA, triangleB]) {
+		for (let edgeIndex = 0; edgeIndex < 3; edgeIndex += 1) {
+			const start = triangle[edgeIndex];
+			const end = triangle[(edgeIndex + 1) % 3];
+			const edge = subtractVector(end, start);
+			const edgeLength = Math.hypot(edge.x, edge.y);
+			if (edgeLength <= 1e-10) return undefined;
+			const axis = { x: edge.y / edgeLength, y: -edge.x / edgeLength };
+			const project = (vertices: readonly MpmVector2[]) => {
+				const values = vertices.map((vertex) => dot2(vertex, axis));
+				return {
+					min: Math.min(...values),
+					max: Math.max(...values)
+				};
+			};
+			const projectionA = project(triangleA);
+			const projectionB = project(triangleB);
+			const gap = Math.max(
+				projectionB.min - projectionA.max,
+				projectionA.min - projectionB.max
+			);
+			if (gap > 0) {
+				separated = true;
+				if (gap > largestGap) {
+					largestGap = gap;
+					contactAxis = axis;
+				}
+			} else if (!separated && -gap < smallestOverlap) {
+				smallestOverlap = -gap;
+				contactAxis = axis;
+			}
+		}
+	}
+	if (separated && largestGap > skin) return undefined;
+	if (!contactAxis) return undefined;
+	const centerA = triangleCentroid(triangleA);
+	const centerB = triangleCentroid(triangleB);
+	const direction = subtractVector(centerA, centerB);
+	const normal =
+		dot2(direction, contactAxis) >= 0
+			? contactAxis
+			: scaleVector(contactAxis, -1);
+	const penetration = separated
+		? skin - largestGap
+		: skin + smallestOverlap;
+	return penetration > 0 ? { normal, penetration } : undefined;
+}
+
+function triangleCentroid(
+	triangle: readonly [MpmVector2, MpmVector2, MpmVector2]
+): MpmVector2 {
+	return {
+		x: (triangle[0].x + triangle[1].x + triangle[2].x) / 3,
+		y: (triangle[0].y + triangle[1].y + triangle[2].y) / 3
+	};
+}
+
+function triangleMeanVelocity(particles: readonly MpmParticle[], start: number): MpmVector2 {
+	return {
+		x:
+			(particles[start].velocity.x +
+				particles[start + 1].velocity.x +
+				particles[start + 2].velocity.x) /
+			3,
+		y:
+			(particles[start].velocity.y +
+				particles[start + 1].velocity.y +
+				particles[start + 2].velocity.y) /
+			3
+	};
+}
+
+function assertGridNodeFinite(node: GridNode): void {
+	for (const [name, value] of Object.entries(node)) {
+		if (typeof value === 'number') assertComputedFinite(value, `grid node ${name}`);
+	}
+	if (
+		node.mass < 0 ||
+		node.waterMass < 0 ||
+		node.waterVolume < 0 ||
+		node.oilMass < 0 ||
+		node.oilVolume < 0
+	) {
+		throw new RangeError('grid node mass and phase volume must be non-negative');
+	}
+}
+
+function subtractVector(first: MpmVector2, second: MpmVector2): MpmVector2 {
+	return { x: first.x - second.x, y: first.y - second.y };
+}
+
+function addVector(first: MpmVector2, second: MpmVector2): MpmVector2 {
+	return { x: first.x + second.x, y: first.y + second.y };
+}
+
+function scaleVector(vector: MpmVector2, scale: number): MpmVector2 {
+	return { x: vector.x * scale, y: vector.y * scale };
+}
+
+function dot2(first: MpmVector2, second: MpmVector2): number {
+	return first.x * second.x + first.y * second.y;
+}
+
+function cross2(first: MpmVector2, second: MpmVector2): number {
+	return first.x * second.y - first.y * second.x;
+}
+
+function isFiniteVector(vector: MpmVector2): boolean {
+	return Number.isFinite(vector.x) && Number.isFinite(vector.y);
 }
 
 function particleStencil(position: MpmVector2, cellSize: number): ParticleStencil {

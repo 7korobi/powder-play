@@ -21,7 +21,10 @@ The solver owns the canvas context and device obtained from the shared WebGPU
 session; call `dispose()` when the lab is finished. `step(dt, gravity)` queues
 one step. `stepBatch(stepCount, dt, gravity)` encodes sequential fixed steps
 into one command buffer and submits them together; each step keeps its normal
-grid passes and particle-buffer ping-pong.
+grid passes and particle-buffer ping-pong. With bonded triangles, each step
+also builds the triangle contact field between P2G and grid update, applies
+liquid/triangle contacts after G2P, solves the three pebble edges and pair
+contacts, then commits particles. A batch still uses one compute pass.
 
 The Gate 4 lab keeps the solver step fixed at `1 / 240` seconds, targets 60 FPS,
 and starts at a 2× simulation-time multiplier. The UI offers 0.5×–32× without
@@ -38,13 +41,24 @@ total). The pebbles form a 14-column × 15-row array with 68-world-unit center
 spacing; the last row is centered and contains four pebbles. Each is an
 equilateral triangle with 66-world-unit edges and width, about 3% of the
 simulation-domain width. Each triangle spans roughly 6.6 grid cells and has
-its own `objectId`. The three particle vertices are not connected by explicit
-elastic bonds or contact, so mutual penetration and sustained shape retention
-are not validated. Each pebble uses lambda 20 and mu 10.
+its own `objectId`. Each pebble uses lambda 20 and mu 10; its three edges also
+use position constraints. Water and oil have separate grid velocity/volume
+channels and receive normal contact impulses from their phase-volume gradients.
+The triangle signed-distance field projects liquid particles out of the
+pebbles and gathers the opposing normal impulse back to the three vertices.
+Pebble pairs use triangle SAT contact with a normal impulse and positional
+correction. These are discrete, approximate contacts, not a continuous
+collider or continuum deformable mesh.
 At scene initialization, water and oil velocity components are sampled
-independently from ±12 world units/s and each pebble vertex from ±24 world
+independently from ±60 world units/s and each pebble vertex from ±120 world
 units/s. A fixed scene seed reproduces the same velocities for tests and
 benchmarks; the lab chooses a fresh seed on initialization.
+The triangle field scans all bonded bodies for each grid node; the current
+200-pebble scene performs up to about 6.82 million node/body candidate checks
+per step. This GPU pass and the pairwise SAT solver are profiled in
+`docs/PERFORMANCE-MLS-MPM.md`; larger scenes and sustained stability remain
+unverified. Contact friction, surface tension, wetting, complete water/oil
+separation, and swept collision detection are not implemented.
 
 Water and oil reference densities are 0.02 and 0.016, half the previous
 values. Their reference volumes and EOS stiffnesses are unchanged. The liquid

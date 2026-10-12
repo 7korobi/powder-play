@@ -129,9 +129,24 @@ workgroup 内 barrier を異なる dispatch の同期の代用品にしない。
 - [既存ロードマップ](./ROADMAP-MLS-MPM.md):
   現行実装の変更と合格範囲。材料機能の gate を勝手に完了扱いにしない。
 
+## Gate 4 接触prototype追加後の補足計測
+
+M4 の接触dispatchを含む現行シーンを、P0〜P4で使った再現可能benchmarkで追加計測した。
+14,600 active、1,000,000 capacity、200小石、固定 seed、Apple Metal 3 / Chrome 154。
+batch profileは0.37094 ms/step median・0.37371 p95、GPU buffer確保量は221,564,392 byte。
+stages profileは80 compute pass/8-step batchで診断し、`buildTriangleField` 0.13918、
+`solveBondedTriangles` 0.10010 ms/step medianが上位だった。測定条件・全stage値は
+[性能資料](./PERFORMANCE-MLS-MPM.md#現行-66-unit接触prototype高ランダム初速2026-10-12) に記録する。
+
+計測で分かった候補のうち、三角形 SAT の AABB reject、contact impulse gather 範囲の縮小、
+field broad-phase の平方距離化を実装した。変更前後は各１回の参考計測で、制御された反復A/Bではない。
+P4のM1採否を変更する結果ではなく、接触追加後の性能合格も意味しない。
+
 ## 後続: 今回実装しない調査
 
 - mobile で capacity と機能 profile を見直し、５分以上の持続性能を測る。
+- `buildTriangleField` の全 node×body 探索をGPU spatial tile/bucket候補に置き換え、
+  固定容量・overflow検知・clone後の動的body数を含めて現在の計測と反復A/B比較する。
 - dense node の list 長・偏りを収集して sort/tile gather を比較する。
 - active node/tile と full-grid の crossover を測る。
 - physics と render の decoupling、queue gate、pick の大粒子数 search を比較する。

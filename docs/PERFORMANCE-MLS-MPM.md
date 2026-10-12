@@ -78,20 +78,25 @@ linked-list ソート化、active-grid 化、SoA 化、subgroup、workgroup サ�
 P2G の atomic list 順は不定なので bitwise 一致は要求しない。
 長い chaotic scene の粒子位置差だけで、短い step の式の正否を判断しない。
 
-## 3. 調査から確認できたボトルネック
+## 3. 調査時点のボトルネックと現在の優先測定
 
-1. **GPU: P2G の重複計算**。
-   [WGSL](../src/lib/mpm/kernels/shaders.ts) の node list 内で
-   同じ粒子の構成則を最大９回評価する。Snow／粉体の分解は特に重い。
-2. **CPU: batch 内の pass encoding**。
-   [GPU solver](../src/lib/mpm/kernels/solver.ts) は６ dispatch ごとに６ pass を開閉する。
-   ８ step なら48 pass、128 step なら768 pass を encode する。
-3. **メモリ: active と capacity の差**。
-   [Gate 4 scene](../src/lib/mpm/scenes/gate4.ts) は20,000 active に対して1,000,000 capacity。
-   約201 MBを確保している。これは今回の kernel 計算削減とは別の容量設定課題。
+1. **GPU: P2G の重複構成則評価（M1 で解消）**。
+   [WGSL](../src/lib/mpm/kernels/shaders.ts) の node list 内で同じ粒子の応力を最大９回評価していたが、
+   16 byte/粒子の prepare cache により現在は１回/粒子/step。
+2. **CPU: batch 内の pass encoding（集約済み）**。
+   batch を１ compute pass にまとめた。M1 benchmark では８ step の dispatch が48から56へ増えても、
+   pass open/close は１回だった。後続の contact dispatch 数は下記 M4 実装状況を参照。
+3. **メモリ: active と capacity の差（継続課題）**。
+   旧 Gate 4 scene は20,000 active に対して1,000,000 capacity、M1 後の確保量は約217 MB。
+   capacity の削減は今回の計算高速化とは別の検証が必要。
+4. **GPU: 三角形 contact field の全 node × body 探索（未計測）**。
+   現在の Gate 4 は grid node ごとに200小石を走査し、最大約6.82M candidate checks/step。
+   AABB rejection 後の narrow-phase 量だけではなく、候補全走査自体の費用を計測する。
+5. **GPU: 小石同士の SAT（未計測）**。
+   200 bodies の body pass は最大約39,800 pair checks/step。field builder と合わせて stage timing を取る。
 
-bucket の dense-node 偏り、GPU に余裕があるときの rAF/queue gate の制約は調べる候補だが、
-今回まだ分布・操作 latency を定量測定していない。確認済みの bottleneck と混ぜない。
+新しい contact pass の GPU 時間、密な node bucket、実機の rAF/queue gate、
+操作 latency はまだ定量測定していない。仮説と計測済み bottleneck を混ぜない。
 
 ## 4. 実装前の baseline
 
@@ -135,7 +140,7 @@ P2G median は GPU step median の約49%。個々の median は同一サンプ�
 
 ## 5. 実装後に残す比較
 
-### 採用した変更
+### 採用した変更（M1 の A/B。M4 接触追加前）
 
 ロードマップを完成させてから、粒子別の16 byteアフィン運動量cacheと
 batchの１compute pass集約を実装した。`dt`・係数・格子・粒子数・容量・壁は変えていない。
@@ -304,13 +309,14 @@ CPU時計の分解能のため、encode median/p95の0 msは実処理時間ゼ�
 `1.3956e-5`、batch/単発差0、pick・drag・clone・render・rollback・永続数値statusを確認した。
 これらは長時間弾性復元、頂点間の一体変形、明示的接触を検証するものではない。
 
-### 現行: 66-unit・ランダム初速シーン計測（2026-10-12）
+### 接触追加前: 66-unit・低ランダム初速シーン計測（2026-10-12）
 
 前項と同じ14,600 active / 1,000,000 capacityの配置・格子・時間刻み・重力を使い、
 水・油の速度成分を±12、小石の各頂点の速度成分を±24 world units/sから独立に抽選した。
 シーン生成seedは `0x4d504d34` に固定し、計測を再現可能にした。Chrome 154 / Apple Metal 3
 （fallbackなし）/ `timestamp-query`、暖機64 step、静止暖機600 ms、12 batch×8 step、
-描画なし。GPU確保量は217,228,520 byte。
+描画なし。GPU確保量は217,228,520 byte。この記録は現在の±60/±120初速と
+水–油／小石接触 dispatch を含まない。M1 の性能基準としてのみ残す。
 
 | profile | GPU median / p95 (ms/step) | CPU normal encode median / p95 (ms/batch) | queue wait median / p95 (ms/batch) | measured pass/batch |
 |---|---:|---:|---:|---:|
@@ -322,10 +328,61 @@ bucket構築 0.01158、P2G 0.03598、grid update 0.00977、G2P 0.01672、
 commit 0.00502 ms/step。attributionはbatchと異なるpass構成であり、通常batch値と直接比較しない。
 CPU時計の分解能のため、encode median/p95の0 msは実処理時間ゼロを意味しない。
 
-ランダム初速で再読み込みしたページの初回CPU/GPU比較は最大絶対誤差 `2.48e-5`、
-許容範囲内。GPU benchmark内の45粒子・５モデル／８ step回帰は最大絶対誤差
+当時のランダム初速で再読み込みしたページの初回CPU/GPU比較は最大絶対誤差 `2.48e-5`、
+当時の許容範囲内。GPU benchmark内の45粒子・５モデル／８ step回帰は最大絶対誤差
 `1.3956e-5`、batch/単発差0、pick・drag・clone・render・rollback・永続数値statusを確認した。
 この短時間試験は長時間弾性復元、頂点間の一体変形、明示的接触を検証するものではない。
+
+### 現行: 66-unit・接触prototype・高ランダム初速（2026-10-12）
+
+接触・辺長制約を含む現在のコードを、同じ固定条件で追加計測した。シーン seed は
+`0x4d504d34`、水・油±60、小石頂点±120 world units/s、14,600 active /
+1,000,000 capacity、220×150 cells (`h=10`)、`dt=1/240`、重力 `(0,90)`、
+描画なし。Chrome 154 / Apple Metal 3 (fallbackなし) / `timestamp-query`、
+600 ms の重力ゼロ暖機、64 step の重力暖機、12 batch×8 step。
+測定した source hash は layout `509c84abf9ac089369e8ed18f92a0dd0fea754695f3ad35124a021e93a9880ca`、
+shaders `1e9f3de53af6ad0db3602b2dffce1cdc2a87671ab57f62efead3d486c8a535e4`、
+solver `151f3e05ebeb6233d9915b658ffe91b4908466e78fab2ff4c5d2d6e3584ad893`。
+GPU確保量は `221,564,392 byte`。storage buffer binding上限は8、現在の要求数以内。
+
+| 指標 | batch profile median / p95 | stages profile median / p95 |
+|---|---:|---:|
+| GPU step interval (ms/step) | 0.37094 / 0.37371 | 0.41262 / 0.42210 |
+| CPU encode/submit (ms/batch) | 0 / 0.10 | 0 / 0 |
+| queue completion wait (ms/batch) | 3.30 / 3.40 | 3.90 / 3.90 |
+| 計測pass数 / 8-step batch | 1 | 80 |
+
+CPU encode は `performance.now()` の時計分解能により0 msへ丸められるため、処理がゼロという意味ではない。
+stages profile はdispatchごとにcompute passを分ける診断経路で、通常batchよりGPU時間が増える。
+次表のstage中央値は独立したサンプルの統計値であり、合計をGPU step中央値と厳密に一致させない。
+
+| stage | median (ms/step) | p95 (ms/step) |
+|---|---:|---:|
+| clearGrid | 0.00806 | 0.00819 |
+| prepareParticles | 0.00697 | 0.00704 |
+| buildBuckets | 0.01064 | 0.01080 |
+| P2G | 0.03223 | 0.03323 |
+| buildTriangleField | 0.13918 | 0.13975 |
+| updateGrid | 0.01653 | 0.01681 |
+| G2P | 0.02277 | 0.02316 |
+| applyTriangleContactImpulses | 0.03664 | 0.03715 |
+| solveBondedTriangles | 0.10010 | 0.10094 |
+| commitParticles | 0.00517 | 0.00556 |
+
+最も大きい個別stageは全grid node×200三角形を候補走査する `buildTriangleField` と、
+小石同士を検査する `solveBondedTriangles`。AABB早期除外、contact impulse gather 範囲の縮小、
+field broad-phase の平方距離化を加えた。変更前後各１回の参考計測ではbatch medianが
+0.47325から0.37094 ms/step、SAT passが0.19493から0.10010 ms/stepへ変化したが、
+反復A/Bではないため改善率として確定しない。field走査のGPU spatial broad-phase、
+描画込みの実効時間倍率、他端末・長時間の性能は後続検討である。
+
+benchmark内の45粒子・５モデル／８ step回帰は最大絶対誤差`1.3955e-5`、
+batch/単発差0、pick・drag・clone・render・rollback・永続numerical statusを確認した。
+実画面の初回比較は各材料の局所sampleで、速度はCPU倍精度／GPU単精度差に合わせた
+absolute-plus-relative基準を用いる。１回のrandom-seed reloadでは最大絶対誤差`1.10e-2`で基準内。
+固定した５ seed の同じ局所CPU/GPU比較もすべて合格し、raw最大絶対差は`1.9063e-2`。
+三角形のGPU clone/readbackと、clone後の追加step・numerical statusも確認した。
+これは接触のscene-scale妥当性、長時間の形状保持、運動量残差の証明ではない。
 
 ## 6. 参照
 

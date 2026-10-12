@@ -11,14 +11,36 @@ struct Particle {
 	density: f32,
 	volume: f32,
 	frictionCoefficient: f32,
+	bondedTriangleVertex: u32,
 }
 
 struct GridNode {
 	mass: f32,
 	momentum: vec2<f32>,
 	velocity: vec2<f32>,
-	liquidMass: f32,
-	liquidVolume: f32,
+	waterMass: f32,
+	waterMomentum: vec2<f32>,
+	waterVelocity: vec2<f32>,
+	waterVolume: f32,
+	oilMass: f32,
+	oilMomentum: vec2<f32>,
+	oilVelocity: vec2<f32>,
+	oilVolume: f32,
+}
+
+struct TriangleFieldNode {
+	signedDistance: f32,
+	bodyStartPlusOne: u32,
+	normal: vec2<f32>,
+	barycentric: vec2<f32>,
+	impulse: vec2<f32>,
+}
+
+struct TriangleDistanceSample {
+	signedDistance: f32,
+	normal: vec2<f32>,
+	barycentric: vec2<f32>,
+	valid: u32,
 }
 
 struct SimulationParams {
@@ -27,6 +49,7 @@ struct SimulationParams {
 	physical: vec4<f32>,
 	material: vec4<f32>,
 	gravityAndDomain: vec4<f32>,
+	bonding: vec4<f32>,
 }
 
 struct InteractionParams {
@@ -42,6 +65,7 @@ struct PickParams {
 struct CloneParams {
 	rangeAndObjectId: vec4<u32>,
 	offsetAndDomain: vec4<f32>,
+	bondRangeAndCapacity: vec4<u32>,
 }
 
 const WALL_CUSHION_CELLS: f32 = 8.0;
@@ -61,6 +85,9 @@ const WALL_CUSHION_CELLS: f32 = 8.0;
 @group(0) @binding(12) var<storage, read_write> cloneObjectIds: array<u32>;
 @group(0) @binding(13) var<uniform> cloneParams: CloneParams;
 @group(0) @binding(14) var<storage, read_write> preparedAffines: array<vec4<f32>>;
+@group(0) @binding(15) var<storage, read_write> surfaceFields: array<vec2<f32>>;
+@group(0) @binding(16) var<storage, read_write> triangleFieldNodes: array<TriangleFieldNode>;
+@group(0) @binding(17) var<storage, read_write> bondedBodyStarts: array<u32>;
 
 const ERROR_STENCIL: u32 = 1u;
 const ERROR_DEFORMATION: u32 = 2u;
@@ -73,6 +100,13 @@ const ERROR_P2G_INVALID_MATERIAL: u32 = 128u;
 const ERROR_P2G_NONFINITE_PARTICLE: u32 = 256u;
 const ERROR_P2G_NONFINITE_ACCUMULATION: u32 = 1024u;
 const ERROR_P2G_NONFINITE_NODE: u32 = 2048u;
+const ERROR_TRIANGLE_CONTACT: u32 = 4096u;
+const ERROR_TRIANGLE_BOND: u32 = 8192u;
+const BONDED_TRIANGLE_SOLVER_ITERATIONS: u32 = 2u;
+const TRIANGLE_CONTACT_SKIN_CELLS: f32 = 0.1;
+const SURFACE_ERROR_BUCKET: u32 = 1u;
+const SURFACE_ERROR_PARTICLE_AREA: u32 = 2u;
+const SURFACE_ERROR_ACCUMULATION: u32 = 4u;
 const MODEL_NEO_HOOKEAN: u32 = 0u;
 const MODEL_SNOW: u32 = 1u;
 const MODEL_WATER: u32 = 2u;
@@ -310,6 +344,88 @@ fn confineAxis(
 	return vec2<f32>(nextPosition, velocity);
 }
 
+fn cross2(first: vec2<f32>, second: vec2<f32>) -> f32 {
+	return first.x * second.y - first.y * second.x;
+}
+
+fn closestPointOnSegment(
+	point: vec2<f32>,
+	start: vec2<f32>,
+	end: vec2<f32>,
+) -> vec3<f32> {
+	let edge = end - start;
+	let parameter = clamp(dot(point - start, edge) / dot(edge, edge), 0.0, 1.0);
+	return vec3<f32>(start + parameter * edge, parameter);
+}
+
+fn triangleDistanceSample(
+	point: vec2<f32>,
+	first: vec2<f32>,
+	second: vec2<f32>,
+	third: vec2<f32>,
+) -> TriangleDistanceSample {
+	let signedArea = cross2(second - first, third - first);
+	if (!finiteFloat(signedArea) || abs(signedArea) <= 1e-7) {
+		return TriangleDistanceSample(0.0, vec2<f32>(0.0), vec2<f32>(0.0), 0u);
+	}
+
+	let closestFirstSecond = closestPointOnSegment(point, first, second);
+	let closestSecondThird = closestPointOnSegment(point, second, third);
+	let closestThirdFirst = closestPointOnSegment(point, third, first);
+	var closestPoint = closestFirstSecond.xy;
+	var closestEdge = second - first;
+	var barycentric = vec2<f32>(closestFirstSecond.z, 0.0);
+	var distanceSquared = dot(point - closestPoint, point - closestPoint);
+	let secondThirdDistanceSquared =
+		dot(point - closestSecondThird.xy, point - closestSecondThird.xy);
+	if (secondThirdDistanceSquared < distanceSquared) {
+		closestPoint = closestSecondThird.xy;
+		closestEdge = third - second;
+		barycentric = vec2<f32>(1.0 - closestSecondThird.z, closestSecondThird.z);
+		distanceSquared = secondThirdDistanceSquared;
+	}
+	let thirdFirstDistanceSquared =
+		dot(point - closestThirdFirst.xy, point - closestThirdFirst.xy);
+	if (thirdFirstDistanceSquared < distanceSquared) {
+		closestPoint = closestThirdFirst.xy;
+		closestEdge = first - third;
+		barycentric = vec2<f32>(0.0, 1.0 - closestThirdFirst.z);
+		distanceSquared = thirdFirstDistanceSquared;
+	}
+
+	let sideFirst = cross2(second - first, point - first);
+	let sideSecond = cross2(third - second, point - second);
+	let sideThird = cross2(first - third, point - third);
+	let inside =
+		(signedArea > 0.0 &&
+			sideFirst >= -1e-6 &&
+			sideSecond >= -1e-6 &&
+			sideThird >= -1e-6) ||
+		(signedArea < 0.0 &&
+			sideFirst <= 1e-6 &&
+			sideSecond <= 1e-6 &&
+			sideThird <= 1e-6);
+	let distance = sqrt(max(0.0, distanceSquared));
+	var normal = vec2<f32>(closestEdge.y, -closestEdge.x);
+	if (signedArea < 0.0) {
+		normal = -normal;
+	}
+	let normalLength = length(normal);
+	if (normalLength <= 1e-8 || !finiteFloat(distance) || !finiteFloat(normalLength)) {
+		return TriangleDistanceSample(0.0, vec2<f32>(0.0), vec2<f32>(0.0), 0u);
+	}
+	normal = normal / normalLength;
+	if (!inside && distance > 1e-8) {
+		normal = (point - closestPoint) / distance;
+	}
+	return TriangleDistanceSample(
+		select(distance, -distance, inside),
+		normal,
+		barycentric,
+		1u,
+	);
+}
+
 @compute @workgroup_size(64)
 fn clearGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	let index = invocation.x;
@@ -320,8 +436,19 @@ fn clearGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	gridNodes[index].mass = 0.0;
 	gridNodes[index].momentum = vec2<f32>(0.0, 0.0);
 	gridNodes[index].velocity = vec2<f32>(0.0, 0.0);
-	gridNodes[index].liquidMass = 0.0;
-	gridNodes[index].liquidVolume = 0.0;
+	gridNodes[index].waterMass = 0.0;
+	gridNodes[index].waterMomentum = vec2<f32>(0.0, 0.0);
+	gridNodes[index].waterVelocity = vec2<f32>(0.0, 0.0);
+	gridNodes[index].waterVolume = 0.0;
+	gridNodes[index].oilMass = 0.0;
+	gridNodes[index].oilMomentum = vec2<f32>(0.0, 0.0);
+	gridNodes[index].oilVelocity = vec2<f32>(0.0, 0.0);
+	gridNodes[index].oilVolume = 0.0;
+	triangleFieldNodes[index].signedDistance = params.bonding.z;
+	triangleFieldNodes[index].bodyStartPlusOne = 0u;
+	triangleFieldNodes[index].normal = vec2<f32>(0.0, 0.0);
+	triangleFieldNodes[index].barycentric = vec2<f32>(0.0, 0.0);
+	triangleFieldNodes[index].impulse = vec2<f32>(0.0, 0.0);
 }
 
 @compute @workgroup_size(64)
@@ -359,6 +486,113 @@ fn buildBuckets(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			bucketNext[pairIndex] = previousHead;
 		}
 	}
+}
+
+@compute @workgroup_size(64)
+fn clearSurfaceOccupancy(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let index = invocation.x;
+	if (index >= params.counts.y) {
+		return;
+	}
+	atomicStore(&bucketHeads[index], -1);
+	surfaceFields[index] = vec2<f32>(0.0, 0.0);
+}
+
+@compute @workgroup_size(64)
+fn gatherSurfaceOccupancy(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let nodeIndex = invocation.x;
+	if (
+		nodeIndex >= params.counts.y ||
+		atomicLoad(&stateError[0]) != 0u ||
+		atomicLoad(&stateError[7]) != 0u
+	) {
+		return;
+	}
+
+	var waterArea = 0.0;
+	var oilArea = 0.0;
+	var entry = atomicLoad(&bucketHeads[nodeIndex]);
+	var visited = 0u;
+
+	loop {
+		if (entry == -1) {
+			break;
+		}
+		if (entry < -1 || visited >= params.counts.x) {
+			atomicOr(&stateError[7], SURFACE_ERROR_BUCKET);
+			return;
+		}
+		let pairIndex = u32(entry);
+		if (pairIndex >= params.counts.z) {
+			atomicOr(&stateError[7], SURFACE_ERROR_BUCKET);
+			return;
+		}
+		let particleIndex = pairIndex / 9u;
+		if (particleIndex >= params.counts.x) {
+			atomicOr(&stateError[7], SURFACE_ERROR_BUCKET);
+			return;
+		}
+
+		let supportIndex = pairIndex % 9u;
+		let ox = supportIndex % 3u;
+		let oy = supportIndex / 3u;
+		let particle = particlesIn[particleIndex];
+		if (
+			particle.materialModel == MODEL_WATER ||
+			particle.materialModel == MODEL_OIL
+		) {
+			let gridPosition = particle.position / params.physical.x;
+			if (!finiteVec2(gridPosition)) {
+				atomicOr(&stateError[7], SURFACE_ERROR_PARTICLE_AREA);
+				return;
+			}
+			let base = vec2<i32>(floor(gridPosition - vec2<f32>(0.5, 0.5)));
+			let fraction = gridPosition - vec2<f32>(base);
+			let weightsX = quadraticWeights(fraction.x);
+			let weightsY = quadraticWeights(fraction.y);
+			let weight = weightsX[ox] * weightsY[oy];
+			let supportNode = base + vec2<i32>(i32(ox), i32(oy));
+			if (!stencilFitsHalo(base) || gridIndex(supportNode) != nodeIndex) {
+				atomicOr(&stateError[7], SURFACE_ERROR_BUCKET);
+				return;
+			}
+
+			let determinant = particle.f.x * particle.f.w - particle.f.y * particle.f.z;
+			let currentArea = particle.volume * determinant;
+			let normalizedArea = currentArea * weight /
+				(params.physical.x * params.physical.x);
+			if (
+				!finiteFloat(determinant) ||
+				determinant <= 0.0 ||
+				!finiteFloat(particle.volume) ||
+				particle.volume <= 0.0 ||
+				!finiteFloat(currentArea) ||
+				currentArea <= 0.0 ||
+				!finiteFloat(weight) ||
+				weight < 0.0 ||
+				!finiteFloat(normalizedArea) ||
+				normalizedArea < 0.0
+			) {
+				atomicOr(&stateError[7], SURFACE_ERROR_PARTICLE_AREA);
+				return;
+			}
+
+			if (particle.materialModel == MODEL_WATER) {
+				waterArea = waterArea + normalizedArea;
+			} else {
+				oilArea = oilArea + normalizedArea;
+			}
+			if (!finiteFloat(waterArea) || !finiteFloat(oilArea)) {
+				atomicOr(&stateError[7], SURFACE_ERROR_ACCUMULATION);
+				return;
+			}
+		}
+
+		entry = bucketNext[pairIndex];
+		visited = visited + 1u;
+	}
+
+	surfaceFields[nodeIndex] = vec2<f32>(waterArea, oilArea);
 }
 
 @compute @workgroup_size(64)
@@ -505,10 +739,14 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		return;
 	}
 
-	var mass = 0.0;
-	var momentum = vec2<f32>(0.0, 0.0);
-	var liquidMass = 0.0;
-	var liquidVolume = 0.0;
+	var solidMass = 0.0;
+	var solidMomentum = vec2<f32>(0.0, 0.0);
+	var waterMass = 0.0;
+	var waterMomentum = vec2<f32>(0.0, 0.0);
+	var waterVolume = 0.0;
+	var oilMass = 0.0;
+	var oilMomentum = vec2<f32>(0.0, 0.0);
+	var oilVolume = 0.0;
 	var entry = atomicLoad(&bucketHeads[nodeIndex]);
 	var visited = 0u;
 
@@ -582,21 +820,29 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 
 		let weightedMass = weight * particleMass;
 		let weightedMomentum = weight * particleMomentum;
-		mass = mass + weightedMass;
-		momentum = momentum + weightedMomentum;
-		if (
-			particle.materialModel == MODEL_WATER ||
-			particle.materialModel == MODEL_OIL
-		) {
+		if (particle.materialModel == MODEL_WATER) {
 			let determinant = particle.f.x * particle.f.w - particle.f.y * particle.f.z;
-			liquidMass = liquidMass + weightedMass;
-			liquidVolume = liquidVolume + weight * particle.volume * determinant;
+			waterMass = waterMass + weightedMass;
+			waterMomentum = waterMomentum + weightedMomentum;
+			waterVolume = waterVolume + weight * particle.volume * determinant;
+		} else if (particle.materialModel == MODEL_OIL) {
+			let determinant = particle.f.x * particle.f.w - particle.f.y * particle.f.z;
+			oilMass = oilMass + weightedMass;
+			oilMomentum = oilMomentum + weightedMomentum;
+			oilVolume = oilVolume + weight * particle.volume * determinant;
+		} else {
+			solidMass = solidMass + weightedMass;
+			solidMomentum = solidMomentum + weightedMomentum;
 		}
 		if (
-			!finiteFloat(mass) ||
-			!finiteVec2(momentum) ||
-			!finiteFloat(liquidMass) ||
-			!finiteFloat(liquidVolume)
+			!finiteFloat(solidMass) ||
+			!finiteVec2(solidMomentum) ||
+			!finiteFloat(waterMass) ||
+			!finiteVec2(waterMomentum) ||
+			!finiteFloat(waterVolume) ||
+			!finiteFloat(oilMass) ||
+			!finiteVec2(oilMomentum) ||
+			!finiteFloat(oilVolume)
 		) {
 			atomicMin(&stateError[1], particleIndex);
 			atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_NONFINITE_ACCUMULATION);
@@ -606,15 +852,69 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		visited = visited + 1u;
 	}
 
-	if (!finiteFloat(mass) || !finiteVec2(momentum)) {
+	if (!finiteFloat(solidMass) || !finiteVec2(solidMomentum)) {
 		atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_NONFINITE_NODE);
 		return;
 	}
-	gridNodes[nodeIndex].mass = mass;
-	gridNodes[nodeIndex].momentum = momentum;
+	gridNodes[nodeIndex].mass = solidMass;
+	gridNodes[nodeIndex].momentum = solidMomentum;
 	gridNodes[nodeIndex].velocity = vec2<f32>(0.0, 0.0);
-	gridNodes[nodeIndex].liquidMass = liquidMass;
-	gridNodes[nodeIndex].liquidVolume = liquidVolume;
+	gridNodes[nodeIndex].waterMass = waterMass;
+	gridNodes[nodeIndex].waterMomentum = waterMomentum;
+	gridNodes[nodeIndex].waterVolume = waterVolume;
+	gridNodes[nodeIndex].oilMass = oilMass;
+	gridNodes[nodeIndex].oilMomentum = oilMomentum;
+	gridNodes[nodeIndex].oilVolume = oilVolume;
+}
+
+@compute @workgroup_size(64)
+fn buildTriangleField(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let index = invocation.x;
+	if (index >= params.counts.y || atomicLoad(&stateError[0]) != 0u) {
+		return;
+	}
+	let nodeStorage = vec2<u32>(index % params.grid.z, index / params.grid.z);
+	let nodeCoordinate = vec2<i32>(i32(nodeStorage.x) - 1, i32(nodeStorage.y) - 1);
+	let point = vec2<f32>(nodeCoordinate) * params.physical.x;
+	var bestDistance = params.bonding.z;
+	var bestBodyStartPlusOne = 0u;
+	var bestNormal = vec2<f32>(0.0, 0.0);
+	var bestBarycentric = vec2<f32>(0.0, 0.0);
+
+	for (var bodyIndex = 0u; bodyIndex < params.counts.w; bodyIndex += 1u) {
+		let bodyStart = bondedBodyStarts[bodyIndex];
+		if (bodyStart + 2u >= params.counts.x) {
+			atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
+			return;
+		}
+		let first = particlesIn[bodyStart].position;
+		let second = particlesIn[bodyStart + 1u].position;
+		let third = particlesIn[bodyStart + 2u].position;
+		let minimum = min(first, min(second, third));
+		let maximum = max(first, max(second, third));
+		let outside = max(max(minimum - point, vec2<f32>(0.0)), point - maximum);
+		if (dot(outside, outside) > params.bonding.z * params.bonding.z) {
+			continue;
+		}
+
+		let sample = triangleDistanceSample(point, first, second, third);
+		if (sample.valid == 0u) {
+			atomicMin(&stateError[1], bodyStart);
+			atomicOr(&stateError[0], ERROR_TRIANGLE_CONTACT);
+			return;
+		}
+		if (sample.signedDistance < bestDistance) {
+			bestDistance = sample.signedDistance;
+			bestBodyStartPlusOne = bodyStart + 1u;
+			bestNormal = sample.normal;
+			bestBarycentric = sample.barycentric;
+		}
+	}
+	triangleFieldNodes[index].signedDistance = bestDistance;
+	triangleFieldNodes[index].bodyStartPlusOne = bestBodyStartPlusOne;
+	triangleFieldNodes[index].normal = bestNormal;
+	triangleFieldNodes[index].barycentric = bestBarycentric;
+	triangleFieldNodes[index].impulse = vec2<f32>(0.0, 0.0);
 }
 
 fn applyWallCushion(velocity: f32, coordinate: i32, extent: i32) -> f32 {
@@ -658,26 +958,174 @@ fn updateGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		return;
 	}
 
-	let mass = gridNodes[index].mass;
-	if (!finiteFloat(mass) || mass < 0.0) {
-		atomicOr(&stateError[0], ERROR_GRID);
-		return;
-	}
-	if (mass <= 0.0) {
-		gridNodes[index].velocity = vec2<f32>(0.0, 0.0);
-		return;
-	}
-
-	var velocity =
-		gridNodes[index].momentum / mass +
-		params.physical.w * params.gravityAndDomain.xy;
-	if (!finiteVec2(velocity)) {
-		atomicOr(&stateError[0], ERROR_GRID);
-		return;
-	}
-
 	let nodeStorage = vec2<u32>(index % params.grid.z, index / params.grid.z);
 	let nodeCoordinate = vec2<i32>(i32(nodeStorage.x) - 1, i32(nodeStorage.y) - 1);
+	var solidMass = gridNodes[index].mass;
+	var solidMomentum = gridNodes[index].momentum;
+	var waterMass = gridNodes[index].waterMass;
+	var waterMomentum = gridNodes[index].waterMomentum;
+	var waterVolume = gridNodes[index].waterVolume;
+	var oilMass = gridNodes[index].oilMass;
+	var oilMomentum = gridNodes[index].oilMomentum;
+	var oilVolume = gridNodes[index].oilVolume;
+	if (
+		!finiteFloat(solidMass) ||
+		solidMass < 0.0 ||
+		!finiteVec2(solidMomentum) ||
+		!finiteFloat(waterMass) ||
+		waterMass < 0.0 ||
+		!finiteVec2(waterMomentum) ||
+		!finiteFloat(waterVolume) ||
+		waterVolume < 0.0 ||
+		!finiteFloat(oilMass) ||
+		oilMass < 0.0 ||
+		!finiteVec2(oilMomentum) ||
+		!finiteFloat(oilVolume) ||
+		oilVolume < 0.0
+	) {
+		atomicOr(&stateError[0], ERROR_GRID);
+		return;
+	}
+
+	var solidVelocity = finishGridVelocity(solidMass, solidMomentum, nodeCoordinate);
+	var waterVelocity = finishGridVelocity(waterMass, waterMomentum, nodeCoordinate);
+	var oilVelocity = finishGridVelocity(oilMass, oilMomentum, nodeCoordinate);
+	if (
+		nodeCoordinate.x >= 0 &&
+		nodeCoordinate.y >= 0 &&
+		nodeCoordinate.x <= i32(params.grid.x) &&
+		nodeCoordinate.y <= i32(params.grid.y) &&
+		waterMass > 0.0 &&
+		oilMass > 0.0 &&
+		waterVolume > 0.0 &&
+		oilVolume > 0.0
+	) {
+		let waterGradient = phaseVolumeGradient(nodeCoordinate, 0u);
+		let oilGradient = phaseVolumeGradient(nodeCoordinate, 1u);
+		let separation = oilGradient - waterGradient;
+		let separationLength = length(separation);
+		if (finiteFloat(separationLength) && separationLength > 1e-8) {
+			let normal = separation / separationLength;
+			let relativeNormalVelocity = dot(oilVelocity - waterVelocity, normal);
+			if (relativeNormalVelocity < 0.0) {
+				let impulseMagnitude =
+					-relativeNormalVelocity / (1.0 / waterMass + 1.0 / oilMass);
+				let impulse = impulseMagnitude * normal;
+				waterVelocity = waterVelocity - impulse / waterMass;
+				oilVelocity = oilVelocity + impulse / oilMass;
+			}
+		}
+	}
+
+	var field = triangleFieldNodes[index];
+	if (field.bodyStartPlusOne != 0u && field.signedDistance <= params.bonding.w) {
+		let bodyStart = field.bodyStartPlusOne - 1u;
+		if (bodyStart + 2u >= params.counts.x) {
+			atomicOr(&stateError[0], ERROR_TRIANGLE_CONTACT);
+			return;
+		}
+		let first = particlesIn[bodyStart];
+		let second = particlesIn[bodyStart + 1u];
+		let third = particlesIn[bodyStart + 2u];
+		let barycentric = vec3<f32>(
+			1.0 - field.barycentric.x - field.barycentric.y,
+			field.barycentric.x,
+			field.barycentric.y,
+		);
+		let surfaceVelocity =
+			barycentric.x * first.velocity +
+			barycentric.y * second.velocity +
+			barycentric.z * third.velocity;
+		let inverseBodyMass =
+			dot(barycentric, barycentric) / params.physical.y;
+		let normalLength = length(field.normal);
+		if (
+			!finiteVec2(surfaceVelocity) ||
+			!finiteFloat(inverseBodyMass) ||
+			inverseBodyMass <= 0.0 ||
+			!finiteFloat(normalLength) ||
+			normalLength <= 1e-8
+		) {
+			atomicOr(&stateError[0], ERROR_TRIANGLE_CONTACT);
+			return;
+		}
+		let normal = field.normal / normalLength;
+		if (waterMass > 0.0 && waterVolume > 0.0) {
+			let relativeNormalVelocity = dot(waterVelocity - surfaceVelocity, normal);
+			if (relativeNormalVelocity < 0.0) {
+				let impulseMagnitude =
+					-relativeNormalVelocity / (1.0 / waterMass + inverseBodyMass);
+				let impulse = impulseMagnitude * normal;
+				waterVelocity = waterVelocity + impulse / waterMass;
+				field.impulse = field.impulse - impulse;
+			}
+		}
+		if (oilMass > 0.0 && oilVolume > 0.0) {
+			let relativeNormalVelocity = dot(oilVelocity - surfaceVelocity, normal);
+			if (relativeNormalVelocity < 0.0) {
+				let impulseMagnitude =
+					-relativeNormalVelocity / (1.0 / oilMass + inverseBodyMass);
+				let impulse = impulseMagnitude * normal;
+				oilVelocity = oilVelocity + impulse / oilMass;
+				field.impulse = field.impulse - impulse;
+			}
+		}
+	}
+
+	if (
+		!finiteVec2(solidVelocity) ||
+		!finiteVec2(waterVelocity) ||
+		!finiteVec2(oilVelocity) ||
+		!finiteVec2(field.impulse)
+	) {
+		atomicOr(&stateError[0], ERROR_GRID | ERROR_TRIANGLE_CONTACT);
+		return;
+	}
+	solidVelocity.x = applyWallCushion(
+		solidVelocity.x,
+		nodeCoordinate.x,
+		i32(params.grid.x),
+	);
+	solidVelocity.y = applyWallCushion(
+		solidVelocity.y,
+		nodeCoordinate.y,
+		i32(params.grid.y),
+	);
+	waterVelocity.x = applyWallCushion(
+		waterVelocity.x,
+		nodeCoordinate.x,
+		i32(params.grid.x),
+	);
+	waterVelocity.y = applyWallCushion(
+		waterVelocity.y,
+		nodeCoordinate.y,
+		i32(params.grid.y),
+	);
+	oilVelocity.x = applyWallCushion(
+		oilVelocity.x,
+		nodeCoordinate.x,
+		i32(params.grid.x),
+	);
+	oilVelocity.y = applyWallCushion(
+		oilVelocity.y,
+		nodeCoordinate.y,
+		i32(params.grid.y),
+	);
+	gridNodes[index].velocity = solidVelocity;
+	gridNodes[index].waterVelocity = waterVelocity;
+	gridNodes[index].oilVelocity = oilVelocity;
+	triangleFieldNodes[index].impulse = field.impulse;
+}
+
+fn finishGridVelocity(
+	mass: f32,
+	momentum: vec2<f32>,
+	nodeCoordinate: vec2<i32>,
+) -> vec2<f32> {
+	if (mass <= 0.0) {
+		return vec2<f32>(0.0, 0.0);
+	}
+	var velocity = momentum / mass + params.physical.w * params.gravityAndDomain.xy;
 	let dragRadius = interactionParams.targetAndRadius.z;
 	if (
 		dragRadius > 0.0 &&
@@ -701,13 +1149,183 @@ fn updateGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			}
 		}
 	}
-	if (!finiteVec2(velocity)) {
-		atomicOr(&stateError[0], ERROR_GRID);
-		return;
+	return velocity;
+}
+
+fn volumeAtNode(nodeCoordinate: vec2<i32>, phase: u32) -> f32 {
+	if (
+		nodeCoordinate.x < -1 ||
+		nodeCoordinate.y < -1 ||
+		nodeCoordinate.x > i32(params.grid.x + 1u) ||
+		nodeCoordinate.y > i32(params.grid.y + 1u)
+	) {
+		return 0.0;
 	}
-	velocity.x = applyWallCushion(velocity.x, nodeCoordinate.x, i32(params.grid.x));
-	velocity.y = applyWallCushion(velocity.y, nodeCoordinate.y, i32(params.grid.y));
-	gridNodes[index].velocity = velocity;
+	let node = gridNodes[gridIndex(nodeCoordinate)];
+	return select(node.waterVolume, node.oilVolume, phase == 1u);
+}
+
+fn phaseVolumeGradient(nodeCoordinate: vec2<i32>, phase: u32) -> vec2<f32> {
+	return vec2<f32>(
+		volumeAtNode(nodeCoordinate + vec2<i32>(1, 0), phase) -
+			volumeAtNode(nodeCoordinate - vec2<i32>(1, 0), phase),
+		volumeAtNode(nodeCoordinate + vec2<i32>(0, 1), phase) -
+			volumeAtNode(nodeCoordinate - vec2<i32>(0, 1), phase),
+	);
+}
+
+fn projectLiquidFromTriangles(position: vec2<f32>, radius: f32) -> vec2<f32> {
+	let gridPosition = position / params.physical.x;
+	let base = vec2<i32>(floor(gridPosition - vec2<f32>(0.5, 0.5)));
+	let fraction = gridPosition - vec2<f32>(base);
+	let weightsX = quadraticWeights(fraction.x);
+	let weightsY = quadraticWeights(fraction.y);
+	var signedDistance = 0.0;
+	var closestDistance = 3.402823466e38;
+	var bodyStartPlusOne = 0u;
+	var selectedNormal = vec2<f32>(0.0, 0.0);
+	for (var y = 0u; y < 3u; y += 1u) {
+		for (var x = 0u; x < 3u; x += 1u) {
+			let node = base + vec2<i32>(i32(x), i32(y));
+			let field = triangleFieldNodes[gridIndex(node)];
+			let weight = weightsX[x] * weightsY[y];
+			signedDistance += weight * field.signedDistance;
+			if (
+				field.bodyStartPlusOne != 0u &&
+				field.signedDistance < closestDistance
+			) {
+				closestDistance = field.signedDistance;
+				bodyStartPlusOne = field.bodyStartPlusOne;
+				selectedNormal = field.normal;
+			}
+		}
+	}
+	if (bodyStartPlusOne != 0u) {
+		var normal = vec2<f32>(0.0, 0.0);
+		for (var y = 0u; y < 3u; y += 1u) {
+			for (var x = 0u; x < 3u; x += 1u) {
+				let node = base + vec2<i32>(i32(x), i32(y));
+				let field = triangleFieldNodes[gridIndex(node)];
+				if (field.bodyStartPlusOne == bodyStartPlusOne) {
+					normal += weightsX[x] * weightsY[y] * field.normal;
+				}
+			}
+		}
+		let normalLength = length(normal);
+		if (!finiteFloat(normalLength) || normalLength <= 1e-8) {
+			normal = selectedNormal;
+		} else {
+			normal = normal / normalLength;
+		}
+		if (
+			!finiteFloat(signedDistance) ||
+			signedDistance >= radius ||
+			!finiteVec2(normal)
+		) {
+			return position;
+		}
+		return position + (radius - signedDistance) * normal;
+	}
+	return position;
+}
+
+fn bondEdgeCorrection(
+	first: vec2<f32>,
+	second: vec2<f32>,
+	restLength: f32,
+	stiffness: f32,
+) -> vec3<f32> {
+	let difference = second - first;
+	let distance = length(difference);
+	if (!finiteFloat(distance) || distance <= 1e-10) {
+		return vec3<f32>(0.0, 0.0, 0.0);
+	}
+	return vec3<f32>(
+		difference * ((distance - restLength) * stiffness * 0.5 / distance),
+		1.0,
+	);
+}
+
+fn trianglePairContact(
+	firstA: vec2<f32>,
+	secondA: vec2<f32>,
+	thirdA: vec2<f32>,
+	firstB: vec2<f32>,
+	secondB: vec2<f32>,
+	thirdB: vec2<f32>,
+	skin: f32,
+) -> vec3<f32> {
+	let edges = array<vec2<f32>, 6>(
+		secondA - firstA,
+		thirdA - secondA,
+		firstA - thirdA,
+		secondB - firstB,
+		thirdB - secondB,
+		firstB - thirdB,
+	);
+	var axes = array<vec2<f32>, 6>(
+		vec2<f32>(0.0),
+		vec2<f32>(0.0),
+		vec2<f32>(0.0),
+		vec2<f32>(0.0),
+		vec2<f32>(0.0),
+		vec2<f32>(0.0),
+	);
+	for (var axisIndex = 0u; axisIndex < 6u; axisIndex += 1u) {
+		let edgeLength = length(edges[axisIndex]);
+		if (!finiteFloat(edgeLength) || edgeLength <= 1e-10) {
+			return vec3<f32>(0.0, 0.0, 0.0);
+		}
+		axes[axisIndex] =
+			vec2<f32>(edges[axisIndex].y, -edges[axisIndex].x) / edgeLength;
+	}
+
+	var separated = false;
+	var largestGap = -3.402823466e38;
+	var smallestOverlap = 3.402823466e38;
+	var contactAxis = vec2<f32>(0.0, 0.0);
+	for (var axisIndex = 0u; axisIndex < 6u; axisIndex += 1u) {
+		let axis = axes[axisIndex];
+		let minA = min(
+			dot(firstA, axis),
+			min(dot(secondA, axis), dot(thirdA, axis)),
+		);
+		let maxA = max(
+			dot(firstA, axis),
+			max(dot(secondA, axis), dot(thirdA, axis)),
+		);
+		let minB = min(
+			dot(firstB, axis),
+			min(dot(secondB, axis), dot(thirdB, axis)),
+		);
+		let maxB = max(
+			dot(firstB, axis),
+			max(dot(secondB, axis), dot(thirdB, axis)),
+		);
+		let gap = max(minB - maxA, minA - maxB);
+		if (gap > 0.0) {
+			separated = true;
+			if (gap > largestGap) {
+				largestGap = gap;
+				contactAxis = axis;
+			}
+		} else if (!separated && -gap < smallestOverlap) {
+			smallestOverlap = -gap;
+			contactAxis = axis;
+		}
+	}
+	if (separated && largestGap > skin) {
+		return vec3<f32>(0.0, 0.0, 0.0);
+	}
+	let centerDelta = (firstA + secondA + thirdA - firstB - secondB - thirdB) / 3.0;
+	if (dot(centerDelta, contactAxis) < 0.0) {
+		contactAxis = -contactAxis;
+	}
+	let penetration = select(skin + smallestOverlap, skin - largestGap, separated);
+	if (!finiteFloat(penetration) || penetration <= 0.0) {
+		return vec3<f32>(0.0, 0.0, 0.0);
+	}
+	return vec3<f32>(contactAxis, penetration);
 }
 
 @compute @workgroup_size(64)
@@ -735,13 +1353,13 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	let fraction = gridPosition - vec2<f32>(base);
 	let weightsX = quadraticWeights(fraction.x);
 	let weightsY = quadraticWeights(fraction.y);
-	let isLiquidParticle =
-		particle.materialModel == MODEL_WATER ||
-		particle.materialModel == MODEL_OIL;
+	let isWaterParticle = particle.materialModel == MODEL_WATER;
+	let isOilParticle = particle.materialModel == MODEL_OIL;
+	let isLiquidParticle = isWaterParticle || isOilParticle;
 	var velocity = vec2<f32>(0.0, 0.0);
 	var affine = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-	var liquidMass = 0.0;
-	var liquidVolume = 0.0;
+	var phaseMass = 0.0;
+	var phaseVolume = 0.0;
 
 	for (var oy = 0u; oy < 3u; oy = oy + 1u) {
 		for (var ox = 0u; ox < 3u; ox = ox + 1u) {
@@ -754,7 +1372,12 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			let weight = weightsX[ox] * weightsY[oy];
 			let dpos =
 				(vec2<f32>(f32(ox), f32(oy)) - fraction) * params.physical.x;
-			let gridVelocity = gridNodes[nodeIndex].velocity;
+			var gridVelocity = gridNodes[nodeIndex].velocity;
+			if (isWaterParticle) {
+				gridVelocity = gridNodes[nodeIndex].waterVelocity;
+			} else if (isOilParticle) {
+				gridVelocity = gridNodes[nodeIndex].oilVelocity;
+			}
 			if (
 				!finiteFloat(weight) ||
 				weight < 0.0 ||
@@ -766,20 +1389,22 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			}
 			velocity = velocity + weight * gridVelocity;
 			if (isLiquidParticle) {
-				let nodeLiquidMass = gridNodes[nodeIndex].liquidMass;
-				let nodeLiquidVolume = gridNodes[nodeIndex].liquidVolume;
+				let nodePhaseMass =
+					gridNodes[nodeIndex].waterMass + gridNodes[nodeIndex].oilMass;
+				let nodePhaseVolume =
+					gridNodes[nodeIndex].waterVolume + gridNodes[nodeIndex].oilVolume;
 				if (
-					!finiteFloat(nodeLiquidMass) ||
-					nodeLiquidMass < 0.0 ||
-					!finiteFloat(nodeLiquidVolume) ||
-					nodeLiquidVolume < 0.0
+					!finiteFloat(nodePhaseMass) ||
+					nodePhaseMass < 0.0 ||
+					!finiteFloat(nodePhaseVolume) ||
+					nodePhaseVolume < 0.0
 				) {
 					atomicMin(&stateError[1], particleIndex);
 					atomicOr(&stateError[0], ERROR_G2P);
 					return;
 				}
-				liquidMass = liquidMass + weight * nodeLiquidMass;
-				liquidVolume = liquidVolume + weight * nodeLiquidVolume;
+				phaseMass = phaseMass + weight * nodePhaseMass;
+				phaseVolume = phaseVolume + weight * nodePhaseVolume;
 			}
 			affine = affine + vec4<f32>(
 				weight * gridVelocity.x * dpos.x,
@@ -793,10 +1418,10 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	if (isLiquidParticle) {
 		let particleDeterminant = particle.f.x * particle.f.w - particle.f.y * particle.f.z;
 		if (
-			!finiteFloat(liquidMass) ||
-			liquidMass <= 0.0 ||
-			!finiteFloat(liquidVolume) ||
-			liquidVolume <= 0.0 ||
+			!finiteFloat(phaseMass) ||
+			phaseMass <= 0.0 ||
+			!finiteFloat(phaseVolume) ||
+			phaseVolume <= 0.0 ||
 			!finiteFloat(particleDeterminant) ||
 			particleDeterminant <= 0.0
 		) {
@@ -805,7 +1430,7 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			return;
 		}
 		let particleDensity = particle.density / particleDeterminant;
-		let localDensity = liquidMass / liquidVolume;
+		let localDensity = phaseMass / phaseVolume;
 		let relativeDensity = (particleDensity - localDensity) / particleDensity;
 		let separationAcceleration = relativeDensity * params.gravityAndDomain.xy;
 		velocity = velocity + params.physical.w * separationAcceleration;
@@ -946,13 +1571,303 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		velocity.y,
 		params.gravityAndDomain.w,
 	);
+	var projectedPosition = vec2<f32>(boundedX.x, boundedY.x);
+	if (isLiquidParticle) {
+		let particleRadius = sqrt(particle.volume * updatedDeterminant / 3.14159265359);
+		if (!finiteFloat(particleRadius)) {
+			atomicMin(&stateError[1], particleIndex);
+			atomicOr(&stateError[0], ERROR_G2P);
+			return;
+		}
+		projectedPosition = projectLiquidFromTriangles(projectedPosition, particleRadius);
+	}
+	let finalX = confineAxis(
+		projectedPosition.x,
+		boundedX.y,
+		params.gravityAndDomain.z,
+	);
+	let finalY = confineAxis(
+		projectedPosition.y,
+		boundedY.y,
+		params.gravityAndDomain.w,
+	);
 	var updatedParticle = particle;
-	updatedParticle.position = vec2<f32>(boundedX.x, boundedY.x);
-	updatedParticle.velocity = vec2<f32>(boundedX.y, boundedY.y);
+	updatedParticle.position = vec2<f32>(finalX.x, finalY.x);
+	updatedParticle.velocity = vec2<f32>(finalX.y, finalY.y);
 	updatedParticle.c = updatedC;
 	updatedParticle.f = updatedF;
 	updatedParticle.plasticVolume = updatedPlasticVolume;
 	particlesOut[particleIndex] = updatedParticle;
+}
+
+@compute @workgroup_size(64)
+fn applyTriangleContactImpulses(
+	@builtin(global_invocation_id) invocation: vec3<u32>,
+) {
+	let bodyIndex = invocation.x;
+	if (bodyIndex >= params.counts.w || atomicLoad(&stateError[0]) != 0u) {
+		return;
+	}
+	let bodyStart = bondedBodyStarts[bodyIndex];
+	if (
+		bodyStart + 2u >= params.counts.x ||
+		particlesIn[bodyStart].bondedTriangleVertex != 1u ||
+		particlesIn[bodyStart + 1u].bondedTriangleVertex != 2u ||
+		particlesIn[bodyStart + 2u].bondedTriangleVertex != 3u
+	) {
+		atomicMin(&stateError[1], bodyStart);
+		atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
+		return;
+	}
+	let first = particlesIn[bodyStart].position;
+	let second = particlesIn[bodyStart + 1u].position;
+	let third = particlesIn[bodyStart + 2u].position;
+	let minimum = min(first, min(second, third)) - vec2<f32>(params.bonding.w);
+	let maximum = max(first, max(second, third)) + vec2<f32>(params.bonding.w);
+	let minimumNode = clamp(
+		vec2<i32>(floor(minimum / params.physical.x)),
+		vec2<i32>(-1),
+		vec2<i32>(i32(params.grid.x + 1u), i32(params.grid.y + 1u)),
+	);
+	let maximumNode = clamp(
+		vec2<i32>(ceil(maximum / params.physical.x)),
+		vec2<i32>(-1),
+		vec2<i32>(i32(params.grid.x + 1u), i32(params.grid.y + 1u)),
+	);
+	var impulseFirst = vec2<f32>(0.0, 0.0);
+	var impulseSecond = vec2<f32>(0.0, 0.0);
+	var impulseThird = vec2<f32>(0.0, 0.0);
+	for (var y = minimumNode.y; y <= maximumNode.y; y += 1) {
+		for (var x = minimumNode.x; x <= maximumNode.x; x += 1) {
+			let field = triangleFieldNodes[gridIndex(vec2<i32>(x, y))];
+			if (field.bodyStartPlusOne != bodyStart + 1u) {
+				continue;
+			}
+			let firstWeight = 1.0 - field.barycentric.x - field.barycentric.y;
+			impulseFirst += firstWeight * field.impulse;
+			impulseSecond += field.barycentric.x * field.impulse;
+			impulseThird += field.barycentric.y * field.impulse;
+		}
+	}
+	let inverseMass = 1.0 / params.physical.y;
+	let firstVelocity = particlesOut[bodyStart].velocity + inverseMass * impulseFirst;
+	let secondVelocity = particlesOut[bodyStart + 1u].velocity + inverseMass * impulseSecond;
+	let thirdVelocity = particlesOut[bodyStart + 2u].velocity + inverseMass * impulseThird;
+	if (
+		!finiteVec2(firstVelocity) ||
+		!finiteVec2(secondVelocity) ||
+		!finiteVec2(thirdVelocity)
+	) {
+		atomicMin(&stateError[1], bodyStart);
+		atomicOr(&stateError[0], ERROR_TRIANGLE_CONTACT);
+		return;
+	}
+	particlesOut[bodyStart].velocity = firstVelocity;
+	particlesOut[bodyStart + 1u].velocity = secondVelocity;
+	particlesOut[bodyStart + 2u].velocity = thirdVelocity;
+}
+
+@compute @workgroup_size(64)
+fn solveBondedTriangles(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let bodyIndex = invocation.x;
+	if (bodyIndex >= params.counts.w || atomicLoad(&stateError[0]) != 0u) {
+		return;
+	}
+	let bodyStart = bondedBodyStarts[bodyIndex];
+	if (
+		bodyStart + 2u >= params.counts.x ||
+		particlesIn[bodyStart].bondedTriangleVertex != 1u ||
+		particlesIn[bodyStart + 1u].bondedTriangleVertex != 2u ||
+		particlesIn[bodyStart + 2u].bondedTriangleVertex != 3u
+	) {
+		atomicMin(&stateError[1], bodyStart);
+		atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
+		return;
+	}
+	var first = particlesOut[bodyStart];
+	var second = particlesOut[bodyStart + 1u];
+	var third = particlesOut[bodyStart + 2u];
+	let originalFirst = first.position;
+	let originalSecond = second.position;
+	let originalThird = third.position;
+	var firstPosition = originalFirst;
+	var secondPosition = originalSecond;
+	var thirdPosition = originalThird;
+	for (
+		var iteration = 0u;
+		iteration < BONDED_TRIANGLE_SOLVER_ITERATIONS;
+		iteration += 1u
+	) {
+		let firstEdge = bondEdgeCorrection(
+			firstPosition,
+			secondPosition,
+			params.bonding.x,
+			params.bonding.y,
+		);
+		if (firstEdge.z == 0.0) {
+			atomicMin(&stateError[1], bodyStart);
+			atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
+			return;
+		}
+		firstPosition += firstEdge.xy;
+		secondPosition -= firstEdge.xy;
+
+		let secondEdge = bondEdgeCorrection(
+			secondPosition,
+			thirdPosition,
+			params.bonding.x,
+			params.bonding.y,
+		);
+		if (secondEdge.z == 0.0) {
+			atomicMin(&stateError[1], bodyStart);
+			atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
+			return;
+		}
+		secondPosition += secondEdge.xy;
+		thirdPosition -= secondEdge.xy;
+
+		let thirdEdge = bondEdgeCorrection(
+			thirdPosition,
+			firstPosition,
+			params.bonding.x,
+			params.bonding.y,
+		);
+		if (thirdEdge.z == 0.0) {
+			atomicMin(&stateError[1], bodyStart);
+			atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
+			return;
+		}
+		thirdPosition += thirdEdge.xy;
+		firstPosition -= thirdEdge.xy;
+	}
+
+	let inverseDt = 1.0 / params.physical.w;
+	let bondedPositions = array<vec2<f32>, 3>(
+		firstPosition,
+		secondPosition,
+		thirdPosition,
+	);
+	let originalPositions = array<vec2<f32>, 3>(
+		originalFirst,
+		originalSecond,
+		originalThird,
+	);
+	var particles = array<Particle, 3>(first, second, third);
+	for (var vertex = 0u; vertex < 3u; vertex += 1u) {
+		let position = bondedPositions[vertex];
+		let velocity =
+			particles[vertex].velocity +
+			(position - originalPositions[vertex]) * inverseDt;
+		let boundedX = confineAxis(
+			position.x,
+			velocity.x,
+			params.gravityAndDomain.z,
+		);
+		let boundedY = confineAxis(
+			position.y,
+			velocity.y,
+			params.gravityAndDomain.w,
+		);
+		particles[vertex].position = vec2<f32>(boundedX.x, boundedY.x);
+		particles[vertex].velocity = vec2<f32>(boundedX.y, boundedY.y);
+	}
+
+	var collisionCorrection = vec2<f32>(0.0, 0.0);
+	var collisionVelocityDelta = vec2<f32>(0.0, 0.0);
+	let objectId = particleObjectIds[bodyStart];
+	let minimum = min(
+		particlesIn[bodyStart].position,
+		min(particlesIn[bodyStart + 1u].position, particlesIn[bodyStart + 2u].position),
+	);
+	let maximum = max(
+		particlesIn[bodyStart].position,
+		max(particlesIn[bodyStart + 1u].position, particlesIn[bodyStart + 2u].position),
+	);
+	let currentVelocity =
+		(particlesIn[bodyStart].velocity +
+			particlesIn[bodyStart + 1u].velocity +
+			particlesIn[bodyStart + 2u].velocity) /
+		3.0;
+	let bodyMass = 3.0 * params.physical.y;
+	let contactSkin = params.physical.x * TRIANGLE_CONTACT_SKIN_CELLS;
+	for (var otherIndex = 0u; otherIndex < params.counts.w; otherIndex += 1u) {
+		if (otherIndex == bodyIndex) {
+			continue;
+		}
+		let otherStart = bondedBodyStarts[otherIndex];
+		if (otherStart + 2u >= params.counts.x) {
+			atomicMin(&stateError[1], otherStart);
+			atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
+			return;
+		}
+		if (particleObjectIds[otherStart] == objectId) {
+			continue;
+		}
+		let otherMinimum = min(
+			particlesIn[otherStart].position,
+			min(particlesIn[otherStart + 1u].position, particlesIn[otherStart + 2u].position),
+		);
+		let otherMaximum = max(
+			particlesIn[otherStart].position,
+			max(particlesIn[otherStart + 1u].position, particlesIn[otherStart + 2u].position),
+		);
+		let aabbGap = max(otherMinimum - maximum, minimum - otherMaximum);
+		if (max(aabbGap.x, aabbGap.y) > contactSkin) {
+			continue;
+		}
+		let contact = trianglePairContact(
+			particlesIn[bodyStart].position,
+			particlesIn[bodyStart + 1u].position,
+			particlesIn[bodyStart + 2u].position,
+			particlesIn[otherStart].position,
+			particlesIn[otherStart + 1u].position,
+			particlesIn[otherStart + 2u].position,
+			contactSkin,
+		);
+		if (contact.z <= 0.0) {
+			continue;
+		}
+		let otherVelocity =
+			(particlesIn[otherStart].velocity +
+				particlesIn[otherStart + 1u].velocity +
+				particlesIn[otherStart + 2u].velocity) /
+			3.0;
+		let relativeNormalVelocity = dot(currentVelocity - otherVelocity, contact.xy);
+		if (relativeNormalVelocity < 0.0) {
+			let impulseMagnitude = -relativeNormalVelocity / (2.0 / bodyMass);
+			collisionVelocityDelta +=
+				(impulseMagnitude / bodyMass) * contact.xy;
+		}
+		collisionCorrection += 0.5 * contact.z * contact.xy;
+	}
+
+	for (var vertex = 0u; vertex < 3u; vertex += 1u) {
+		let position = particles[vertex].position + collisionCorrection;
+		let velocity = particles[vertex].velocity + collisionVelocityDelta;
+		let boundedX = confineAxis(
+			position.x,
+			velocity.x,
+			params.gravityAndDomain.z,
+		);
+		let boundedY = confineAxis(
+			position.y,
+			velocity.y,
+			params.gravityAndDomain.w,
+		);
+		particles[vertex].position = vec2<f32>(boundedX.x, boundedY.x);
+		particles[vertex].velocity = vec2<f32>(boundedX.y, boundedY.y);
+		if (
+			!finiteVec2(particles[vertex].position) ||
+			!finiteVec2(particles[vertex].velocity)
+		) {
+			atomicMin(&stateError[1], bodyStart);
+			atomicOr(&stateError[0], ERROR_TRIANGLE_CONTACT);
+			return;
+		}
+	}
+	particlesOut[bodyStart] = particles[0];
+	particlesOut[bodyStart + 1u] = particles[1];
+	particlesOut[bodyStart + 2u] = particles[2];
 }
 
 @compute @workgroup_size(64)
@@ -1018,6 +1933,16 @@ fn cloneObject(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	);
 	cloneParticles[destinationIndex] = particle;
 	cloneObjectIds[destinationIndex] = cloneParams.rangeAndObjectId.w;
+	if (
+		localIndex % 3u == 0u &&
+		localIndex / 3u < cloneParams.bondRangeAndCapacity.x
+	) {
+		let bodyListIndex =
+			cloneParams.bondRangeAndCapacity.y + localIndex / 3u;
+		if (bodyListIndex < cloneParams.bondRangeAndCapacity.z) {
+			bondedBodyStarts[bodyListIndex] = destinationIndex;
+		}
+	}
 }
 `;
 
@@ -1046,8 +1971,15 @@ struct RenderParams {
 	domainAndRadius: vec4<f32>,
 }
 
+struct SurfaceRenderParams {
+	grid: vec4<u32>,
+	domainAndCell: vec4<f32>,
+}
+
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;
 @group(0) @binding(1) var<uniform> params: RenderParams;
+@group(0) @binding(2) var<storage, read> surfaceFields: array<vec2<f32>>;
+@group(0) @binding(3) var<uniform> surfaceParams: SurfaceRenderParams;
 
 struct VertexOutput {
 	@builtin(position) position: vec4<f32>,
@@ -1070,6 +2002,16 @@ fn vertexMain(
 	);
 	let local = corners[vertexIndex];
 	let particle = particles[instanceIndex];
+	let isLiquid =
+		particle.materialModel == MODEL_WATER ||
+		particle.materialModel == MODEL_OIL;
+	if (params.domainAndRadius.w > 0.5 && isLiquid) {
+		var hidden: VertexOutput;
+		hidden.position = vec4<f32>(2.0, 2.0, 0.0, 1.0);
+		hidden.localPosition = local;
+		hidden.materialColor = vec3<f32>(0.0, 0.0, 0.0);
+		return hidden;
+	}
 	let worldPosition =
 		particle.position + local * params.domainAndRadius.z;
 	let clipPosition = vec2<f32>(
@@ -1099,5 +2041,69 @@ fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
 		discard;
 	}
 	return vec4<f32>(input.materialColor, 1.0);
+}
+
+struct SurfaceVertexOutput {
+	@builtin(position) position: vec4<f32>,
+	@location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn surfaceVertexMain(@builtin(vertex_index) vertexIndex: u32) -> SurfaceVertexOutput {
+	let positions = array<vec2<f32>, 3>(
+		vec2<f32>(-1.0, -1.0),
+		vec2<f32>(3.0, -1.0),
+		vec2<f32>(-1.0, 3.0),
+	);
+	let clipPosition = positions[vertexIndex];
+	var output: SurfaceVertexOutput;
+	output.position = vec4<f32>(clipPosition, 0.0, 1.0);
+	output.uv = vec2<f32>(
+		0.5 * (clipPosition.x + 1.0),
+		0.5 * (1.0 - clipPosition.y),
+	);
+	return output;
+}
+
+fn surfaceFieldAt(coordinate: vec2<u32>) -> vec2<f32> {
+	return surfaceFields[coordinate.y * surfaceParams.grid.x + coordinate.x];
+}
+
+fn sampleSurfaceField(uv: vec2<f32>) -> vec2<f32> {
+	let worldPosition = uv * surfaceParams.domainAndCell.xy;
+	let gridPosition = worldPosition / surfaceParams.domainAndCell.z + vec2<f32>(1.0, 1.0);
+	let maximumCoordinate = surfaceParams.grid.xy - vec2<u32>(1u, 1u);
+	let clampedPosition = clamp(
+		gridPosition,
+		vec2<f32>(0.0, 0.0),
+		vec2<f32>(maximumCoordinate),
+	);
+	let lower = vec2<u32>(floor(clampedPosition));
+	let upper = min(lower + vec2<u32>(1u, 1u), maximumCoordinate);
+	let fraction = clampedPosition - vec2<f32>(lower);
+	let lowerRow = mix(surfaceFieldAt(lower), surfaceFieldAt(vec2<u32>(upper.x, lower.y)), fraction.x);
+	let upperRow = mix(surfaceFieldAt(vec2<u32>(lower.x, upper.y)), surfaceFieldAt(upper), fraction.x);
+	return mix(lowerRow, upperRow, fraction.y);
+}
+
+@fragment
+fn surfaceFragmentMain(input: SurfaceVertexOutput) -> @location(0) vec4<f32> {
+	let occupancy = sampleSurfaceField(input.uv);
+	// V0 / spacing^2 = 25 / 9^2 ~= 0.309; the display iso-level is near half
+	// of that initial interior area density. It is a visual threshold, not physics.
+	let waterCoverage = smoothstep(0.115, 0.195, max(occupancy.x, 0.0));
+	let oilCoverage = smoothstep(0.115, 0.195, max(occupancy.y, 0.0));
+	let totalCoverage = waterCoverage + oilCoverage;
+	if (totalCoverage <= 1.0e-5) {
+		return vec4<f32>(0.035, 0.047, 0.063, 1.0);
+	}
+
+	let waterColor = vec3<f32>(0.12, 0.48, 0.88);
+	let oilColor = vec3<f32>(0.91, 0.62, 0.18);
+	let mixedColor =
+		(waterColor * waterCoverage + oilColor * oilCoverage) / totalCoverage;
+	let opacity = clamp(totalCoverage, 0.0, 1.0);
+	let background = vec3<f32>(0.035, 0.047, 0.063);
+	return vec4<f32>(mix(background, mixedColor, opacity), 1.0);
 }
 `;

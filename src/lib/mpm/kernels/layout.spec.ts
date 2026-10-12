@@ -70,7 +70,7 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		const state = validateMpmMlsGpuInput([makeParticle()], makeConfig());
 		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
 
-		expect(layout).toEqual({
+		expect(layout).toMatchObject({
 			nodeWidth: 19,
 			nodeHeight: 11,
 			nodeCount: 209,
@@ -82,8 +82,12 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			objectIdBufferBytes: 4,
 			bucketHeadBytes: 836,
 			bucketNextBytes: 36,
-			gridStateBytes: 6688,
-			readbackBytes: 112
+			gridStateBytes: 16_720,
+			triangleFieldBytes: 6_688,
+			bondedBodyStartBytes: 4,
+			bondedBodyCapacity: 1,
+			surfaceFieldBytes: 1672,
+			readbackBytes: 116
 		});
 	});
 
@@ -97,7 +101,12 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(layout.preparedAffineBytes).toBe(16);
 		expect(layout.bucketNextBytes).toBe(4);
 		expect(layout.objectIdBufferBytes).toBe(4);
-		expect(layout.readbackBytes).toBe(32);
+		expect(layout.gridStateBytes).toBe(16_720);
+		expect(layout.triangleFieldBytes).toBe(6_688);
+		expect(layout.bondedBodyStartBytes).toBe(4);
+		expect(layout.bondedBodyCapacity).toBe(1);
+		expect(layout.surfaceFieldBytes).toBe(1672);
+		expect(layout.readbackBytes).toBe(36);
 	});
 
 	it('reserves capacity up front while packing only initial particle and object state', () => {
@@ -118,13 +127,16 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(layout.preparedAffineBytes).toBe(64);
 		expect(layout.objectIdBufferBytes).toBe(16);
 		expect(layout.bucketNextBytes).toBe(144);
-		expect(layout.readbackBytes).toBe(364);
+		expect(layout.readbackBytes).toBe(368);
 	});
 
 	it('supports a one-million particle capacity within standard desktop buffer limits', () => {
 		const state = validateMpmMlsGpuInput(
 			[makeParticle()],
-			makeConfig({ capacity: 1_000_000 })
+			makeConfig({
+				capacity: 1_000_000,
+				grid: { cellsX: 220, cellsY: 150, cellSize: 10 }
+			})
 		);
 		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
 
@@ -134,7 +146,12 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(layout.preparedAffineBytes).toBe(16_000_000);
 		expect(layout.objectIdBufferBytes).toBe(4_000_000);
 		expect(layout.bucketNextBytes).toBe(36_000_000);
-		expect(layout.readbackBytes).toBe(84_000_028);
+		expect(layout.gridStateBytes).toBe(2_729_520);
+		expect(layout.triangleFieldBytes).toBe(1_091_808);
+		expect(layout.bondedBodyStartBytes).toBe(1_333_332);
+		expect(layout.bondedBodyCapacity).toBe(333_333);
+		expect(layout.surfaceFieldBytes).toBe(272_952);
+		expect(layout.readbackBytes).toBe(84_000_032);
 	});
 
 	it('packs each particle material and snow plastic history with the GPU layout', () => {
@@ -215,6 +232,49 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(state.packedParticles[37]).toBe(Math.fround(0.01));
 		expect(words[53]).toBe(4);
 		expect(state.packedParticles[58]).toBe(Math.fround(0.55));
+	});
+
+	it('packs bonded triangle vertices and exposes the active body count', () => {
+		const particles: readonly MpmParticle[] = [
+			makeParticle({
+				objectId: 7,
+				position: { x: 8, y: 4 },
+				bondedTriangleVertex: 0
+			}),
+			makeParticle({
+				objectId: 7,
+				position: { x: 8.6, y: 4 },
+				bondedTriangleVertex: 1
+			}),
+			makeParticle({
+				objectId: 7,
+				position: { x: 8.3, y: 4.519615242270663 },
+				bondedTriangleVertex: 2
+			})
+		];
+		const state = validateMpmMlsGpuInput(
+			particles,
+			makeConfig({ bondRestLength: 0.6, capacity: 6 })
+		);
+		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
+		const words = new Uint32Array(state.packedParticles.buffer);
+		const parameters = packMpmMlsGpuStepParameters(
+			state,
+			layout,
+			0.001,
+			{ x: 0, y: 0 }
+		);
+
+		expect([words[19], words[39], words[59]]).toEqual([1, 2, 3]);
+		expect(Array.from(state.bondedBodyStarts)).toEqual([0]);
+		expect(state.bondedBodyCountsByObjectId.get(7)).toBe(1);
+		expect(Array.from(new Uint32Array(parameters, 16, 4))).toEqual([
+			3,
+			layout.nodeCount,
+			27,
+			1
+		]);
+		expect(new Float32Array(parameters, 32, 16)[12]).toBe(Math.fround(0.6));
 	});
 
 	it('rejects invalid physical parameters and particle states rather than repairing them', () => {
@@ -366,7 +426,7 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			2, 3, 5, 6,
 			1, 30, 9, 0
 		]);
-		const floats = new Float32Array(parameters, 32, 12);
+		const floats = new Float32Array(parameters, 32, 16);
 		expect(Array.from(floats.slice(0, 4))).toEqual([
 			0.5,
 			Math.fround(0.2),
@@ -374,7 +434,13 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			Math.fround(0.001)
 		]);
 		expect(Array.from(floats.slice(4, 8))).toEqual([20, 10, Math.fround(-0.00016), 16]);
-		expect(Array.from(floats.slice(8))).toEqual([1, -2, 1, 1.5]);
+		expect(Array.from(floats.slice(8, 12))).toEqual([1, -2, 1, 1.5]);
+		expect(Array.from(floats.slice(12))).toEqual([
+			0,
+			Math.fround(0.35),
+			1,
+			Math.fround(Math.sqrt(0.01 / Math.PI) + 0.375)
+		]);
 
 		expect(() => packMpmMlsGpuStepParameters(state, layout, 0, { x: 0, y: 0 }))
 			.toThrow(/dt/);

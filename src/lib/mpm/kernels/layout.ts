@@ -4,6 +4,7 @@ import type {
 	MpmStepConfig,
 	MpmVector2
 } from '../reference/solver.js';
+import { DEFAULT_BONDED_TRIANGLE_STIFFNESS } from '../reference/solver.js';
 import {
 	encodeMpmConstitutiveModel,
 	normalizeMpmConstitutiveModel,
@@ -35,6 +36,10 @@ export interface MpmMlsGpuBufferLayout {
 	readonly bucketHeadBytes: number;
 	readonly bucketNextBytes: number;
 	readonly gridStateBytes: number;
+	readonly triangleFieldBytes: number;
+	readonly bondedBodyStartBytes: number;
+	readonly bondedBodyCapacity: number;
+	readonly surfaceFieldBytes: number;
 	readonly readbackBytes: number;
 }
 
@@ -50,6 +55,8 @@ export interface ValidatedMpmMlsGpuInput {
 	readonly particleCapacity: number;
 	readonly packedParticles: Float32Array;
 	readonly packedObjectIds: Uint32Array;
+	readonly bondedBodyStarts: Uint32Array;
+	readonly bondedBodyCountsByObjectId: ReadonlyMap<number, number>;
 	readonly objectRanges: readonly MpmMlsGpuObjectRange[];
 	readonly domainWidth: number;
 	readonly domainHeight: number;
@@ -58,6 +65,8 @@ export interface ValidatedMpmMlsGpuInput {
 	readonly cellSizeF32: number;
 	readonly particleMassF32: number;
 	readonly particleVolumeF32: number;
+	readonly bondRestLengthF32: number;
+	readonly bondStiffnessF32: number;
 	readonly lambdaF32: number;
 	readonly muF32: number;
 	readonly gradientScale: number;
@@ -68,17 +77,19 @@ export const PARTICLE_FLOATS = 20;
 export const PARTICLE_STRIDE_BYTES = PARTICLE_FLOATS * Float32Array.BYTES_PER_ELEMENT;
 export const PREPARED_AFFINE_STRIDE_BYTES = 4 * Float32Array.BYTES_PER_ELEMENT;
 export const OBJECT_ID_STRIDE_BYTES = Uint32Array.BYTES_PER_ELEMENT;
-export const SIMULATION_PARAMS_BYTES = 80;
+export const SIMULATION_PARAMS_BYTES = 96;
 export const RENDER_PARAMS_BYTES = 16;
+export const SURFACE_RENDER_PARAMS_BYTES = 32;
 export const COMPUTE_WORKGROUP_SIZE = 64;
-export const NUMERICAL_STATUS_WORDS = 7;
+export const NUMERICAL_STATUS_WORDS = 8;
 export const NUMERICAL_STATUS_BYTES =
 	NUMERICAL_STATUS_WORDS * Uint32Array.BYTES_PER_ELEMENT;
 
 const UINT32_MAX = 0xffff_ffff;
 const INT32_MAX = 0x7fff_ffff;
 const MAX_FLOAT32 = 3.4028234663852886e38;
-const GRID_NODE_STRIDE_BYTES = 32;
+const GRID_NODE_STRIDE_BYTES = 80;
+const TRIANGLE_FIELD_NODE_STRIDE_BYTES = 32;
 
 export function validateMpmMlsGpuInput(
 	particles: readonly MpmParticle[],
@@ -93,6 +104,14 @@ export function validateMpmMlsGpuInput(
 	const cellSize = finiteNumber(rawGrid.cellSize, 'grid.cellSize');
 	const particleMass = finiteNumber(rawConfig.particleMass, 'particleMass');
 	const particleVolume = finiteNumber(rawConfig.particleVolume, 'particleVolume');
+	const bondRestLength =
+		rawConfig.bondRestLength === undefined
+			? undefined
+			: finiteNumber(rawConfig.bondRestLength, 'bondRestLength');
+	const bondStiffness =
+		rawConfig.bondStiffness === undefined
+			? DEFAULT_BONDED_TRIANGLE_STIFFNESS
+			: finiteNumber(rawConfig.bondStiffness, 'bondStiffness');
 	const lambda = material.lambda;
 	const mu = material.mu;
 
@@ -105,6 +124,12 @@ export function validateMpmMlsGpuInput(
 	if (cellSize <= 0) throw new RangeError('grid.cellSize must be greater than zero');
 	if (particleMass <= 0) throw new RangeError('particleMass must be greater than zero');
 	if (particleVolume <= 0) throw new RangeError('particleVolume must be greater than zero');
+	if (bondRestLength !== undefined && bondRestLength <= 0) {
+		throw new RangeError('bondRestLength must be greater than zero');
+	}
+	if (bondStiffness <= 0 || bondStiffness > 1) {
+		throw new RangeError('bondStiffness must be greater than zero and at most one');
+	}
 	if (lambda < 0) throw new RangeError('material.lambda must be non-negative');
 	if (mu <= 0) throw new RangeError('material.mu must be greater than zero');
 
@@ -139,6 +164,15 @@ export function validateMpmMlsGpuInput(
 	const cellSizeF32 = finiteFloat32(cellSize, 'grid.cellSize', true);
 	const particleMassF32 = finiteFloat32(particleMass, 'particleMass', true);
 	const particleVolumeF32 = finiteFloat32(particleVolume, 'particleVolume', true);
+	const bondRestLengthF32 =
+		bondRestLength === undefined
+			? 0
+			: finiteFloat32(bondRestLength, 'bondRestLength', true);
+	const bondStiffnessF32 = finiteFloat32(
+		bondStiffness,
+		'bondStiffness',
+		true
+	);
 	const lambdaF32 = finiteFloat32(lambda, 'material.lambda');
 	const muF32 = finiteFloat32(
 		mu,
@@ -205,6 +239,18 @@ export function validateMpmMlsGpuInput(
 			rawParticle.material === undefined
 				? material
 				: validateMaterial(rawParticle.material, `particles[${index}].material`);
+		const bondedTriangleVertex = rawParticle.bondedTriangleVertex;
+		if (
+			bondedTriangleVertex !== undefined &&
+			(typeof bondedTriangleVertex !== 'number' ||
+				!Number.isSafeInteger(bondedTriangleVertex) ||
+				bondedTriangleVertex < 0 ||
+				bondedTriangleVertex > 2)
+		) {
+			throw new RangeError(
+				`particles[${index}].bondedTriangleVertex must be 0, 1, or 2`
+			);
+		}
 		const plasticVolume =
 			rawParticle.plasticVolume === undefined
 				? 1
@@ -317,6 +363,8 @@ export function validateMpmMlsGpuInput(
 		packedParticleWords[offset + 13] = encodeMpmConstitutiveModel(
 			particleMaterial.model ?? 'neo-hookean'
 		);
+		packedParticleWords[offset + 19] =
+			bondedTriangleVertex === undefined ? 0 : bondedTriangleVertex + 1;
 		packedObjectIds[index] = objectId;
 
 		const currentRange = objectRanges.at(-1);
@@ -336,11 +384,54 @@ export function validateMpmMlsGpuInput(
 		}
 	}
 
+	const bondedBodyStarts: number[] = [];
+	const bondedBodyCountsByObjectId = new Map<number, number>();
+	for (const range of objectRanges) {
+		const objectParticles = particles.slice(range.start, range.start + range.count);
+		if (
+			!objectParticles.some(
+				(particle) => particle.bondedTriangleVertex !== undefined
+			)
+		) {
+			continue;
+		}
+		if (bondRestLength === undefined) {
+			throw new RangeError(
+				`object ${range.objectId} uses bonded triangles but bondRestLength is missing`
+			);
+		}
+		if (range.count % 3 !== 0) {
+			throw new RangeError(
+				`bonded object ${range.objectId} must contain complete three-particle triangles`
+			);
+		}
+		for (let localIndex = 0; localIndex < range.count; localIndex += 1) {
+			const particle = objectParticles[localIndex];
+			const expectedVertex = localIndex % 3;
+			if (particle.bondedTriangleVertex !== expectedVertex) {
+				throw new RangeError(
+					`bonded object ${range.objectId} must store contiguous vertices 0, 1, and 2`
+				);
+			}
+			const model = particle.material?.model ?? material.model;
+			if (model === 'water' || model === 'oil') {
+				throw new RangeError('bonded triangle vertices must use a solid material');
+			}
+			if (expectedVertex === 0) bondedBodyStarts.push(range.start + localIndex);
+		}
+		bondedBodyCountsByObjectId.set(range.objectId, range.count / 3);
+	}
+	if (bondedBodyStarts.length > 0 && bondRestLengthF32 <= 0) {
+		throw new RangeError('bondRestLength must remain positive in float32');
+	}
+
 	return {
 		config: {
 			grid: { cellsX, cellsY, cellSize },
 			particleMass,
 			particleVolume,
+			...(bondRestLength === undefined ? {} : { bondRestLength }),
+			bondStiffness,
 			material,
 			capacity: particleCapacity
 		},
@@ -348,6 +439,8 @@ export function validateMpmMlsGpuInput(
 		particleCapacity,
 		packedParticles,
 		packedObjectIds,
+		bondedBodyStarts: new Uint32Array(bondedBodyStarts),
+		bondedBodyCountsByObjectId,
 		objectRanges,
 		domainWidth,
 		domainHeight,
@@ -356,6 +449,8 @@ export function validateMpmMlsGpuInput(
 		cellSizeF32,
 		particleMassF32,
 		particleVolumeF32,
+		bondRestLengthF32,
+		bondStiffnessF32,
 		lambdaF32,
 		muF32,
 		gradientScale,
@@ -412,6 +507,22 @@ export function calculateMpmMlsGpuBufferLayout(
 		GRID_NODE_STRIDE_BYTES,
 		'grid state buffer size'
 	);
+	const triangleFieldBytes = safeProduct(
+		nodeCount,
+		TRIANGLE_FIELD_NODE_STRIDE_BYTES,
+		'triangle contact field size'
+	);
+	const bondedBodyCapacity = Math.max(1, Math.floor(state.particleCapacity / 3));
+	const bondedBodyStartBytes = safeProduct(
+		bondedBodyCapacity,
+		Uint32Array.BYTES_PER_ELEMENT,
+		'bonded triangle body index buffer size'
+	);
+	const surfaceFieldBytes = safeProduct(
+		nodeCount,
+		2 * Float32Array.BYTES_PER_ELEMENT,
+		'water/oil surface field buffer size'
+	);
 	const readbackBytes = Math.max(
 		NUMERICAL_STATUS_BYTES,
 		safeSum(
@@ -433,6 +544,9 @@ export function calculateMpmMlsGpuBufferLayout(
 	if (limits.maxUniformBufferBindingSize < SIMULATION_PARAMS_BYTES) {
 		throw new RangeError('GPU maxUniformBufferBindingSize is too small for simulation parameters');
 	}
+	if (limits.maxUniformBufferBindingSize < SURFACE_RENDER_PARAMS_BYTES) {
+		throw new RangeError('GPU maxUniformBufferBindingSize is too small for surface render parameters');
+	}
 	if (limits.maxStorageBuffersPerShaderStage < 6) {
 		throw new RangeError('GPU supports fewer than six storage buffers per shader stage');
 	}
@@ -444,9 +558,13 @@ export function calculateMpmMlsGpuBufferLayout(
 		['bucket heads', bucketHeadBytes],
 		['bucket links', bucketNextBytes],
 		['grid state', gridStateBytes],
+		['triangle contact field', triangleFieldBytes],
+		['bonded triangle body indices', bondedBodyStartBytes],
+		['water/oil surface field', surfaceFieldBytes],
 		['simulation parameters', SIMULATION_PARAMS_BYTES],
 		['render parameters', RENDER_PARAMS_BYTES],
-		['numerical status', Uint32Array.BYTES_PER_ELEMENT],
+		['surface render parameters', SURFACE_RENDER_PARAMS_BYTES],
+		['numerical status', NUMERICAL_STATUS_BYTES],
 		['particle readback', readbackBytes]
 	] as const;
 	for (const [name, size] of buffers) {
@@ -462,7 +580,10 @@ export function calculateMpmMlsGpuBufferLayout(
 		['bucket heads', bucketHeadBytes],
 		['bucket links', bucketNextBytes],
 		['grid state', gridStateBytes],
-		['numerical status', Uint32Array.BYTES_PER_ELEMENT]
+		['triangle contact field', triangleFieldBytes],
+		['bonded triangle body indices', bondedBodyStartBytes],
+		['water/oil surface field', surfaceFieldBytes],
+		['numerical status', NUMERICAL_STATUS_BYTES]
 	] as const;
 	for (const [name, size] of storageBuffers) {
 		if (size > limits.maxStorageBufferBindingSize) {
@@ -496,6 +617,10 @@ export function calculateMpmMlsGpuBufferLayout(
 		bucketHeadBytes,
 		bucketNextBytes,
 		gridStateBytes,
+		triangleFieldBytes,
+		bondedBodyStartBytes,
+		bondedBodyCapacity,
+		surfaceFieldBytes,
 		readbackBytes
 	};
 }
@@ -505,10 +630,18 @@ export function packMpmMlsGpuStepParameters(
 	layout: MpmMlsGpuBufferLayout,
 	dt: number,
 	gravity: MpmVector2,
-	particleCount = state.particleCount
+	particleCount = state.particleCount,
+	bondedBodyCount = state.bondedBodyStarts.length
 ): ArrayBuffer {
 	if (!Number.isSafeInteger(particleCount) || particleCount < 0 || particleCount > layout.particleCapacity) {
 		throw new RangeError('particleCount must be an integer within the allocated GPU capacity');
+	}
+	if (
+		!Number.isSafeInteger(bondedBodyCount) ||
+		bondedBodyCount < 0 ||
+		bondedBodyCount > layout.bondedBodyCapacity
+	) {
+		throw new RangeError('bondedBodyCount must fit the allocated triangle body capacity');
 	}
 	const pairCount = safeProduct(particleCount, 9, 'active particle stencil entry count');
 	if (pairCount > INT32_MAX) {
@@ -536,9 +669,9 @@ export function packMpmMlsGpuStepParameters(
 		particleCount,
 		layout.nodeCount,
 		pairCount,
-		0
+		bondedBodyCount
 	]);
-	const floats = new Float32Array(result, 32, 12);
+	const floats = new Float32Array(result, 32, 16);
 	floats.set([
 		state.cellSizeF32,
 		state.particleMassF32,
@@ -551,7 +684,12 @@ export function packMpmMlsGpuStepParameters(
 		gravityX,
 		gravityY,
 		state.domainWidthF32,
-		state.domainHeightF32
+		state.domainHeightF32,
+		state.bondRestLengthF32,
+		state.bondStiffnessF32,
+		state.cellSizeF32 * 2,
+		Math.sqrt(state.particleVolumeF32 / Math.PI) +
+			state.cellSizeF32 * 0.75
 	]);
 	return result;
 }

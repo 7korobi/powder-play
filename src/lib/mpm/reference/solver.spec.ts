@@ -36,6 +36,18 @@ function closeEnough(actual: number, expected: number, tolerance: number): void 
 	expect(Math.abs(actual - expected)).toBeLessThanOrEqual(tolerance);
 }
 
+function triangleEdgeLengthError(
+	particles: readonly MpmParticle[],
+	restLength: number
+): number {
+	const positions = particles.map(({ position }) => position);
+	return (
+		Math.abs(Math.hypot(positions[1].x - positions[0].x, positions[1].y - positions[0].y) - restLength) +
+		Math.abs(Math.hypot(positions[2].x - positions[1].x, positions[2].y - positions[1].y) - restLength) +
+		Math.abs(Math.hypot(positions[0].x - positions[2].x, positions[0].y - positions[2].y) - restLength)
+	);
+}
+
 function principalLogStretchDifference(F: MpmMatrix2): number {
 	const c00 = F.m00 * F.m00 + F.m10 * F.m10;
 	const c01 = F.m00 * F.m01 + F.m10 * F.m11;
@@ -349,6 +361,127 @@ describe('CPU MLS-MPM reference', () => {
 
 		expect(result.particles[0].velocity.y).toBeGreaterThan(result.particles[1].velocity.y);
 		expect(result.particles[0].position.y).toBeGreaterThan(result.particles[1].position.y);
+	});
+
+	it('resolves water-oil contact with equal and opposite normal impulses', () => {
+		const particles = [
+			makeParticle({
+				position: { x: 7.5, y: 8 },
+				velocity: { x: 5, y: 0 },
+				objectId: 1,
+				volume: 0.25,
+				material: { lambda: 8, mu: 0, model: 'water', density: 1 }
+			}),
+			makeParticle({
+				position: { x: 8.5, y: 8 },
+				velocity: { x: -5, y: 0 },
+				objectId: 2,
+				volume: 0.25,
+				material: { lambda: 8, mu: 0, model: 'oil', density: 1 }
+			})
+		];
+		const result = stepMpm(
+			particles,
+			makeConfig({
+				dt: 0.001,
+				particleVolume: 0.25,
+				gravity: { x: 0, y: 0 }
+			})
+		);
+
+		expect(result.particles[0].velocity.x).toBeLessThan(5);
+		expect(result.particles[1].velocity.x).toBeGreaterThan(-5);
+		expect(result.diagnostics.outputMomentum.x).toBeCloseTo(
+			result.diagnostics.inputMomentum.x,
+			10
+		);
+	});
+
+	it('returns liquid contact reaction to a bonded triangle and preserves vertex markers', () => {
+		const particles: MpmParticle[] = [
+			makeParticle({
+				position: { x: 7.5, y: 8 },
+				velocity: { x: 4, y: 0 },
+				objectId: 1,
+				volume: 0.25,
+				material: { lambda: 8, mu: 0, model: 'water', density: 1 }
+			}),
+			makeParticle({
+				position: { x: 8, y: 8 },
+				objectId: 2,
+				bondedTriangleVertex: 0
+			}),
+			makeParticle({
+				position: { x: 8 + Math.sqrt(3), y: 7 },
+				objectId: 2,
+				bondedTriangleVertex: 1
+			}),
+			makeParticle({
+				position: { x: 8 + Math.sqrt(3), y: 9 },
+				objectId: 2,
+				bondedTriangleVertex: 2
+			})
+		];
+		const result = stepMpm(
+			particles,
+			makeConfig({
+				dt: 0.001,
+				particleVolume: 0.25,
+				bondRestLength: 2,
+				gravity: { x: 0, y: 0 }
+			})
+		);
+		const water = result.particles[0];
+		const triangle = result.particles.slice(1);
+		const triangleMomentumX = triangle.reduce(
+			(momentum, particle) => momentum + 0.1 * particle.velocity.x,
+			0
+		);
+
+		expect(water.velocity.x).toBeLessThan(4);
+		expect(triangleMomentumX).toBeGreaterThan(0);
+		expect(triangle.map(({ bondedTriangleVertex }) => bondedTriangleVertex)).toEqual([
+			0, 1, 2
+		]);
+		expect(result.diagnostics.outputMomentum.x).toBeCloseTo(
+			result.diagnostics.inputMomentum.x,
+			8
+		);
+	});
+
+	it('restores a stretched bonded triangle toward its configured edge length', () => {
+		const particles: MpmParticle[] = [
+			makeParticle({
+				position: { x: 8, y: 8 },
+				objectId: 4,
+				bondedTriangleVertex: 0
+			}),
+			makeParticle({
+				position: { x: 10, y: 8 },
+				objectId: 4,
+				bondedTriangleVertex: 1
+			}),
+			makeParticle({
+				position: { x: 9, y: 9.5 },
+				objectId: 4,
+				bondedTriangleVertex: 2
+			})
+		];
+		const initialError = triangleEdgeLengthError(particles, 1);
+		const result = stepMpm(
+			particles,
+			makeConfig({
+				dt: 0.001,
+				bondRestLength: 1,
+				bondStiffness: 1,
+				gravity: { x: 0, y: 0 }
+			})
+		);
+
+		expect(triangleEdgeLengthError(result.particles, 1)).toBeLessThan(initialError);
+		expect(result.particles.map(({ bondedTriangleVertex }) => bondedTriangleVertex)).toEqual([
+			0, 1, 2
+		]);
 	});
 
 	it('applies liquid bulk pressure only to compression', () => {

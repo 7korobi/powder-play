@@ -2,7 +2,7 @@
 
 作成日: 2026-10-12
 
-状態: **設計・実装計画。以下の M0〜M7 は未着手**。
+状態: **設計・実装計画。M1 の粒子別 cache と、M4 の Gate 4 接触 prototype の一部を実装済み。M0〜M7 の合格ゲートは未完了**。
 根拠・式・現行ソースのハッシュは
 [４論点の調査資料](./RESEARCH-MLS-MPM-MATERIALS.md) に保存する。
 本書は [既存の Gate 0〜5](./ROADMAP-MLS-MPM.md) を置き換えず、
@@ -13,6 +13,7 @@ Gate 1・3・4 の数値／材料機能を深め、Gate 5 に渡すためのサ�
 現行cacheは必要なアフィン運動量のみの16 byte/粒子で、batchを１compute passに集約する。
 以下の32 byte cacheやpass構成は追加診断・材料拡張時の設計候補であり、
 M0〜M7全体の物理ゲートが合格したことを意味しない。
+M4 prototype の構成、未検証項目、性能上の注意は §4 の M4 に追記した。
 
 ## 1. 到達点と設計境界
 
@@ -42,8 +43,8 @@ M0〜M7全体の物理ゲートが合格したことを意味しない。
 
 ## 2. 現行実装からの差分
 
-出発点の詳細は [調査資料 §0](./RESEARCH-MLS-MPM-MATERIALS.md#0-出発点-liquidfun-のゼリーと現行-mls-mpm)。
-特に次を前提にする。
+調査時点の出発点は [調査資料 §0](./RESEARCH-MLS-MPM-MATERIALS.md#0-出発点-liquidfun-のゼリーと現行-mls-mpm)。
+以下はその baseline であり、M1 および Gate 4 prototype を加えた現在の実装状態ではない。
 
 1. 粒子 stride は **80 byte**、格子は単一速度場、物理 step は６ compute pass。
 2. P2G リスト内で構成則を再計算している。粒子ごとに最大９回である。
@@ -304,6 +305,10 @@ F-bar 型安定化は全文確認と locking の定量的検出後の別実験�
 
 **前提**: M2 と、M3 の校正された幾何場。M1 の採否に合わせて P2G を拡張する。
 
+本来の M4 ゲートは前提条件が揃ってから判定する。Gate 4 の要望に応じ、
+水・油・三粒子小石向けの限定的な prototype を先行実装したが、M2/M3 の校正、
+以下の接触ゲート、長時間試験を完了したものではない。
+
 1. 同じ Neo-Hookean のゼリー２個を別 field に置く。
 2. 法線 impulse、離脱、摩擦ゼロの滑りを実装する。
 3. 材料対摩擦、多点接触、壁 corner を追加する。
@@ -356,6 +361,35 @@ clone の規則:
 - clone/readback/render に field と材料状態が保持され、容量不足が UI に現れる。
 
 格子未解像の薄片、自己接触、液体–粉体浸透はこの段階の対応外として表示する。
+
+#### Gate 4 prototype の現状（2026-10-12、M4 未合格）
+
+| 対象 | 実装した近似 | まだ保証しないこと |
+|---|---|---|
+| 水–油 | 相別の mass/momentum/volume/velocity を grid に保持し、相別体積勾配に沿った法線 impulse を両相へ返す | 静的な重なりの位置解消、完全分離、表面張力・濡れ・接線摩擦 |
+| 液体–小石 | 各小石を3頂点の三角形 collider として場にし、格子法線 impulse の反力を barycentric weight で頂点へ gather。G2P 後に液体粒子を SDF で外側へ投影 | swept collision による高速 tunneling 防止、反力・体積保存の scene-scale 誤差保証 |
+| 小石–小石 | 三角形 SAT 接触で法線速度 impulse と位置補正 | 接線摩擦、自己接触、長時間の貫入上限保証 |
+| 小石内部 | Neo-Hookean 粒子応力に辺長制約を重ね、2 iteration 解く | 連続体変形、破断、格子解像度への収束 |
+
+実装上は汎用 `contactFieldId` を追加せず、粒子 stride 80 byte の word 19 に三角形頂点 marker を保持する。
+水・油は別々の grid channel、小石は三角形 field と body-start list を用いる。
+`GridNode` は 80 byte、`TriangleFieldNode` は 32 byte、body-start は容量ベースで別 buffer に保持する。
+表示専用 occupancy binding 15 は維持し、新規 resource は binding 16/17 に接続した。
+計算順は `clearGrid → prepareParticles → buildBuckets → p2g → buildTriangleField → updateGrid → g2p → applyTriangleContactImpulses → solveBondedTriangles → commitParticles`。
+
+現在の `buildTriangleField` は各格子節点から全小石を走査し、AABB で narrow-phase を除外する。
+Gate 4 の 34,119 halo 込み grid node と200小石では、最大約6.82M node/body candidate checks/step になる。
+小石同士の SAT も最悪 200×199 の body pair checks/step を持つ。
+計測・spatial candidate list との比較は未実施であり、実機性能の合格や高密度 scene への拡張性は主張しない。
+
+追加された CPU reference/unit coverage は水–油 impulse、小石–液体の両側反力、
+辺長復元、clone marker/body metadata を対象にする。初回の局所 CPU/GPU 比較は３ probe に限る。
+接線運動量・長時間形状・三角形内部からの排出・最大貫入・運動量残差・clone 後の複数 step を含む
+M4 の合格条件は、個別の測定と scene-level 証拠が得られるまで未完了とする。
+Chrome 154 / Apple Metal 3 の GPU では５つの固定 seed の局所 probe がすべて component 別誤差基準内で、
+raw 最大絶対差は `1.9063e-2`。Gate 4 全体の複数 batch benchmark は numerical status 正常。
+別の局所 GPU 試験では三角形を複製し、頂点 marker と object ID を保持したまま追加 step 後も正常だった。
+いずれも短い GPU smoke test であり、上記の M4 scene-level 合格指標を代替しない。
 
 <a id="m5"></a>
 ### M5 — 粘性・表面張力・界面保持

@@ -21,7 +21,11 @@ if (!['stages', 'batch'].includes(profile)) throw new Error('--profile must be s
 
 async function benchmark(profile) {
 	const { createMpmMlsGpuSolver, MpmMlsGpuNumericalError } = await import('/src/lib/mpm/kernels/solver.ts');
-	const { createMpmGate4Scene, GATE4_GRID } = await import('/src/lib/mpm/scenes/gate4.ts');
+	const {
+		createMpmGate4Scene,
+		GATE4_GRID,
+		GATE4_PEBBLE_EDGE_LENGTH
+	} = await import('/src/lib/mpm/scenes/gate4.ts');
 	const { stepMpm } = await import('/src/lib/mpm/reference/solver.ts');
 	const gate4BenchmarkSeed = 0x4d504d34;
 	if (!navigator.gpu) throw new Error('WebGPU is unavailable.');
@@ -68,6 +72,7 @@ async function benchmark(profile) {
 		const scene = createMpmGate4Scene(gate4BenchmarkSeed);
 		const config = {
 			grid: GATE4_GRID, particleMass: 1, particleVolume: 25,
+			bondRestLength: GATE4_PEBBLE_EDGE_LENGTH,
 			material: { lambda: 20, mu: 10, model: 'neo-hookean' }, capacity: 1_000_000
 		};
 		solver = await createMpmMlsGpuSolver(canvas, scene.particles, config);

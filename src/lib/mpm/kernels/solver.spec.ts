@@ -29,8 +29,22 @@ function setupDevice() {
 		}),
 		end: vi.fn()
 	};
-	const encoder = { beginComputePass: vi.fn(() => pass), finish: vi.fn(() => ({})) };
+	const renderPass = {
+		setPipeline: vi.fn(),
+		setBindGroup: vi.fn(),
+		draw: vi.fn(),
+		end: vi.fn()
+	};
+	const encoder = {
+		beginComputePass: vi.fn(() => pass),
+		beginRenderPass: vi.fn(() => renderPass),
+		finish: vi.fn(() => ({}))
+	};
 	const queue = { writeBuffer: vi.fn(), submit: vi.fn() };
+	const getCompilationInfo = vi.fn(async () => ({ messages: [] }));
+	const context = {
+		getCurrentTexture: vi.fn(() => ({ createView: vi.fn(() => ({})) }))
+	};
 	const device = {
 		limits: {
 			maxBufferSize: 256 * 1024 * 1024,
@@ -43,11 +57,13 @@ function setupDevice() {
 		queue,
 		pushErrorScope: vi.fn(),
 		popErrorScope: vi.fn(async () => null),
-		createShaderModule: vi.fn(() => ({ getCompilationInfo: async () => ({ messages: [] }) })),
+		createShaderModule: vi.fn(() => ({ getCompilationInfo })),
 		createComputePipelineAsync: vi.fn(async ({ label }) => ({
 			label, getBindGroupLayout: () => ({})
 		})),
-		createRenderPipelineAsync: vi.fn(async () => ({ getBindGroupLayout: () => ({}) })),
+		createRenderPipelineAsync: vi.fn(async ({ label }) => ({
+			label, getBindGroupLayout: () => ({})
+		})),
 		createBuffer: vi.fn(({ label, size }) => {
 			const buffer = { label, size, destroy: vi.fn() };
 			buffers.push(buffer);
@@ -60,12 +76,12 @@ function setupDevice() {
 	vi.mocked(createMpmWebGpuSession).mockResolvedValue({
 		adapter: {} as GPUAdapter,
 		device: device as unknown as GPUDevice,
-		context: {} as GPUCanvasContext,
+		context: context as unknown as GPUCanvasContext,
 		format: 'bgra8unorm',
 		lost: device.lost,
 		dispose
 	});
-	return { device, encoder, pass, queue, dispatches, buffers, dispose };
+	return { device, encoder, pass, renderPass, queue, dispatches, buffers, dispose, getCompilationInfo };
 }
 
 const CONFIG = {
@@ -81,6 +97,37 @@ const PARTICLE: MpmParticle = {
 	C: { m00: 0, m01: 0, m10: 0, m11: 0 },
 	F: { m00: 1, m01: 0, m10: 0, m11: 1 }
 };
+const WATER_PARTICLE: MpmParticle = {
+	...PARTICLE,
+	material: { lambda: 8, mu: 0, model: 'water', density: 0.02 },
+	volume: 25
+};
+const OIL_PARTICLE: MpmParticle = {
+	...PARTICLE,
+	position: { x: 9, y: 4 },
+	material: { lambda: 6, mu: 0, model: 'oil', density: 0.016 },
+	volume: 25
+};
+const BONDED_TRIANGLE_PARTICLES: readonly MpmParticle[] = [
+	{
+		...PARTICLE,
+		position: { x: 8, y: 4 },
+		objectId: 9,
+		bondedTriangleVertex: 0
+	},
+	{
+		...PARTICLE,
+		position: { x: 8.6, y: 4 },
+		objectId: 9,
+		bondedTriangleVertex: 1
+	},
+	{
+		...PARTICLE,
+		position: { x: 8.3, y: 4.519615242270663 },
+		objectId: 9,
+		bondedTriangleVertex: 2
+	}
+];
 const CANVAS = { getContext() {} } as unknown as HTMLCanvasElement;
 
 describe('GPU MLS-MPM batch encoding', () => {
@@ -105,6 +152,101 @@ describe('GPU MLS-MPM batch encoding', () => {
 		expect(gpu.buffers.find(({ label }) => label.includes('prepared affine'))?.size).toBe(64);
 		for (const buffer of gpu.buffers) expect(buffer.destroy).toHaveBeenCalledOnce();
 		expect(gpu.dispose).toHaveBeenCalledOnce();
+	});
+
+	it('dispatches bonded triangle field, reaction, and constraint passes in dependency order', async () => {
+		const gpu = setupDevice();
+		const solver = await createMpmMlsGpuSolver(CANVAS, BONDED_TRIANGLE_PARTICLES, {
+			...CONFIG,
+			capacity: 6,
+			bondRestLength: 0.6
+		});
+		solver.step(0.001, { x: 0, y: 0 });
+
+		expect(gpu.dispatches.map(({ pipeline }) => pipeline)).toEqual([
+			'MLS-MPM clearGrid pipeline',
+			'MLS-MPM prepareParticles pipeline',
+			'MLS-MPM buildBuckets pipeline',
+			'MLS-MPM p2g pipeline',
+			'MLS-MPM buildTriangleField pipeline',
+			'MLS-MPM updateGrid pipeline',
+			'MLS-MPM g2p pipeline',
+			'MLS-MPM applyTriangleContactImpulses pipeline',
+			'MLS-MPM solveBondedTriangles pipeline',
+			'MLS-MPM commitParticles pipeline'
+		]);
+		expect(gpu.buffers.find(({ label }) => label.includes('triangle contact field'))?.size).toBe(
+			209 * 32
+		);
+		expect(gpu.buffers.find(({ label }) => label.includes('bonded triangle body indices'))?.size).toBe(
+			2 * Uint32Array.BYTES_PER_ELEMENT
+		);
+		solver.dispose();
+	});
+
+	describe('GPU MLS-MPM free-surface rendering', () => {
+		it('updates live bucket counts after GPU-side clones', async () => {
+			const gpu = setupDevice();
+			const solver = await createMpmMlsGpuSolver(CANVAS, [PARTICLE], CONFIG);
+			expect(
+				solver.clone(
+					{ particleIndex: 0, objectId: 0, anchor: PARTICLE.position },
+					{ x: 0.1, y: 0 }
+				)
+			).toBe(true);
+			expect(gpu.queue.writeBuffer).toHaveBeenLastCalledWith(
+				expect.objectContaining({ label: 'MLS-MPM simulation parameters' }),
+				16,
+				new Uint32Array([2, 209, 18, 0])
+			);
+
+			gpu.dispatches.length = 0;
+			solver.render('surface');
+			expect(gpu.dispatches.find(({ pipeline }) => pipeline === 'MLS-MPM buildBuckets pipeline'))
+				.toMatchObject({ input: 'MLS-MPM particle state A', workgroups: 1 });
+			solver.dispose();
+		});
+
+		it('gathers water and oil from the final batch buffer before drawing surfaces without liquid markers', async () => {
+			const gpu = setupDevice();
+			const solver = await createMpmMlsGpuSolver(
+				CANVAS,
+				[WATER_PARTICLE, OIL_PARTICLE],
+				CONFIG
+			);
+			expect(gpu.getCompilationInfo).toHaveBeenCalledTimes(2);
+			solver.stepBatch(1, 0.001, { x: 0, y: 0 });
+
+			const physicsBucket = gpu.dispatches.find(
+				({ pipeline }) => pipeline === 'MLS-MPM buildBuckets pipeline'
+			);
+			expect(physicsBucket?.input).toBe('MLS-MPM particle state A');
+
+			gpu.dispatches.length = 0;
+			solver.render('surface');
+
+			expect(gpu.dispatches.map(({ pipeline, input }) => [pipeline, input])).toEqual([
+				['MLS-MPM clearSurfaceOccupancy pipeline', undefined],
+				['MLS-MPM buildBuckets pipeline', 'MLS-MPM particle state B'],
+				['MLS-MPM gatherSurfaceOccupancy pipeline', 'MLS-MPM particle state B']
+			]);
+			expect(gpu.renderPass.setPipeline.mock.calls.map(([pipeline]) => pipeline.label)).toEqual([
+				'MLS-MPM water/oil surface render pipeline',
+				'MLS-MPM particle render pipeline'
+			]);
+			expect(gpu.renderPass.draw.mock.calls).toEqual([
+				[3, 1],
+				[6, 2]
+			]);
+
+			gpu.dispatches.length = 0;
+			gpu.renderPass.draw.mockClear();
+			solver.render('particles');
+			expect(gpu.dispatches).toEqual([]);
+			expect(gpu.renderPass.draw.mock.calls).toEqual([[6, 2]]);
+			expect(() => solver.render('unsupported' as 'surface')).toThrow(/render mode/);
+			solver.dispose();
+		});
 	});
 
 	it('skips zero-workgroup particle dispatches while updating the empty grid', async () => {

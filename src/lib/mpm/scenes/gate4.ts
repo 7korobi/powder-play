@@ -10,8 +10,8 @@ export const GATE4_PEBBLE_PARTICLE_COUNT =
 export const GATE4_PEBBLE_COLUMNS = 14;
 export const GATE4_PEBBLE_ROWS = 15;
 export const GATE4_PEBBLE_SPACING = 68;
-export const GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX = 12;
-export const GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX = 24;
+export const GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX = 60;
+export const GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX = 120;
 const PEBBLE_BASE_WIDTH_RATIO = 0.005;
 const PEBBLE_SIZE_MULTIPLIER = 6;
 const UINT32_RANGE = 0x1_0000_0000;
@@ -170,9 +170,10 @@ export function createMpmGate4Scene(
 		};
 		const pebbleStart = particles.length;
 		const objectId = PEBBLE_FIRST_OBJECT_ID + pebbleIndex;
-		for (const position of getPebbleVertices(center)) {
+		const vertices = getPebbleVertices(center);
+		for (let vertex = 0; vertex < vertices.length; vertex += 1) {
 			particles.push({
-				position,
+				position: vertices[vertex],
 				velocity: createRandomVelocity(
 					random,
 					GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX
@@ -180,6 +181,7 @@ export function createMpmGate4Scene(
 				C: ZERO_MATRIX,
 				F: INITIAL_DEFORMATION,
 				objectId,
+				bondedTriangleVertex: vertex as 0 | 1 | 2,
 				plasticVolume: 1,
 				material: PEBBLE_MATERIAL
 			});
@@ -215,7 +217,7 @@ export function createMpmCpuParitySample(
 		return particles[index];
 	});
 	const interactionRadius = gridCellSize * 3;
-	const sourceIndices: number[] = [];
+	const sourceIndices = new Set<number>();
 	for (let index = 0; index < particles.length; index += 1) {
 		const particle = particles[index];
 		if (
@@ -225,12 +227,70 @@ export function createMpmCpuParitySample(
 					Math.abs(particle.position.y - probe.position.y) <= interactionRadius
 			)
 		) {
-			sourceIndices.push(index);
+			sourceIndices.add(index);
 		}
 	}
+	const contactRadius = interactionRadius + 2 * gridCellSize;
+	for (let bodyStart = 0; bodyStart < particles.length; bodyStart += 1) {
+		if (particles[bodyStart].bondedTriangleVertex !== 0) continue;
+		const body = particles.slice(bodyStart, bodyStart + 3);
+		if (
+			body.length !== 3 ||
+			body.some(
+				(particle, vertex) => particle.bondedTriangleVertex !== vertex
+			)
+		) {
+			throw new RangeError(`Bonded triangle at particle ${bodyStart} is incomplete.`);
+		}
+		const minX = Math.min(...body.map(({ position }) => position.x));
+		const maxX = Math.max(...body.map(({ position }) => position.x));
+		const minY = Math.min(...body.map(({ position }) => position.y));
+		const maxY = Math.max(...body.map(({ position }) => position.y));
+		const relevant = probeParticles.some(
+			({ position }) =>
+				position.x >= minX - contactRadius &&
+				position.x <= maxX + contactRadius &&
+				position.y >= minY - contactRadius &&
+				position.y <= maxY + contactRadius
+		);
+		if (!relevant) continue;
+		for (let vertex = 0; vertex < 3; vertex += 1) {
+			sourceIndices.add(bodyStart + vertex);
+		}
+		for (let index = 0; index < particles.length; index += 1) {
+			const { position } = particles[index];
+			if (
+				position.x >= minX - interactionRadius &&
+				position.x <= maxX + interactionRadius &&
+				position.y >= minY - interactionRadius &&
+				position.y <= maxY + interactionRadius
+			) {
+				sourceIndices.add(index);
+			}
+		}
+	}
+	for (const sourceIndex of [...sourceIndices]) {
+		const vertex = particles[sourceIndex].bondedTriangleVertex;
+		if (vertex === undefined) continue;
+		const bodyStart = sourceIndex - vertex;
+		const body = particles.slice(bodyStart, bodyStart + 3);
+		if (
+			body.length !== 3 ||
+			body.some((particle, expectedVertex) => particle.bondedTriangleVertex !== expectedVertex)
+		) {
+			throw new RangeError(`Bonded triangle at particle ${bodyStart} is incomplete.`);
+		}
+		for (let expectedVertex = 0; expectedVertex < 3; expectedVertex += 1) {
+			sourceIndices.add(bodyStart + expectedVertex);
+		}
+	}
+	const orderedSourceIndices = [...sourceIndices].sort((first, second) => first - second);
 
 	const sampleIndexBySource = new Map(
-		sourceIndices.map((sourceIndex, sampleIndex) => [sourceIndex, sampleIndex])
+		orderedSourceIndices.map((sourceIndex, sampleIndex) => [
+			sourceIndex,
+			sampleIndex
+		])
 	);
 	const probeSampleIndices = probeIndices.map((sourceIndex) => {
 		const sampleIndex = sampleIndexBySource.get(sourceIndex);
@@ -241,8 +301,8 @@ export function createMpmCpuParitySample(
 	});
 
 	return {
-		particles: sourceIndices.map((index) => particles[index]),
-		sourceIndices,
+		particles: orderedSourceIndices.map((index) => particles[index]),
+		sourceIndices: orderedSourceIndices,
 		probeSampleIndices
 	};
 }

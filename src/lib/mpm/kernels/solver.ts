@@ -16,6 +16,7 @@ import {
 	packMpmMlsGpuStepParameters,
 	PARTICLE_STRIDE_BYTES,
 	RENDER_PARAMS_BYTES,
+	SURFACE_RENDER_PARAMS_BYTES,
 	SIMULATION_PARAMS_BYTES,
 	validateMpmMlsGpuInput,
 	type MpmMlsGpuBufferLayout,
@@ -33,13 +34,15 @@ export interface MpmMlsGpuSelection {
 	readonly anchor: MpmVector2;
 }
 
+export type MpmMlsGpuRenderMode = 'surface' | 'particles';
+
 export interface MpmMlsGpuSolver {
 	readonly deviceLost: Promise<GPUDeviceLostInfo>;
 	readonly particleCount: number;
 	readonly particleCapacity: number;
 	step(dt: number, gravity: MpmVector2): void;
 	stepBatch(stepCount: number, dt: number, gravity: MpmVector2): void;
-	render(): void;
+	render(mode?: MpmMlsGpuRenderMode): void;
 	readParticles(particleIndices?: readonly number[]): Promise<readonly MpmParticle[]>;
 	checkNumericalStatus(): Promise<void>;
 	measureQueueCompletionMs(): Promise<number>;
@@ -74,7 +77,9 @@ export class MpmMlsGpuNumericalError extends Error {
 			[128, 'invalid P2G material parameters'],
 			[256, 'non-finite particle stress or momentum'],
 			[1024, 'non-finite P2G node accumulation'],
-			[2048, 'non-finite P2G node output']
+			[2048, 'non-finite P2G node output'],
+			[4096, 'invalid triangle contact field or reaction'],
+			[8192, 'invalid bonded triangle state']
 		] as const;
 		const message = details
 			.filter(([flag]) => (flags & flag) !== 0)
@@ -98,6 +103,25 @@ export class MpmMlsGpuNumericalError extends Error {
 				'all particles were rolled back to the last valid state.'
 		);
 		this.name = 'MpmMlsGpuNumericalError';
+	}
+}
+
+class MpmMlsGpuSurfaceError extends Error {
+	constructor(readonly flags: number) {
+		const details = [
+			[1, 'invalid free-surface bucket state'],
+			[2, 'invalid particle area or deformation determinant'],
+			[4, 'non-finite free-surface occupancy accumulation']
+		] as const;
+		const message = details
+			.filter(([flag]) => (flags & flag) !== 0)
+			.map(([, description]) => description)
+			.join('; ');
+		super(
+			`GPU free-surface occupancy generation failed (${message || `status 0x${flags.toString(16)}`}); ` +
+				'particle state was not modified.'
+		);
+		this.name = 'MpmMlsGpuSurfaceError';
 	}
 }
 
@@ -142,24 +166,45 @@ function decodeNumericalError(
 	);
 }
 
+function decodeSurfaceError(
+	snapshot: ArrayBuffer,
+	offset: number
+): MpmMlsGpuSurfaceError | null {
+	const surfaceFlags = new Uint32Array(snapshot, offset, NUMERICAL_STATUS_WORDS)[
+		SURFACE_STATUS_WORD_INDEX
+	];
+	return surfaceFlags === 0 ? null : new MpmMlsGpuSurfaceError(surfaceFlags);
+}
+
 interface MpmMlsGpuPipelines {
 	readonly clearGrid: GPUComputePipeline;
+	readonly clearSurfaceOccupancy: GPUComputePipeline;
 	readonly prepareParticles: GPUComputePipeline;
 	readonly buildBuckets: GPUComputePipeline;
+	readonly buildTriangleField: GPUComputePipeline;
+	readonly gatherSurfaceOccupancy: GPUComputePipeline;
 	readonly p2g: GPUComputePipeline;
 	readonly updateGrid: GPUComputePipeline;
 	readonly g2p: GPUComputePipeline;
+	readonly applyTriangleContactImpulses: GPUComputePipeline;
+	readonly solveBondedTriangles: GPUComputePipeline;
 	readonly commitParticles: GPUComputePipeline;
 	readonly pick: GPUComputePipeline;
 	readonly cloneObject: GPUComputePipeline;
 	readonly render: GPURenderPipeline;
+	readonly surfaceRender: GPURenderPipeline;
 }
 
 interface MpmMlsGpuStepBindings {
+	readonly gatherSurfaceOccupancy: GPUBindGroup;
 	readonly prepareParticles: GPUBindGroup;
 	readonly buildBuckets: GPUBindGroup;
+	readonly buildTriangleField: GPUBindGroup;
 	readonly p2g: GPUBindGroup;
+	readonly updateGrid: GPUBindGroup;
 	readonly g2p: GPUBindGroup;
+	readonly applyTriangleContactImpulses: GPUBindGroup;
+	readonly solveBondedTriangles: GPUBindGroup;
 	readonly commitParticles: GPUBindGroup;
 	readonly pick: GPUBindGroup;
 	readonly render: GPUBindGroup;
@@ -168,7 +213,9 @@ interface MpmMlsGpuStepBindings {
 const INTERACTION_PARAMS_BYTES = 32;
 const PICK_PARAMS_BYTES = 32;
 const PICK_RESULT_BYTES = 16;
-const CLONE_PARAMS_BYTES = 32;
+const CLONE_PARAMS_BYTES = 48;
+const SURFACE_STATUS_WORD_INDEX = 7;
+const SURFACE_PARAMETER_DT = 1;
 const MAX_U32 = 0xffff_ffff;
 const DRAG_STIFFNESS = 20;
 const DRAG_DAMPING = 8;
@@ -233,10 +280,14 @@ interface MpmMlsGpuRuntime {
 		readonly simulationParams: GPUBuffer;
 		readonly interactionParams: GPUBuffer;
 		readonly renderParams: GPUBuffer;
+		readonly surfaceRenderParams: GPUBuffer;
 		readonly stateError: GPUBuffer;
 		readonly bucketHeads: GPUBuffer;
 		readonly bucketNext: GPUBuffer;
 		readonly gridNodes: GPUBuffer;
+		readonly surfaceFields: GPUBuffer;
+		readonly triangleFieldNodes: GPUBuffer;
+		readonly bondedBodyStarts: GPUBuffer;
 		readonly preparedAffines: GPUBuffer;
 		readonly particleObjectIds: GPUBuffer;
 		readonly pickParams: GPUBuffer;
@@ -246,7 +297,8 @@ interface MpmMlsGpuRuntime {
 	};
 	readonly pipelines: MpmMlsGpuPipelines;
 	readonly clearGrid: GPUBindGroup;
-	readonly updateGrid: GPUBindGroup;
+	readonly clearSurfaceOccupancy: GPUBindGroup;
+	readonly surfaceRender: GPUBindGroup;
 	readonly bindings: readonly [MpmMlsGpuStepBindings, MpmMlsGpuStepBindings];
 	readonly cloneBindings: readonly [GPUBindGroup, GPUBindGroup];
 }
@@ -271,15 +323,45 @@ async function createRuntime(
 
 	const pipelines: MpmMlsGpuPipelines = {
 		clearGrid: await createComputePipeline(device, computeModule, 'clearGrid'),
+		clearSurfaceOccupancy: await createComputePipeline(
+			device,
+			computeModule,
+			'clearSurfaceOccupancy'
+		),
 		prepareParticles: await createComputePipeline(device, computeModule, 'prepareParticles'),
 		buildBuckets: await createComputePipeline(device, computeModule, 'buildBuckets'),
+		buildTriangleField: await createComputePipeline(
+			device,
+			computeModule,
+			'buildTriangleField'
+		),
+		gatherSurfaceOccupancy: await createComputePipeline(
+			device,
+			computeModule,
+			'gatherSurfaceOccupancy'
+		),
 		p2g: await createComputePipeline(device, computeModule, 'p2g'),
 		updateGrid: await createComputePipeline(device, computeModule, 'updateGrid'),
 		g2p: await createComputePipeline(device, computeModule, 'g2p'),
+		applyTriangleContactImpulses: await createComputePipeline(
+			device,
+			computeModule,
+			'applyTriangleContactImpulses'
+		),
+		solveBondedTriangles: await createComputePipeline(
+			device,
+			computeModule,
+			'solveBondedTriangles'
+		),
 		commitParticles: await createComputePipeline(device, computeModule, 'commitParticles'),
 		pick: await createComputePipeline(device, computeModule, 'pickParticle'),
 		cloneObject: await createComputePipeline(device, computeModule, 'cloneObject'),
-		render: await createRenderPipeline(device, renderModule, format)
+		render: await createRenderPipeline(device, renderModule, format),
+		surfaceRender: await createRenderPipeline(device, renderModule, format, {
+			label: 'MLS-MPM water/oil surface render pipeline',
+			vertexEntryPoint: 'surfaceVertexMain',
+			fragmentEntryPoint: 'surfaceFragmentMain'
+		})
 	};
 
 	const createBuffer = (label: string, size: number, usage: GPUBufferUsageFlags) => {
@@ -306,6 +388,11 @@ async function createRuntime(
 			RENDER_PARAMS_BYTES,
 			BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST
 		),
+		surfaceRenderParams: createBuffer(
+			'MLS-MPM free-surface render parameters',
+			SURFACE_RENDER_PARAMS_BYTES,
+			BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST
+		),
 		stateError: createBuffer(
 			'MLS-MPM numerical status',
 			NUMERICAL_STATUS_BYTES,
@@ -325,6 +412,21 @@ async function createRuntime(
 			'MLS-MPM halo grid state',
 			layout.gridStateBytes,
 			BUFFER_USAGE.STORAGE
+		),
+		surfaceFields: createBuffer(
+			'MLS-MPM water/oil occupancy fields',
+			layout.surfaceFieldBytes,
+			BUFFER_USAGE.STORAGE
+		),
+		triangleFieldNodes: createBuffer(
+			'MLS-MPM triangle contact field',
+			layout.triangleFieldBytes,
+			BUFFER_USAGE.STORAGE
+		),
+		bondedBodyStarts: createBuffer(
+			'MLS-MPM bonded triangle body indices',
+			layout.bondedBodyStartBytes,
+			BUFFER_USAGE.STORAGE | BUFFER_USAGE.COPY_DST
 		),
 		preparedAffines: createBuffer(
 			'MLS-MPM prepared affine momentum',
@@ -368,32 +470,58 @@ async function createRuntime(
 	device.queue.writeBuffer(
 		buffers.stateError,
 		0,
-		new Uint32Array([0, MAX_U32, 0, 0, 0, 0, 0])
+		new Uint32Array([0, MAX_U32, 0, 0, 0, 0, 0, 0])
+	);
+	// Surface bucketing needs the grid/count fields before the first simulation step.
+	// This valid placeholder is replaced by the caller's full physics parameters before stepping.
+	device.queue.writeBuffer(
+		buffers.simulationParams,
+		0,
+		packMpmMlsGpuStepParameters(state, layout, SURFACE_PARAMETER_DT, { x: 0, y: 0 })
 	);
 	device.queue.writeBuffer(buffers.interactionParams, 0, new Float32Array(8));
 	device.queue.writeBuffer(buffers.pickResult, 0, new Uint32Array([MAX_U32, 0, 0, 0]));
 	device.queue.writeBuffer(
 		buffers.renderParams,
 		0,
-		createRenderParameters(state)
+		createRenderParameters(state, 'particles')
+	);
+	device.queue.writeBuffer(
+		buffers.surfaceRenderParams,
+		0,
+		createSurfaceRenderParameters(state, layout)
 	);
 	if (layout.particleStateBytes > 0) {
 		device.queue.writeBuffer(buffers.particles[0], 0, state.packedParticles);
 		device.queue.writeBuffer(buffers.particleObjectIds, 0, state.packedObjectIds);
 	}
+	if (state.bondedBodyStarts.length > 0) {
+		device.queue.writeBuffer(
+			buffers.bondedBodyStarts,
+			0,
+			state.bondedBodyStarts
+		);
+	}
 
 	const clearGrid = createBindGroup(device, pipelines.clearGrid, [
 		bufferEntry(0, buffers.simulationParams),
 		bufferEntry(3, buffers.bucketHeads),
-		bufferEntry(5, buffers.gridNodes)
-	]);
-	const updateGrid = createBindGroup(device, pipelines.updateGrid, [
-		bufferEntry(0, buffers.simulationParams),
 		bufferEntry(5, buffers.gridNodes),
-		bufferEntry(6, buffers.stateError),
-		bufferEntry(7, buffers.interactionParams)
+		bufferEntry(16, buffers.triangleFieldNodes)
 	]);
-
+	const clearSurfaceOccupancy = createBindGroup(
+		device,
+		pipelines.clearSurfaceOccupancy,
+		[
+			bufferEntry(0, buffers.simulationParams),
+			bufferEntry(3, buffers.bucketHeads),
+			bufferEntry(15, buffers.surfaceFields)
+		]
+	);
+	const surfaceRender = createBindGroup(device, pipelines.surfaceRender, [
+		bufferEntry(2, buffers.surfaceFields),
+		bufferEntry(3, buffers.surfaceRenderParams)
+	]);
 	const createStepBindings = (inputIndex: 0 | 1): MpmMlsGpuStepBindings => {
 		const inputBuffers = buffers.particles;
 		const input = inputBuffers[inputIndex];
@@ -411,6 +539,29 @@ async function createRuntime(
 			bufferEntry(4, buffers.bucketNext),
 			bufferEntry(6, buffers.stateError)
 		]);
+		const buildTriangleField = createBindGroup(
+			device,
+			pipelines.buildTriangleField,
+			[
+				bufferEntry(0, buffers.simulationParams),
+				bufferEntry(1, input),
+				bufferEntry(6, buffers.stateError),
+				bufferEntry(16, buffers.triangleFieldNodes),
+				bufferEntry(17, buffers.bondedBodyStarts)
+			]
+		);
+		const gatherSurfaceOccupancy = createBindGroup(
+			device,
+			pipelines.gatherSurfaceOccupancy,
+			[
+				bufferEntry(0, buffers.simulationParams),
+				bufferEntry(1, input),
+				bufferEntry(3, buffers.bucketHeads),
+				bufferEntry(4, buffers.bucketNext),
+				bufferEntry(6, buffers.stateError),
+				bufferEntry(15, buffers.surfaceFields)
+			]
+		);
 		const p2g = createBindGroup(device, pipelines.p2g, [
 			bufferEntry(0, buffers.simulationParams),
 			bufferEntry(1, input),
@@ -420,13 +571,46 @@ async function createRuntime(
 			bufferEntry(6, buffers.stateError),
 			bufferEntry(14, buffers.preparedAffines)
 		]);
+		const updateGrid = createBindGroup(device, pipelines.updateGrid, [
+			bufferEntry(0, buffers.simulationParams),
+			bufferEntry(1, input),
+			bufferEntry(5, buffers.gridNodes),
+			bufferEntry(6, buffers.stateError),
+			bufferEntry(7, buffers.interactionParams),
+			bufferEntry(16, buffers.triangleFieldNodes)
+		]);
 		const g2p = createBindGroup(device, pipelines.g2p, [
 			bufferEntry(0, buffers.simulationParams),
 			bufferEntry(1, input),
 			bufferEntry(2, output),
 			bufferEntry(5, buffers.gridNodes),
-			bufferEntry(6, buffers.stateError)
+			bufferEntry(6, buffers.stateError),
+			bufferEntry(16, buffers.triangleFieldNodes)
 		]);
+		const applyTriangleContactImpulses = createBindGroup(
+			device,
+			pipelines.applyTriangleContactImpulses,
+			[
+				bufferEntry(0, buffers.simulationParams),
+				bufferEntry(1, input),
+				bufferEntry(2, output),
+				bufferEntry(6, buffers.stateError),
+				bufferEntry(16, buffers.triangleFieldNodes),
+				bufferEntry(17, buffers.bondedBodyStarts)
+			]
+		);
+		const solveBondedTriangles = createBindGroup(
+			device,
+			pipelines.solveBondedTriangles,
+			[
+				bufferEntry(0, buffers.simulationParams),
+				bufferEntry(1, input),
+				bufferEntry(2, output),
+				bufferEntry(6, buffers.stateError),
+				bufferEntry(8, buffers.particleObjectIds),
+				bufferEntry(17, buffers.bondedBodyStarts)
+			]
+		);
 		const commitParticles = createBindGroup(device, pipelines.commitParticles, [
 			bufferEntry(0, buffers.simulationParams),
 			bufferEntry(1, input),
@@ -443,13 +627,27 @@ async function createRuntime(
 			bufferEntry(9, buffers.pickParams),
 			bufferEntry(10, buffers.pickResult)
 		]);
-		return { prepareParticles, buildBuckets, p2g, g2p, commitParticles, pick, render };
+		return {
+			gatherSurfaceOccupancy,
+			prepareParticles,
+			buildBuckets,
+			buildTriangleField,
+			p2g,
+			updateGrid,
+			g2p,
+			applyTriangleContactImpulses,
+			solveBondedTriangles,
+			commitParticles,
+			pick,
+			render
+		};
 	};
 	const createCloneBinding = (inputIndex: 0 | 1): GPUBindGroup =>
 		createBindGroup(device, pipelines.cloneObject, [
 			bufferEntry(11, buffers.particles[inputIndex]),
 			bufferEntry(12, buffers.particleObjectIds),
-			bufferEntry(13, buffers.cloneParams)
+			bufferEntry(13, buffers.cloneParams),
+			bufferEntry(17, buffers.bondedBodyStarts)
 		]);
 	const bindings: readonly [
 		MpmMlsGpuStepBindings,
@@ -460,7 +658,15 @@ async function createRuntime(
 		createCloneBinding(1)
 	];
 
-	return { buffers, pipelines, clearGrid, updateGrid, bindings, cloneBindings };
+	return {
+		buffers,
+		pipelines,
+		clearGrid,
+		clearSurfaceOccupancy,
+		surfaceRender,
+		bindings,
+		cloneBindings
+	};
 }
 
 function createSolver(
@@ -476,10 +682,13 @@ function createSolver(
 	let lostInfo: GPUDeviceLostInfo | null = null;
 	let pickPending = false;
 	let activeDrag: { readonly radius: number } | null = null;
+	let currentRenderMode: MpmMlsGpuRenderMode = 'particles';
+	let bondedBodyCount = state.bondedBodyStarts.length;
 	const temporaryReadbacks = new Set<GPUBuffer>();
 	const objectRanges = new Map<number, MpmMlsGpuObjectRange>(
 		state.objectRanges.map((range) => [range.objectId, range])
 	);
+	const bondedBodyCountsByObjectId = new Map(state.bondedBodyCountsByObjectId);
 	let nextObjectId = 0;
 	for (const range of state.objectRanges) {
 		nextObjectId = Math.max(nextObjectId, range.objectId + 1);
@@ -547,7 +756,14 @@ function createSolver(
 		if (!Number.isSafeInteger(stepCount) || stepCount < 1) {
 			throw new RangeError('stepCount must be a positive safe integer.');
 		}
-		const parameters = packMpmMlsGpuStepParameters(state, layout, dt, gravity, particleCount);
+		const parameters = packMpmMlsGpuStepParameters(
+			state,
+			layout,
+			dt,
+			gravity,
+			particleCount,
+			bondedBodyCount
+		);
 		let inputIndex = currentBuffer;
 		try {
 			session.device.queue.writeBuffer(runtime.buffers.simulationParams, 0, parameters);
@@ -579,10 +795,18 @@ function createSolver(
 					particleCount
 				);
 				dispatchCompute(pass, runtime.pipelines.p2g, groups.p2g, layout.nodeCount);
+				if (bondedBodyCount > 0) {
+					dispatchCompute(
+						pass,
+						runtime.pipelines.buildTriangleField,
+						groups.buildTriangleField,
+						bondedBodyCount > 0 ? layout.nodeCount : 0
+					);
+				}
 				dispatchCompute(
 					pass,
 					runtime.pipelines.updateGrid,
-					runtime.updateGrid,
+					groups.updateGrid,
 					layout.nodeCount
 				);
 				dispatchCompute(
@@ -591,6 +815,20 @@ function createSolver(
 					groups.g2p,
 					particleCount
 				);
+				if (bondedBodyCount > 0) {
+					dispatchCompute(
+						pass,
+						runtime.pipelines.applyTriangleContactImpulses,
+						groups.applyTriangleContactImpulses,
+						bondedBodyCount
+					);
+					dispatchCompute(
+						pass,
+						runtime.pipelines.solveBondedTriangles,
+						groups.solveBondedTriangles,
+						bondedBodyCount
+					);
+				}
 				dispatchCompute(
 					pass,
 					runtime.pipelines.commitParticles,
@@ -610,12 +848,51 @@ function createSolver(
 		}
 	}
 
-	function render(): void {
+	function render(mode: MpmMlsGpuRenderMode = 'particles'): void {
 		assertActive();
+		if (mode !== 'surface' && mode !== 'particles') {
+			throw new RangeError('render mode must be "surface" or "particles".');
+		}
 		try {
+			if (mode !== currentRenderMode) {
+				session.device.queue.writeBuffer(
+					runtime.buffers.renderParams,
+					0,
+					createRenderParameters(state, mode)
+				);
+				currentRenderMode = mode;
+			}
 			const encoder = session.device.createCommandEncoder({
-				label: 'MLS-MPM particle render'
+				label:
+					mode === 'surface'
+						? 'MLS-MPM water/oil surface render'
+						: 'MLS-MPM particle-marker diagnostic render'
 			});
+			if (mode === 'surface') {
+				const computePass = encoder.beginComputePass({
+					label: 'MLS-MPM final-particle occupancy gather'
+				});
+				const groups = runtime.bindings[currentBuffer];
+				dispatchCompute(
+					computePass,
+					runtime.pipelines.clearSurfaceOccupancy,
+					runtime.clearSurfaceOccupancy,
+					layout.nodeCount
+				);
+				dispatchCompute(
+					computePass,
+					runtime.pipelines.buildBuckets,
+					groups.buildBuckets,
+					particleCount
+				);
+				dispatchCompute(
+					computePass,
+					runtime.pipelines.gatherSurfaceOccupancy,
+					groups.gatherSurfaceOccupancy,
+					layout.nodeCount
+				);
+				computePass.end();
+			}
 			const pass = encoder.beginRenderPass({
 				colorAttachments: [
 					{
@@ -626,13 +903,20 @@ function createSolver(
 					}
 				]
 			});
+			if (mode === 'surface') {
+				pass.setPipeline(runtime.pipelines.surfaceRender);
+				pass.setBindGroup(0, runtime.surfaceRender);
+				pass.draw(3, 1);
+			}
 			pass.setPipeline(runtime.pipelines.render);
 			pass.setBindGroup(0, runtime.bindings[currentBuffer].render);
 			pass.draw(6, particleCount);
 			pass.end();
 			session.device.queue.submit([encoder.finish()]);
 		} catch (cause) {
-			throw new Error('Failed to render MLS-MPM particles from GPU state.', { cause });
+			throw new Error(`Failed to render MLS-MPM ${mode} view from GPU state.`, {
+				cause
+			});
 		}
 	}
 
@@ -683,8 +967,15 @@ function createSolver(
 
 			const numericalError = decodeNumericalError(snapshot, 0);
 			if (numericalError) throw numericalError;
+			const surfaceError = decodeSurfaceError(snapshot, 0);
+			if (surfaceError) throw surfaceError;
 		} catch (cause) {
-			if (cause instanceof MpmMlsGpuNumericalError) throw cause;
+			if (
+				cause instanceof MpmMlsGpuNumericalError ||
+				cause instanceof MpmMlsGpuSurfaceError
+			) {
+				throw cause;
+			}
 			throw new Error('Failed to read GPU MLS-MPM numerical status.', { cause });
 		} finally {
 			if (mapped) {
@@ -818,9 +1109,18 @@ function createSolver(
 			if (numericalError) {
 				throw numericalError;
 			}
+			const surfaceError = decodeSurfaceError(snapshot, errorOffset);
+			if (surfaceError) {
+				throw surfaceError;
+			}
 			return particles;
 		} catch (cause) {
-			if (cause instanceof MpmMlsGpuNumericalError) throw cause;
+			if (
+				cause instanceof MpmMlsGpuNumericalError ||
+				cause instanceof MpmMlsGpuSurfaceError
+			) {
+				throw cause;
+			}
 			throw new Error('Failed to read GPU MLS-MPM particle state.', { cause });
 		} finally {
 			if (mapped) {
@@ -965,6 +1265,10 @@ function createSolver(
 		const source = resolveSelection(selection);
 		const translation = validateMpmCloneOffset(offset);
 		if (source.count > layout.particleCapacity - particleCount) return false;
+		const sourceBondedBodyCount = bondedBodyCountsByObjectId.get(source.objectId) ?? 0;
+		if (sourceBondedBodyCount > layout.bondedBodyCapacity - bondedBodyCount) {
+			return false;
+		}
 		if (nextObjectId > MAX_U32) {
 			throw new RangeError('No unsigned 32-bit object ids remain for MLS-MPM cloning.');
 		}
@@ -983,6 +1287,12 @@ function createSolver(
 			translation.y,
 			state.domainWidthF32,
 			state.domainHeightF32
+		]);
+		new Uint32Array(parameters, 32, 4).set([
+			sourceBondedBodyCount,
+			bondedBodyCount,
+			layout.bondedBodyCapacity,
+			0
 		]);
 
 		try {
@@ -1011,8 +1321,27 @@ function createSolver(
 			start: destinationStart,
 			count: source.count
 		});
+		bondedBodyCountsByObjectId.set(clonedObjectId, sourceBondedBodyCount);
 		particleCount += source.count;
+		bondedBodyCount += sourceBondedBodyCount;
 		nextObjectId++;
+		try {
+			// Refresh only live gather counts; preserve step and material parameters.
+			session.device.queue.writeBuffer(
+				runtime.buffers.simulationParams,
+				16,
+				new Uint32Array([
+					particleCount,
+					layout.nodeCount,
+					particleCount * 9,
+					bondedBodyCount
+				])
+			);
+		} catch (cause) {
+			throw new Error('Failed to update the active particle count for surface rendering.', {
+				cause
+			});
+		}
 		return true;
 	}
 
@@ -1090,23 +1419,29 @@ async function createComputePipeline(
 async function createRenderPipeline(
 	device: GPUDevice,
 	module: GPUShaderModule,
-	format: GPUTextureFormat
+	format: GPUTextureFormat,
+	options: {
+		readonly label?: string;
+		readonly vertexEntryPoint?: string;
+		readonly fragmentEntryPoint?: string;
+	} = {}
 ): Promise<GPURenderPipeline> {
+	const label = options.label ?? 'MLS-MPM particle render pipeline';
 	try {
 		return await device.createRenderPipelineAsync({
-			label: 'MLS-MPM particle render pipeline',
+			label,
 			layout: 'auto',
-			vertex: { module, entryPoint: 'vertexMain' },
+			vertex: { module, entryPoint: options.vertexEntryPoint ?? 'vertexMain' },
 			fragment: {
 				module,
-				entryPoint: 'fragmentMain',
+				entryPoint: options.fragmentEntryPoint ?? 'fragmentMain',
 				targets: [{ format }]
 			},
 			primitive: { topology: 'triangle-list' }
 		});
 	} catch (cause) {
 		throw new Error(
-			`Failed to create the MLS-MPM particle render pipeline: ${describeError(cause)}`,
+			`Failed to create the ${label}: ${describeError(cause)}`,
 			{ cause }
 		);
 	}
@@ -1143,7 +1478,10 @@ function bufferEntry(binding: number, buffer: GPUBuffer): GPUBindGroupEntry {
 	return { binding, resource: { buffer } };
 }
 
-function createRenderParameters(state: ValidatedMpmMlsGpuInput): Float32Array {
+function createRenderParameters(
+	state: ValidatedMpmMlsGpuInput,
+	mode: MpmMlsGpuRenderMode
+): Float32Array {
 	const radius = Math.fround(state.cellSizeF32 * 0.22);
 	if (!Number.isFinite(radius) || radius <= 0) {
 		throw new RangeError('grid.cellSize cannot produce a visible float32 particle radius');
@@ -1152,8 +1490,28 @@ function createRenderParameters(state: ValidatedMpmMlsGpuInput): Float32Array {
 		state.domainWidthF32,
 		state.domainHeightF32,
 		radius,
+		mode === 'surface' ? 1 : 0
+	]);
+}
+
+function createSurfaceRenderParameters(
+	state: ValidatedMpmMlsGpuInput,
+	layout: MpmMlsGpuBufferLayout
+): ArrayBuffer {
+	const parameters = new ArrayBuffer(SURFACE_RENDER_PARAMS_BYTES);
+	new Uint32Array(parameters, 0, 4).set([
+		layout.nodeWidth,
+		layout.nodeHeight,
+		state.config.grid.cellsX,
+		state.config.grid.cellsY
+	]);
+	new Float32Array(parameters, 16, 4).set([
+		state.domainWidthF32,
+		state.domainHeightF32,
+		state.cellSizeF32,
 		0
 	]);
+	return parameters;
 }
 
 function unpackParticles(
@@ -1166,6 +1524,18 @@ function unpackParticles(
 	for (let index = 0; index < particleCount; index++) {
 		const offset = index * PARTICLE_FLOATS;
 		const model = decodeMpmConstitutiveModel(words[offset + 13]);
+		const bondedVertexMarker = words[offset + 19];
+		if (bondedVertexMarker > 3) {
+			throw new RangeError(`GPU particle ${index} has an invalid bonded triangle marker.`);
+		}
+		const bondedTriangleVertex =
+			bondedVertexMarker === 1
+				? 0
+				: bondedVertexMarker === 2
+					? 1
+					: bondedVertexMarker === 3
+						? 2
+						: undefined;
 		const lambda = values[offset + 14];
 		const mu = values[offset + 15];
 		let material: MpmMaterialParameters;
@@ -1204,6 +1574,7 @@ function unpackParticles(
 			plasticVolume: values[offset + 12],
 			volume: values[offset + 17],
 			material,
+			...(bondedTriangleVertex === undefined ? {} : { bondedTriangleVertex }),
 			objectId: objectIds[index]
 		});
 	}

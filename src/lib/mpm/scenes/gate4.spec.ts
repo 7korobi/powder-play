@@ -272,9 +272,17 @@ describe('Gate 4 mixed-material sample scene', () => {
 						GATE4_GRID.cellsY * GATE4_GRID.cellSize - wallCushion
 			)
 		).toBe(true);
-		expect(sample.particles).toHaveLength(57);
-		expect(sample.sourceIndices).toHaveLength(57);
+		expect(sample.particles).toHaveLength(110);
+		expect(sample.sourceIndices).toHaveLength(110);
 		expect(sample.probeSampleIndices).toHaveLength(3);
+		for (const sourceIndex of sample.sourceIndices) {
+			const vertex = scene.particles[sourceIndex].bondedTriangleVertex;
+			if (vertex === undefined) continue;
+			const bodyStart = sourceIndex - vertex;
+			expect(sample.sourceIndices).toContain(bodyStart);
+			expect(sample.sourceIndices).toContain(bodyStart + 1);
+			expect(sample.sourceIndices).toContain(bodyStart + 2);
+		}
 	});
 
 	it('produces the same CPU step for each probe as the complete 14,600-particle scene', () => {
@@ -283,6 +291,7 @@ describe('Gate 4 mixed-material sample scene', () => {
 			grid: GATE4_GRID,
 			particleMass: 1,
 			particleVolume: 25,
+			bondRestLength: GATE4_PEBBLE_EDGE_LENGTH,
 			material: { lambda: 20, mu: 10, model: 'neo-hookean' as const },
 			gravity: { x: 0, y: 90 }
 		};
