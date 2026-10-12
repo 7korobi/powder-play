@@ -69,6 +69,9 @@ export const OBJECT_ID_STRIDE_BYTES = Uint32Array.BYTES_PER_ELEMENT;
 export const SIMULATION_PARAMS_BYTES = 80;
 export const RENDER_PARAMS_BYTES = 16;
 export const COMPUTE_WORKGROUP_SIZE = 64;
+export const NUMERICAL_STATUS_WORDS = 7;
+export const NUMERICAL_STATUS_BYTES =
+	NUMERICAL_STATUS_WORDS * Uint32Array.BYTES_PER_ELEMENT;
 
 const UINT32_MAX = 0xffff_ffff;
 const INT32_MAX = 0x7fff_ffff;
@@ -404,14 +407,14 @@ export function calculateMpmMlsGpuBufferLayout(
 		'grid state buffer size'
 	);
 	const readbackBytes = Math.max(
-		Uint32Array.BYTES_PER_ELEMENT,
+		NUMERICAL_STATUS_BYTES,
 		safeSum(
 			safeSum(
 				capacityStateBytes,
 				objectIdBufferBytes,
 				'particle and object id readback size'
 			),
-			Uint32Array.BYTES_PER_ELEMENT,
+			NUMERICAL_STATUS_BYTES,
 			'readback buffer size'
 		)
 	);

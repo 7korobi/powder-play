@@ -1,4 +1,5 @@
 import type {
+	MpmMatrix2,
 	MpmMaterialParameters,
 	MpmParticle,
 	MpmVector2
@@ -8,6 +9,8 @@ import { createMpmWebGpuSession } from '../platform/webgpu.js';
 import {
 	calculateMpmMlsGpuBufferLayout,
 	COMPUTE_WORKGROUP_SIZE,
+	NUMERICAL_STATUS_BYTES,
+	NUMERICAL_STATUS_WORDS,
 	OBJECT_ID_STRIDE_BYTES,
 	PARTICLE_FLOATS,
 	packMpmMlsGpuStepParameters,
@@ -36,7 +39,8 @@ export interface MpmMlsGpuSolver {
 	readonly particleCapacity: number;
 	step(dt: number, gravity: MpmVector2): void;
 	render(): void;
-	readParticles(): Promise<readonly MpmParticle[]>;
+	readParticles(particleIndices?: readonly number[]): Promise<readonly MpmParticle[]>;
+	measureQueueCompletionMs(): Promise<number>;
 	pick(point: MpmVector2, radius: number): Promise<MpmMlsGpuSelection | null>;
 	beginDrag(selection: MpmMlsGpuSelection, target: MpmVector2, radius: number): void;
 	updateDrag(target: MpmVector2): void;
@@ -46,20 +50,49 @@ export interface MpmMlsGpuSolver {
 }
 
 export class MpmMlsGpuNumericalError extends Error {
-	constructor(readonly flags: number) {
+	constructor(
+		readonly flags: number,
+		readonly particleIndex?: number,
+		readonly diagnostics?: {
+			readonly determinant: number;
+			readonly deformationIncrement: number;
+			readonly precedingDeterminant: number;
+		},
+		readonly particleState?: MpmParticle,
+		readonly projectedDeformation?: MpmMatrix2
+	) {
 		const details = [
 			[1, 'invalid particle stencil or linked-list state'],
-			[2, 'non-positive deformation determinant'],
-			[4, 'non-finite P2G stress or momentum'],
+			[2, 'non-positive trial deformation determinant'],
+			[4, 'P2G validation failed'],
 			[8, 'non-finite grid state'],
-			[16, 'non-finite G2P particle state']
+			[16, 'non-finite G2P particle state'],
+			[32, 'deformation update exceeded the adaptive substep limit'],
+			[64, 'non-positive projected deformation determinant'],
+			[128, 'invalid P2G material parameters'],
+			[256, 'non-finite particle stress or momentum'],
+			[1024, 'non-finite P2G node accumulation'],
+			[2048, 'non-finite P2G node output']
 		] as const;
 		const message = details
 			.filter(([flag]) => (flags & flag) !== 0)
 			.map(([, description]) => description)
 			.join('; ');
+		const particleContext = particleIndex === undefined ? '' : ` at particle ${particleIndex}`;
+		const diagnosticContext =
+			diagnostics === undefined
+				? ''
+				: ` (det=${diagnostics.determinant}, deformation increment=${diagnostics.deformationIncrement}, preceding det=${diagnostics.precedingDeterminant})`;
+		const stateContext =
+			particleState === undefined
+				? ''
+				: ` (last valid state: position=(${particleState.position.x},${particleState.position.y}), velocity=(${particleState.velocity.x},${particleState.velocity.y}), C=(${particleState.C.m00},${particleState.C.m01},${particleState.C.m10},${particleState.C.m11}), F=(${particleState.F.m00},${particleState.F.m01},${particleState.F.m10},${particleState.F.m11}))`;
+		const projectionContext =
+			projectedDeformation === undefined
+				? ''
+				: ` (projected F=(${projectedDeformation.m00},${projectedDeformation.m01},${projectedDeformation.m10},${projectedDeformation.m11}))`;
 		super(
-			`GPU MLS-MPM rejected a step (${message || `status 0x${flags.toString(16)}`}); ` +
+			`GPU MLS-MPM rejected a step (${message || `status 0x${flags.toString(16)}`}${particleContext}${diagnosticContext}${stateContext}${projectionContext}); ` +
 				'all particles were rolled back to the last valid state.'
 		);
 		this.name = 'MpmMlsGpuNumericalError';
@@ -87,7 +120,6 @@ interface MpmMlsGpuStepBindings {
 	readonly render: GPUBindGroup;
 }
 
-const STATE_ERROR_BYTES = Uint32Array.BYTES_PER_ELEMENT;
 const INTERACTION_PARAMS_BYTES = 32;
 const PICK_PARAMS_BYTES = 32;
 const PICK_RESULT_BYTES = 16;
@@ -229,7 +261,7 @@ async function createRuntime(
 		),
 		stateError: createBuffer(
 			'MLS-MPM numerical status',
-			STATE_ERROR_BYTES,
+			NUMERICAL_STATUS_BYTES,
 			BUFFER_USAGE.STORAGE | BUFFER_USAGE.COPY_SRC | BUFFER_USAGE.COPY_DST
 		),
 		bucketHeads: createBuffer(
@@ -281,7 +313,11 @@ async function createRuntime(
 		] as const
 	};
 
-	device.queue.writeBuffer(buffers.stateError, 0, new Uint32Array([0]));
+	device.queue.writeBuffer(
+		buffers.stateError,
+		0,
+		new Uint32Array([0, MAX_U32, 0, 0, 0, 0, 0])
+	);
 	device.queue.writeBuffer(buffers.interactionParams, 0, new Float32Array(8));
 	device.queue.writeBuffer(buffers.pickResult, 0, new Uint32Array([MAX_U32, 0, 0, 0]));
 	device.queue.writeBuffer(
@@ -463,7 +499,7 @@ function createSolver(
 				encoder,
 				runtime.pipelines.buildBuckets,
 				groups.buildBuckets,
-				layout.particleCapacity
+				particleCount
 			);
 			dispatchCompute(encoder, runtime.pipelines.p2g, groups.p2g, layout.nodeCount);
 			dispatchCompute(
@@ -476,13 +512,13 @@ function createSolver(
 				encoder,
 				runtime.pipelines.g2p,
 				groups.g2p,
-				layout.particleCapacity
+				particleCount
 			);
 			dispatchCompute(
 				encoder,
 				runtime.pipelines.commitParticles,
 				groups.commitParticles,
-				layout.particleCapacity
+				particleCount
 			);
 			session.device.queue.submit([encoder.finish()]);
 			currentBuffer = 1 - inputIndex;
@@ -517,16 +553,45 @@ function createSolver(
 		}
 	}
 
-	async function readParticles(): Promise<readonly MpmParticle[]> {
+	async function measureQueueCompletionMs(): Promise<number> {
 		assertActive();
-		const particleStateBytes = particleCount * PARTICLE_STRIDE_BYTES;
-		const objectIdBytes = particleCount * OBJECT_ID_STRIDE_BYTES;
+		const startedAt = performance.now();
+		await session.device.queue.onSubmittedWorkDone();
+		assertActive();
+		return performance.now() - startedAt;
+	}
+
+	function validateReadbackIndices(indices: readonly number[]): readonly number[] {
+		if (!Array.isArray(indices)) {
+			throw new TypeError('particleIndices must be an array of active particle indices.');
+		}
+		for (const index of indices) {
+			if (!Number.isSafeInteger(index) || index < 0 || index >= particleCount) {
+				throw new RangeError('particleIndices must identify active GPU particles.');
+			}
+		}
+		return indices;
+	}
+
+	async function readParticles(
+		particleIndices?: readonly number[]
+	): Promise<readonly MpmParticle[]> {
+		assertActive();
+		const selectedIndices =
+			particleIndices === undefined ? null : validateReadbackIndices(particleIndices);
+		const readParticleCount = selectedIndices?.length ?? particleCount;
+		const particleStateBytes = readParticleCount * PARTICLE_STRIDE_BYTES;
+		const objectIdBytes = readParticleCount * OBJECT_ID_STRIDE_BYTES;
 		const errorOffset = particleStateBytes + objectIdBytes;
+		const readbackBytes =
+			selectedIndices === null
+				? layout.readbackBytes
+				: Math.max(NUMERICAL_STATUS_BYTES, errorOffset + NUMERICAL_STATUS_BYTES);
 		let readback: GPUBuffer;
 		try {
 			readback = session.device.createBuffer({
 				label: 'MLS-MPM explicit particle readback',
-				size: layout.readbackBytes,
+				size: readbackBytes,
 				usage: BUFFER_USAGE.MAP_READ | BUFFER_USAGE.COPY_DST
 			});
 		} catch (cause) {
@@ -542,7 +607,7 @@ function createSolver(
 			const encoder = session.device.createCommandEncoder({
 				label: 'MLS-MPM explicit particle readback'
 			});
-			if (particleStateBytes > 0) {
+			if (selectedIndices === null && particleStateBytes > 0) {
 				encoder.copyBufferToBuffer(
 					runtime.buffers.particles[currentBuffer],
 					0,
@@ -557,13 +622,31 @@ function createSolver(
 					particleStateBytes,
 					objectIdBytes
 				);
+			} else if (selectedIndices !== null) {
+				for (let outputIndex = 0; outputIndex < selectedIndices.length; outputIndex += 1) {
+					const sourceIndex = selectedIndices[outputIndex];
+					encoder.copyBufferToBuffer(
+						runtime.buffers.particles[currentBuffer],
+						sourceIndex * PARTICLE_STRIDE_BYTES,
+						readback,
+						outputIndex * PARTICLE_STRIDE_BYTES,
+						PARTICLE_STRIDE_BYTES
+					);
+					encoder.copyBufferToBuffer(
+						runtime.buffers.particleObjectIds,
+						sourceIndex * OBJECT_ID_STRIDE_BYTES,
+						readback,
+						particleStateBytes + outputIndex * OBJECT_ID_STRIDE_BYTES,
+						OBJECT_ID_STRIDE_BYTES
+					);
+				}
 			}
 			encoder.copyBufferToBuffer(
 				runtime.buffers.stateError,
 				0,
 				readback,
 				errorOffset,
-				STATE_ERROR_BYTES
+				NUMERICAL_STATUS_BYTES
 			);
 			session.device.queue.submit([encoder.finish()]);
 			await readback.mapAsync(MAP_MODE_READ);
@@ -573,18 +656,59 @@ function createSolver(
 			readback.unmap();
 			mapped = false;
 
-			const flags = new Uint32Array(
+			const numericalStatus = new Uint32Array(
 				snapshot,
 				errorOffset,
-				1
-			)[0];
-			if (flags !== 0) throw new MpmMlsGpuNumericalError(flags);
-			return unpackParticles(
+				NUMERICAL_STATUS_WORDS
+			);
+			const particles = unpackParticles(
 				new Float32Array(snapshot, 0, particleStateBytes / Float32Array.BYTES_PER_ELEMENT),
 				new Uint32Array(snapshot, 0, particleStateBytes / Uint32Array.BYTES_PER_ELEMENT),
-				particleCount,
-				new Uint32Array(snapshot, particleStateBytes, particleCount)
+				readParticleCount,
+				new Uint32Array(snapshot, particleStateBytes, readParticleCount)
 			);
+			if (numericalStatus[0] !== 0) {
+				const particleIndex =
+					numericalStatus[1] === MAX_U32 ? undefined : numericalStatus[1];
+				const stateIndex =
+					particleIndex === undefined
+						? -1
+						: selectedIndices === null
+							? particleIndex
+							: selectedIndices.indexOf(particleIndex);
+				const particleState =
+					stateIndex >= 0 ? particles[stateIndex] : undefined;
+				const values = new Float32Array(
+					snapshot,
+					errorOffset + 2 * Uint32Array.BYTES_PER_ELEMENT,
+					4
+				);
+				const diagnostics =
+					numericalStatus[6] !== 1
+						? undefined
+						: {
+								determinant: values[0],
+								deformationIncrement: values[1],
+								precedingDeterminant: values[2]
+							};
+				const projectedDeformation =
+					numericalStatus[6] !== 2
+						? undefined
+						: {
+								m00: values[0],
+								m01: values[1],
+								m10: values[2],
+								m11: values[3]
+							};
+				throw new MpmMlsGpuNumericalError(
+					numericalStatus[0],
+					particleIndex,
+					diagnostics,
+					particleState,
+					projectedDeformation
+				);
+			}
+			return particles;
 		} catch (cause) {
 			if (cause instanceof MpmMlsGpuNumericalError) throw cause;
 			throw new Error('Failed to read GPU MLS-MPM particle state.', { cause });
@@ -807,6 +931,7 @@ function createSolver(
 		step,
 		render,
 		readParticles,
+		measureQueueCompletionMs,
 		pick,
 		beginDrag,
 		updateDrag,

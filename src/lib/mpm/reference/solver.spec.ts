@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { stepMpm, type MpmMatrix2, type MpmParticle, type MpmStepConfig } from './solver.js';
+import {
+	stepMpm,
+	type MpmMaterialParameters,
+	type MpmMatrix2,
+	type MpmParticle,
+	type MpmStepConfig
+} from './solver.js';
 
 const ZERO_MATRIX: MpmMatrix2 = { m00: 0, m01: 0, m10: 0, m11: 0 };
 const IDENTITY: MpmMatrix2 = { m00: 1, m01: 0, m10: 0, m11: 1 };
@@ -109,6 +115,20 @@ describe('CPU MLS-MPM reference', () => {
 		expect(output.position.y).toBeLessThanOrEqual(16);
 	});
 
+	it('substeps a large velocity gradient before it can invert the deformation', () => {
+		const result = stepMpm(
+			[
+				makeParticle({
+					C: { m00: 0, m01: 0, m10: 0, m11: -100 }
+				})
+			],
+			makeConfig({ dt: 0.1 })
+		);
+		const deformation = result.particles[0].F;
+
+		expect(deformation.m00 * deformation.m11 - deformation.m01 * deformation.m10).toBeGreaterThan(0);
+	});
+
 	it('collides with each domain wall without leaving the domain', () => {
 		const cases = [
 			{
@@ -147,6 +167,56 @@ describe('CPU MLS-MPM reference', () => {
 			expect(output.position.x).toBeLessThanOrEqual(8);
 			expect(output.position.y).toBeGreaterThanOrEqual(0);
 			expect(output.position.y).toBeLessThanOrEqual(8);
+		}
+	});
+
+	it('keeps all material models stable under sustained acceleration into domain walls', () => {
+		const materials: readonly MpmMaterialParameters[] = [
+			{ lambda: 8, mu: 0, model: 'water', density: 0.04 },
+			{ lambda: 6, mu: 0, model: 'oil', density: 0.032 },
+			{ lambda: 20, mu: 10, model: 'powder', frictionCoefficient: 0.55 }
+		];
+		const collisions = [
+			{ startX: 8.2, startY: 15.2, gravity: { x: -90, y: 0 } },
+			{ startX: 23.2, startY: 15.2, gravity: { x: 90, y: 0 } },
+			{ startX: 15.2, startY: 8.2, gravity: { x: 0, y: -90 } },
+			{ startX: 15.2, startY: 23.2, gravity: { x: 0, y: 90 } }
+		] as const;
+		const config = (material: MpmMaterialParameters, gravity: MpmStepConfig['gravity']) =>
+			makeConfig({
+				dt: 1 / 240,
+				grid: { cellsX: 32, cellsY: 32, cellSize: 1 },
+				particleVolume: 0.16,
+				material,
+				gravity
+			});
+
+		for (const material of materials) {
+			for (const collision of collisions) {
+				let particles: readonly MpmParticle[] = Array.from({ length: 9 }, (_, index) =>
+					makeParticle({
+						position: {
+							x: collision.startX + (index % 3) * 0.4,
+							y: collision.startY + Math.floor(index / 3) * 0.4
+						},
+						material
+					})
+				);
+				const stepConfig = config(material, collision.gravity);
+
+				for (let step = 0; step < 480; step += 1) {
+					particles = stepMpm(particles, stepConfig).particles;
+				}
+
+				for (const particle of particles) {
+					const jacobian = particle.F.m00 * particle.F.m11 - particle.F.m01 * particle.F.m10;
+					expect(jacobian).toBeGreaterThan(0);
+					expect(particle.position.x).toBeGreaterThanOrEqual(0);
+					expect(particle.position.x).toBeLessThanOrEqual(32);
+					expect(particle.position.y).toBeGreaterThanOrEqual(0);
+					expect(particle.position.y).toBeLessThanOrEqual(32);
+				}
+			}
 		}
 	});
 
@@ -242,8 +312,12 @@ describe('CPU MLS-MPM reference', () => {
 			makeConfig({ dt: 1e-12, gravity: { x: 0, y: 0 } })
 		);
 
-		expect(result.particles[0].F).toEqual(shear);
-		expect(result.particles[1].F).toEqual(shear);
+		const waterDeformation = result.particles[0].F;
+		const oilDeformation = result.particles[1].F;
+		expect(waterDeformation.m00).toBeCloseTo(waterDeformation.m11, 12);
+		expect(waterDeformation.m01).toBeCloseTo(-waterDeformation.m10, 12);
+		expect(waterDeformation.m00 * waterDeformation.m11 - waterDeformation.m01 * waterDeformation.m10).toBeCloseTo(1, 12);
+		expect(oilDeformation).toEqual(waterDeformation);
 		expect(result.particles[0].material?.model).toBe('water');
 		expect(result.particles[1].material?.model).toBe('oil');
 		expect(result.diagnostics.inputMass).toBeCloseTo(0.026, 12);
@@ -317,6 +391,40 @@ describe('CPU MLS-MPM reference', () => {
 		expect(frictionalStretch).toBeGreaterThan(0.5);
 		expect(result.particles[0].material?.model).toBe('powder');
 		expect(frictionalMaterial).toMatchObject({ model: 'powder', frictionCoefficient: 0.55 });
+	});
+
+	it('preserves an unyielded powder deformation during projection', () => {
+		const material = {
+			lambda: 20,
+			mu: 10,
+			model: 'powder',
+			frictionCoefficient: 0.55
+		} as const;
+		const result = stepMpm(
+			[makeParticle({ material })],
+			makeConfig({ gravity: { x: 0, y: 0 } })
+		);
+
+		expect(result.particles[0].F).toEqual(IDENTITY);
+	});
+
+	it('projects liquid shear to rotation while preserving volume', () => {
+		for (const model of ['water', 'oil'] as const) {
+			const result = stepMpm(
+				[
+					makeParticle({
+						F: { m00: 1, m01: 1, m10: 0, m11: 1 },
+						material: { lambda: 20, mu: 0, model, density: 0.04 }
+					})
+				],
+				makeConfig({ gravity: { x: 0, y: 0 } })
+			);
+			const deformation = result.particles[0].F;
+
+			expect(deformation.m00).toBeCloseTo(deformation.m11, 6);
+			expect(deformation.m01).toBeCloseTo(-deformation.m10, 6);
+			expect(deformation.m00 * deformation.m11 - deformation.m01 * deformation.m10).toBeCloseTo(1, 6);
+		}
 	});
 
 	it('projects rotated Snow stretches while preserving the principal rotation', () => {

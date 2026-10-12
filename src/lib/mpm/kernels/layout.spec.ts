@@ -82,7 +82,7 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			bucketHeadBytes: 836,
 			bucketNextBytes: 36,
 			gridStateBytes: 5016,
-			readbackBytes: 88
+			readbackBytes: 112
 		});
 	});
 
@@ -95,7 +95,7 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(layout.particleBufferBytes).toBe(80);
 		expect(layout.bucketNextBytes).toBe(4);
 		expect(layout.objectIdBufferBytes).toBe(4);
-		expect(layout.readbackBytes).toBe(8);
+		expect(layout.readbackBytes).toBe(32);
 	});
 
 	it('reserves capacity up front while packing only initial particle and object state', () => {
@@ -115,7 +115,7 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(layout.particleBufferBytes).toBe(320);
 		expect(layout.objectIdBufferBytes).toBe(16);
 		expect(layout.bucketNextBytes).toBe(144);
-		expect(layout.readbackBytes).toBe(340);
+		expect(layout.readbackBytes).toBe(364);
 	});
 
 	it('packs each particle material and snow plastic history with the GPU layout', () => {

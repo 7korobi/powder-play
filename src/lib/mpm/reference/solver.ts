@@ -128,6 +128,9 @@ interface Decomposition2 {
 }
 
 const IDENTITY: MpmMatrix2 = { m00: 1, m01: 0, m10: 0, m11: 1 };
+const WALL_CUSHION_CELLS = 8;
+const MAX_DEFORMATION_INCREMENT = 0.25;
+const MAX_DEFORMATION_SUBSTEPS = 64;
 
 export function stepMpm(
 	particles: readonly MpmParticle[],
@@ -225,14 +228,8 @@ export function stepMpm(
 		assertComputedFinite(velocityX, 'grid velocity');
 		assertComputedFinite(velocityY, 'grid velocity');
 
-		if ((node.xIndex <= 0 && velocityX < 0) ||
-			(node.xIndex >= validated.grid.cellsX && velocityX > 0)) {
-			velocityX = 0;
-		}
-		if ((node.yIndex <= 0 && velocityY < 0) ||
-			(node.yIndex >= validated.grid.cellsY && velocityY > 0)) {
-			velocityY = 0;
-		}
+		velocityX = applyWallCushion(velocityX, node.xIndex, validated.grid.cellsX);
+		velocityY = applyWallCushion(velocityY, node.yIndex, validated.grid.cellsY);
 		node.velocityX = velocityX;
 		node.velocityY = velocityY;
 	}
@@ -275,19 +272,10 @@ export function stepMpm(
 			m10: c10 * validated.gradientScale,
 			m11: c11 * validated.gradientScale
 		};
-		const trialF = multiplyMatrices(
-			{
-				m00: 1 + validated.dt * C.m00,
-				m01: validated.dt * C.m01,
-				m10: validated.dt * C.m10,
-				m11: 1 + validated.dt * C.m11
-			},
-			particle.F
-		);
 		assertComputedFinite(velocityX, 'particle velocity');
 		assertComputedFinite(velocityY, 'particle velocity');
 		assertComputedMatrixFinite(C, 'particle affine velocity');
-		assertComputedMatrixFinite(trialF, 'deformation gradient');
+		const trialF = updateDeformationGradient(particle.F, C, validated.dt);
 		const jacobian = determinant(trialF);
 		if (!Number.isFinite(jacobian) || jacobian <= 0) {
 			throw new RangeError('step would produce a non-positive deformation determinant');
@@ -300,6 +288,8 @@ export function stepMpm(
 			nextPlasticVolume = projected.plasticVolume;
 		} else if (state.material.model === 'powder') {
 			F = projectGranularDeformation(trialF, state.material);
+		} else if (state.material.model === 'water' || state.material.model === 'oil') {
+			F = projectLiquidDeformation(trialF);
 		}
 
 		const nextX = particle.position.x + validated.dt * velocityX;
@@ -736,6 +726,9 @@ function projectGranularDeformation(
 	const deviatoricLogStretch = 0.5 * (logStretch1 - logStretch2);
 	const maximumDeviatoricLogStretch =
 		(material.frictionCoefficient * pressure) / (2 * material.mu);
+	if (deviatoricLogStretch <= maximumDeviatoricLogStretch) {
+		return deformation;
+	}
 	const projectedDeviatoricLogStretch = Math.min(
 		deviatoricLogStretch,
 		maximumDeviatoricLogStretch
@@ -767,6 +760,36 @@ function projectGranularDeformation(
 	if (determinant(projected) <= 0) {
 		throw new RangeError('powder projection produced a non-positive deformation determinant');
 	}
+	return projected;
+}
+
+function projectLiquidDeformation(deformation: MpmMatrix2): MpmMatrix2 {
+	const determinantF = determinant(deformation);
+	const rotationCosineNumerator = deformation.m00 + deformation.m11;
+	const rotationSineNumerator = deformation.m10 - deformation.m01;
+	const rotationMagnitude = Math.hypot(
+		rotationCosineNumerator,
+		rotationSineNumerator
+	);
+	if (
+		!Number.isFinite(rotationMagnitude) ||
+		rotationMagnitude <= 0 ||
+		!Number.isFinite(determinantF) ||
+		determinantF <= 0
+	) {
+		throw new RangeError('liquid deformation cannot be projected to a finite rotation');
+	}
+
+	const scale = Math.sqrt(determinantF);
+	const cosine = rotationCosineNumerator / rotationMagnitude;
+	const sine = rotationSineNumerator / rotationMagnitude;
+	const projected: MpmMatrix2 = {
+		m00: scale * cosine,
+		m01: -scale * sine,
+		m10: scale * sine,
+		m11: scale * cosine
+	};
+	assertComputedMatrixFinite(projected, 'projected liquid deformation');
 	return projected;
 }
 
@@ -885,6 +908,45 @@ function confineAxis(
 		return { position: maximum, velocity: 0 };
 	}
 	return { position: nextPosition, velocity };
+}
+
+function applyWallCushion(velocity: number, coordinate: number, extent: number): number {
+	const distance = velocity < 0 ? coordinate : extent - coordinate;
+	const cushionCells = Math.min(WALL_CUSHION_CELLS, extent / 4);
+	return velocity * Math.max(0, Math.min(1, distance / cushionCells));
+}
+
+function updateDeformationGradient(
+	deformation: MpmMatrix2,
+	velocityGradient: MpmMatrix2,
+	dt: number
+): MpmMatrix2 {
+	const rowSum = Math.max(
+		Math.abs(velocityGradient.m00) + Math.abs(velocityGradient.m01),
+		Math.abs(velocityGradient.m10) + Math.abs(velocityGradient.m11)
+	);
+	const increment = dt * rowSum;
+	assertComputedFinite(increment, 'deformation increment');
+	const substeps = Math.max(1, Math.ceil(increment / MAX_DEFORMATION_INCREMENT));
+	if (substeps > MAX_DEFORMATION_SUBSTEPS) {
+		throw new RangeError('deformation update exceeds the adaptive substep limit');
+	}
+
+	const substepDt = dt / substeps;
+	let updated = deformation;
+	for (let step = 0; step < substeps; step += 1) {
+		updated = multiplyMatrices(
+			{
+				m00: 1 + substepDt * velocityGradient.m00,
+				m01: substepDt * velocityGradient.m01,
+				m10: substepDt * velocityGradient.m10,
+				m11: 1 + substepDt * velocityGradient.m11
+			},
+			updated
+		);
+	}
+	assertComputedMatrixFinite(updated, 'deformation gradient');
+	return updated;
 }
 
 function gridNodeKey(xIndex: number, yIndex: number): string {

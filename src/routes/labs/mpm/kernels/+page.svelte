@@ -7,85 +7,36 @@
 	} from '#lib/mpm/kernels/solver.js';
 	import {
 		stepMpm,
-		type MpmMatrix2,
 		type MpmParticle,
 		type MpmStepConfig,
 		type MpmVector2
 	} from '#lib/mpm/reference/solver.js';
+	import {
+		createMpmCpuParitySample,
+		createMpmGate4Scene,
+		GATE4_GRID,
+		GATE4_PARTICLE_CAPACITY,
+		GATE4_PARTICLE_COUNT
+	} from '#lib/mpm/scenes/gate4.js';
 
-	const GRID = { cellsX: 48, cellsY: 32, cellSize: 10 } as const;
+	const GRID = GATE4_GRID;
 	const WORLD_WIDTH = GRID.cellsX * GRID.cellSize;
 	const WORLD_HEIGHT = GRID.cellsY * GRID.cellSize;
-	const FIXED_STEP_SECONDS = 1 / 120;
+	const FIXED_STEP_SECONDS = 1 / 240;
 	const FRAME_INTERVAL_MS = 1000 / 30;
 	const MAX_FRAME_SECONDS = 0.1;
-	const MAX_STEPS_PER_FRAME = 4;
-	const GPU_PARTICLE_CAPACITY = 128;
+	const MAX_STEPS_PER_FRAME = 8;
+	const GPU_PARTICLE_CAPACITY = GATE4_PARTICLE_CAPACITY;
 	const PICK_RADIUS = 14;
 	const BRUSH_RADIUS = 24;
 	const CLONE_OFFSET: MpmVector2 = { x: 72, y: 0 };
 	const PARTICLE_MASS = 1;
 	const PARTICLE_VOLUME = 25;
 	const MATERIAL = { lambda: 20, mu: 10, model: 'neo-hookean' } as const;
-	const WATER_MATERIAL = {
-		lambda: 8,
-		mu: 0,
-		model: 'water',
-		density: 0.04
-	} as const;
-	const OIL_MATERIAL = {
-		lambda: 6,
-		mu: 0,
-		model: 'oil',
-		density: 0.032
-	} as const;
-	const POWDER_MATERIAL = {
-		lambda: 20,
-		mu: 10,
-		model: 'powder',
-		frictionCoefficient: 0.55
-	} as const;
 	const PARITY_TOLERANCE = 0.02;
-	const ZERO_MATRIX: MpmMatrix2 = { m00: 0, m01: 0, m10: 0, m11: 0 };
-	const INITIAL_DEFORMATION: MpmMatrix2 = {
-		m00: 0.99,
-		m01: 0,
-		m10: 0,
-		m11: 0.99
-	};
 
 	type Phase = 'initializing' | 'ready' | 'error' | 'lost';
 	type GpuSolver = Awaited<ReturnType<typeof createMpmMlsGpuSolver>>;
-
-	function makeParticles(): MpmParticle[] {
-		const particles: MpmParticle[] = [];
-
-		const objects = [
-			{ objectId: 1, startX: 100, startY: 210, material: WATER_MATERIAL },
-			{ objectId: 2, startX: 100, startY: 170, material: OIL_MATERIAL },
-			{ objectId: 3, startX: 260, startY: 170, material: POWDER_MATERIAL }
-		] as const;
-		for (const object of objects) {
-			for (let row = 0; row < 4; row += 1) {
-				for (let column = 0; column < 5; column += 1) {
-					particles.push({
-						position: {
-							x: object.startX + column * 8,
-							y: object.startY + row * 8
-						},
-						velocity: { x: 0, y: 0 },
-						C: ZERO_MATRIX,
-						F: INITIAL_DEFORMATION,
-						objectId: object.objectId,
-						plasticVolume: 1,
-						material: object.material
-					});
-				}
-			}
-		}
-
-		return particles;
-	}
 
 	function makeStepConfig(gravityMagnitude: number, dt = FIXED_STEP_SECONDS): MpmStepConfig {
 		return {
@@ -96,6 +47,18 @@
 			material: MATERIAL,
 			gravity: { x: 0, y: gravityMagnitude }
 		};
+	}
+
+	let submittedStepCount = 0;
+	let submittedParticleSteps = 0;
+	let submittedStepCpuMilliseconds = 0;
+
+	function submitStep(currentSolver: GpuSolver, gravity: MpmVector2): void {
+		const startedAt = performance.now();
+		currentSolver.step(FIXED_STEP_SECONDS, gravity);
+		submittedStepCount += 1;
+		submittedParticleSteps += currentSolver.particleCount;
+		submittedStepCpuMilliseconds += performance.now() - startedAt;
 	}
 
 	function errorText(error: unknown): string {
@@ -170,8 +133,13 @@
 	let stateCheckPending = $state(false);
 	let stateCheckMessage = $state('');
 	let stateCheckIsError = $state(false);
-	let particleCount = $state(60);
+	let particleCount = $state(GATE4_PARTICLE_COUNT);
 	let particleCapacity = $state(GPU_PARTICLE_CAPACITY);
+	let measuredFps = $state<number | null>(null);
+	let measuredStepsPerSecond = $state<number | null>(null);
+	let measuredParticleStepsPerSecond = $state<number | null>(null);
+	let averageStepSubmitMs = $state<number | null>(null);
+	let averageQueueCompletionMs = $state<number | null>(null);
 	let selection = $state<MpmMlsGpuSelection | null>(null);
 	let interactionMessage = $state('初回の CPU/GPU 1 ステップ比較が完了すると操作できます。');
 	let interactionIsError = $state(false);
@@ -392,7 +360,7 @@
 		if (phase !== 'ready' || !paused || !solver) return;
 
 		try {
-			solver.step(FIXED_STEP_SECONDS, { x: 0, y: gravityMagnitude });
+			submitStep(solver, { x: 0, y: gravityMagnitude });
 			solver.render();
 		} catch (error) {
 			finishPointerInteraction();
@@ -432,7 +400,11 @@
 		let lastFrameTimestamp = 0;
 		let accumulator = 0;
 		let lastRenderTimestamp = 0;
-		const initialParticles = makeParticles();
+		let metricsStartTimestamp: number | null = null;
+		let performanceFrameCount = 0;
+		let queueWorkPending = false;
+		let queueSampleCount = 0;
+		let queueSampleTotalMs = 0;
 		const canvasElement = canvas;
 
 		const resizeCanvas = () => {
@@ -459,6 +431,7 @@
 			if (!mounted || !activeSolver || phase !== 'ready') return;
 			frameRequest = requestAnimationFrame(renderFrame);
 			if (timestamp - lastRenderTimestamp < FRAME_INTERVAL_MS - 1) return;
+			if (queueWorkPending) return;
 
 			const elapsed =
 				lastFrameTimestamp === 0
@@ -472,10 +445,7 @@
 				let steps = 0;
 				while (accumulator >= FIXED_STEP_SECONDS && steps < MAX_STEPS_PER_FRAME) {
 					try {
-						activeSolver.step(FIXED_STEP_SECONDS, {
-							x: 0,
-							y: gravityMagnitude
-						});
+						submitStep(activeSolver, { x: 0, y: gravityMagnitude });
 					} catch (error) {
 						finishPointerInteraction();
 						phase = 'error';
@@ -498,7 +468,49 @@
 				finishPointerInteraction();
 				phase = 'error';
 				phaseMessage = `描画を停止しました: ${errorText(error)}`;
+				return;
 			}
+
+			performanceFrameCount += 1;
+			if (metricsStartTimestamp === null) metricsStartTimestamp = timestamp;
+			const metricsElapsed = timestamp - metricsStartTimestamp;
+			if (metricsElapsed >= 1_000) {
+				const samplesPerSecond = 1_000 / metricsElapsed;
+				measuredFps = performanceFrameCount * samplesPerSecond;
+				measuredStepsPerSecond = submittedStepCount * samplesPerSecond;
+				measuredParticleStepsPerSecond = submittedParticleSteps * samplesPerSecond;
+				averageStepSubmitMs =
+					submittedStepCount > 0
+						? submittedStepCpuMilliseconds / submittedStepCount
+						: null;
+				averageQueueCompletionMs =
+					queueSampleCount > 0 ? queueSampleTotalMs / queueSampleCount : null;
+
+				metricsStartTimestamp = timestamp;
+				performanceFrameCount = 0;
+				submittedStepCount = 0;
+				submittedParticleSteps = 0;
+				submittedStepCpuMilliseconds = 0;
+				queueSampleCount = 0;
+				queueSampleTotalMs = 0;
+			}
+
+			const submittedSolver = activeSolver;
+			queueWorkPending = true;
+			void submittedSolver
+				.measureQueueCompletionMs()
+				.then((completionMs) => {
+					if (!mounted || activeSolver !== submittedSolver) return;
+					queueSampleCount += 1;
+					queueSampleTotalMs += completionMs;
+				})
+				.catch((error) => {
+					if (!mounted || activeSolver !== submittedSolver) return;
+					fail(error);
+				})
+				.finally(() => {
+					if (mounted && activeSolver === submittedSolver) queueWorkPending = false;
+				});
 		}
 
 		function handleVisibilityChange(): void {
@@ -524,6 +536,13 @@
 
 			try {
 				resizeCanvas();
+				const initialScene = createMpmGate4Scene();
+				const paritySample = createMpmCpuParitySample(
+					initialScene.particles,
+					initialScene.parityProbeIndices,
+					GRID.cellSize
+				);
+				const initialParticles = initialScene.particles;
 				const config = makeStepConfig(gravityMagnitude);
 				const candidate = await createMpmMlsGpuSolver(
 					canvasElement,
@@ -551,20 +570,31 @@
 					phaseMessage = info.message || 'WebGPU デバイスが失われました。';
 				});
 
-				const expected = stepMpm(initialParticles, config).particles;
+				const expectedSample = stepMpm(paritySample.particles, config).particles;
 				candidate.step(FIXED_STEP_SECONDS, config.gravity);
-				const actual = await candidate.readParticles();
+				const actual = await candidate.readParticles(initialScene.parityProbeIndices);
 				if (!mounted || activeSolver !== candidate || phase === 'lost') return;
 
+				const expected = paritySample.probeSampleIndices.map(
+					(index) => expectedSample[index]
+				);
 				const maxError = maxParticleDifference(actual, expected);
 				parityPassed = maxError <= PARITY_TOLERANCE;
 				parityMessage = Number.isFinite(maxError)
-					? `初回1ステップの CPU reference 比較: 最大絶対誤差 ${maxError.toExponential(2)} ${
+					? `初回1ステップ・各材料中央3粒子の CPU reference 比較: 最大絶対誤差 ${maxError.toExponential(2)} ${
 							parityPassed ? '· 許容範囲内' : '· 許容範囲外'
 						}`
 					: '初回1ステップの CPU reference 比較で粒子数または数値が一致しません。';
+				submittedStepCount = 0;
+				submittedParticleSteps = 0;
+				submittedStepCpuMilliseconds = 0;
+				queueSampleCount = 0;
+				queueSampleTotalMs = 0;
+				metricsStartTimestamp = null;
+				performanceFrameCount = 0;
+				averageQueueCompletionMs = null;
 				phase = 'ready';
-				phaseMessage = 'GPU MLS-MPM を実行中です · 目標 30 fps';
+				phaseMessage = 'GPU MLS-MPM を実行中です · 20,000 粒子 · 目標 30 fps';
 				interactionMessage = '準備完了。粒子をタップ／クリックして、押したままドラッグできます。';
 				lastFrameTimestamp = performance.now();
 				frameRequest = requestAnimationFrame(renderFrame);
@@ -624,11 +654,11 @@
 <main class="lab">
 	<header class="header">
 		<div>
-				<p class="eyebrow">GATE 4 · WATER / OIL / POWDER</p>
-				<h1>GPU 2D MLS-MPM 混合材料ラボ</h1>
+			<p class="eyebrow">GATE 4 · WATER / OIL / POWDER</p>
+			<h1>GPU 2D MLS-MPM 混合材料ラボ</h1>
 			<p class="intro">
-					水・油は密度を分けた弱圧縮性流体、粉体は圧力依存のせん断降伏として同じ粒子配列で計算します。
-					初回の1ステップを CPU reference と比較し、選択・力ベースのドラッグ・複製を試します。
+				水・油・粉体の20,000粒子を WebGPU で計算します。初回ステップは材料ごとの局所粒子で CPU
+				reference と比較し、描画・粒子更新量・queue 完了待ちを実測できます。
 			</p>
 		</div>
 		<nav aria-label="実験ページ">
@@ -640,7 +670,7 @@
 	<section class="panel" aria-labelledby="simulation-title">
 		<div class="panel-heading">
 			<div>
-				<h2 id="simulation-title">密度の異なる水・油と摩擦性粉体</h2>
+				<h2 id="simulation-title">水・油・粉体の20,000粒子シーン</h2>
 				<p>
 					{particleCount} / {particleCapacity} 粒子 · {GRID.cellsX} × {GRID.cellsY} grid
 				</p>
@@ -669,6 +699,52 @@
 			<span><i class="powder-swatch"></i> 粉体（摩擦係数 0.55）</span>
 			水・油はせん断応力を持たず体積圧力だけを持つ試作モデルです。水・油の界面維持や浮沈は未実装です。
 		</p>
+
+		<section class="performance" aria-labelledby="performance-title">
+			<h2 id="performance-title">GPU 実測性能（直近1秒）</h2>
+			<dl class="performance-metrics">
+				<div>
+					<dt>描画</dt>
+					<dd>
+						{measuredFps === null ? '計測中' : `${measuredFps.toFixed(1)} FPS`}
+					</dd>
+				</div>
+				<div>
+					<dt>シミュレーション</dt>
+					<dd>
+						{measuredStepsPerSecond === null
+							? '計測中'
+							: `${measuredStepsPerSecond.toFixed(1)} steps/s`}
+					</dd>
+				</div>
+				<div>
+					<dt>粒子更新量（submit 換算）</dt>
+					<dd>
+						{measuredParticleStepsPerSecond === null
+							? '計測中'
+							: `${Math.round(measuredParticleStepsPerSecond)} particle-steps/s`}
+					</dd>
+				</div>
+				<div>
+					<dt>CPU step submit 平均</dt>
+					<dd>
+						{averageStepSubmitMs === null ? '—' : `${averageStepSubmitMs.toFixed(2)} ms`}
+					</dd>
+				</div>
+				<div>
+					<dt>GPU queue 完了待ち平均</dt>
+					<dd>
+						{averageQueueCompletionMs === null
+							? '計測中'
+							: `${averageQueueCompletionMs.toFixed(2)} ms`}
+					</dd>
+				</div>
+			</dl>
+			<p>
+				queue 完了待ちは WebGPU の submit 後から処理完了までの時間で、GPU 単体の実行時間ではありません。
+				完了を待ってから次の frame を送信し、遅い端末で GPU queue が無制限に膨らまないようにします。
+			</p>
+		</section>
 
 		<div class="interaction-controls" aria-labelledby="interaction-title">
 			<h2 id="interaction-title">粒子操作</h2>
@@ -754,19 +830,30 @@
 		<strong>検証範囲:</strong> P2G・grid update・G2Pで水・油の弱圧縮性EOSと粉体のDrucker–Prager風
 		せん断降伏を粒子ごとに計算します。objectIdによる選択・力ベースドラッグ・複製は密度・材料状態も保持します。
 		材料間の明示的接触、界面張力・非混和性、浮沈、実粉体の校正、長時間安定性は未実装または未検証です。
-		粒子状態のGPU readbackは初回比較時と一時停止中の明示的な状態確認時だけ行い、通常の各フレームでは行いません。
+		初回比較は材料ごとの局所サンプルだけを GPU から読み戻します。粒子状態の全量 GPU readback は一時停止中の明示的な状態確認時だけです。
 	</aside>
 </main>
 
 <style>
 	.lab {
 		box-sizing: border-box;
-		width: min(100%, 980px);
 		min-height: 100vh;
-		margin: 0 auto;
+		min-height: 100svh;
 		padding: max(1rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right))
 			max(2rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));
 		color: #e8f1fa;
+		background:
+			radial-gradient(ellipse at 12% 0%, rgb(38 101 151 / 22%), transparent 38%),
+			linear-gradient(145deg, #071321 0%, #0b1725 54%, #10182a 100%);
+	}
+
+	.header,
+	.panel,
+	.note {
+		box-sizing: border-box;
+		width: min(100%, 980px);
+		margin-right: auto;
+		margin-left: auto;
 	}
 
 	.header {
@@ -885,6 +972,50 @@
 		width: 0.75rem;
 		height: 0.75rem;
 		border-radius: 50%;
+	}
+
+	.performance {
+		margin-top: 1rem;
+		padding: 0.9rem 1rem;
+		border: 1px solid #31445a;
+		border-radius: 0.65rem;
+		background: #0d1823;
+	}
+
+	.performance h2 {
+		margin-bottom: 0;
+	}
+
+	.performance-metrics {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
+		gap: 0.55rem;
+		margin: 0.65rem 0 0;
+	}
+
+	.performance-metrics div {
+		min-width: 0;
+		padding: 0.6rem 0.7rem;
+		border: 1px solid #26394b;
+		border-radius: 0.45rem;
+	}
+
+	.performance-metrics dt {
+		color: #b8c7d8;
+		font-size: 0.82rem;
+	}
+
+	.performance-metrics dd {
+		margin: 0.25rem 0 0;
+		font-variant-numeric: tabular-nums;
+		overflow-wrap: anywhere;
+	}
+
+	.performance > p {
+		margin: 0.65rem 0 0;
+		color: #b8c7d8;
+		font-size: 0.85rem;
+		line-height: 1.5;
 	}
 
 	.water-swatch {

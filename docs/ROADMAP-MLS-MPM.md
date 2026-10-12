@@ -2,12 +2,12 @@
 
 更新日: 2026-10-12
 
-状態: Gate 0 の GPU 操作ラボはユーザーから稼働確認の報告あり。Gate 1 の CPU 数値
-reference と GPU MLS-MPM kernel は実装済みだが、実機での shader compile と数値検証は未完了。
-Gate 2 の GPU 選択・局所力ドラッグ・オブジェクト複製は `/labs/mpm/kernels` に統合し、
-ユーザーから基本操作の動作確認あり。Gate 3 の Neo-Hookean / Snow 型弾塑性と Gate 4 の水・油・
-粉体構成則はコード試作済み。Gate 1〜4 の GPU 実機受け入れ、Gate 4 の界面・粒状挙動検証、
-Gate 5 の持続性能と製品統合が残る。既存の β v0.2 は維持する。
+状態: Gate 0 の GPU 操作ラボはユーザーから稼働確認の報告あり。Gate 2 の選択・局所力
+ドラッグ・複製は基本操作の動作確認済み。Gate 4 の20,000粒子混合シーンはローカル
+デスクトップ Chrome で初回 CPU/GPU 比較と60 simulated secondsの実行を確認した。
+既定重力90で30 FPS・240 step/s・約4.8M particle-steps/s、最大絶対誤差2.44e-5。
+Android/iOS実機、5分以上の熱・持続性能、界面・粒状挙動検証、Gate 5 の製品統合が残る。
+既存の β v0.2 は維持する。
 
 ## 現在の実装状況
 
@@ -15,9 +15,9 @@ Gate 5 の持続性能と製品統合が残る。既存の β v0.2 は維持す�
 - **Gate 1**: `src/lib/mpm/reference/` にCPU reference、`src/lib/mpm/kernels/` にGPU上のP2G / grid update / G2PとGPU描画を実装。`/labs/mpm/kernels` で初回stepのCPU reference比較を行う。Neo-Hookeanの基準シーンを含む。GPU shader compile・数値差・挙動は実機未確認。
 - **Gate 2**: `/labs/mpm/kernels` に Gate 0 の操作を統合する。選択時だけ16 byteのGPU結果を読み戻し、ドラッグはgrid上の減衰付き局所力、複製は連続した `objectId` 範囲をGPU内でコピーする。粒子と ID buffer は初期化時に固定容量を確保し、容量超過は明示的に拒否する。基本操作はユーザー確認済み。長時間操作、容量境界、readback、数値安定性、性能は未確認。
 - **Gate 3**: 粒子単位でNeo-HookeanとSnow型2D弾塑性モデルを選べる。Snow型は主伸長の降伏射影と塑性体積履歴を持ち、両モデルを同一のGPU粒子配列に置ける。CPU referenceとlayoutテストは実装済み。専用の可視化シーンはGate 4ラボに置き換わった。GPU実機shader compile、混在時の数値比較、繰返し塑性負荷は未完了。
-- **Gate 4 試作**: 水・油に引張応力を持たない弱圧縮性EOSを使い、基準密度と基準体積から粒子質量を計算する。粉体は圧力依存のせん断降伏を持つDrucker-Prager風の試作モデル。CPU reference、GPU state、WGSL、mixed-material画面、CPU/layoutテストを実装した。全材料が単一のgrid速度場を共有するため、水・油の界面維持・浮沈・明示的接触は未実装で、粉体も校正済み粒状モデルではない。
+- **Gate 4 試作**: 水・油に引張応力を持たない弱圧縮性EOSを使い、基準密度と基準体積から粒子質量を計算する。液体は体積を保つ極分解回転へ射影し、圧力を生まないせん断変形の蓄積を抑える。粉体は圧力依存のせん断降伏を持つDrucker-Prager風の試作モデル。CPU reference、GPU state、WGSL、mixed-material画面、CPU/layoutテストを実装した。ラボの初期シーンは水8,000・油6,000・粉体6,000の計20,000粒子、GPU capacityは40,000。初回比較は各材料の局所近傍だけを使い、読み戻し量を抑える。描画FPS、step/s、submit換算particle-steps/s、CPU step submit時間、GPU queue完了待ちを直近1秒で表示し、queue fenceが完了してから次frameを送信する。完了待ちはGPU単体の実行時間ではない。ローカルデスクトップ Chrome で既定重力90の60 simulated secondsを30 FPS・240 step/sで完走し、各30秒後の全粒子数値状態も正常だった。全材料が単一のgrid速度場を共有するため、水・油の界面維持・浮沈・明示的接触は未実装で、粉体も校正済み粒状モデルではない。
 - **未実装**: 水・油の界面張力／非混和性、密度差による浮沈、材料間接触・摩擦、粉体の塑性圧密・校正。
-- **未確認**: Gate 1〜4のGPU実機shader compile・CPU/GPU数値検証、Gate 2〜4の長時間・容量境界・readback・性能試験。
+- **未確認**: Gate 1の弾性基準検証とGate 3のSnow型繰返し塑性負荷、Gate 2〜4の容量境界・操作readback、Android/iOS実機での長時間・熱・性能試験。ラボの性能表示はブラウザー側の測定値で、pass単位のGPU timestampではない。
 - **統合方針**: 実験画面は `/labs/mpm` に隔離し、通常画面 `/` の β v0.2 と既存のクラッシュ対策を置き換えない。
 
 ## 1. 目的と前提
@@ -146,11 +146,18 @@ MLS-MPM の完全な実装より先に行う。合成粒子データを GPU buff
 `lambda * min(J - 1, 0) * I` の体積応力だけを持ち、せん断応力を持たない。基準密度と粒子体積から
 粒子質量を変える。粉体は圧力に応じて対数主ひずみの偏差を制限する簡易せん断降伏モデルを使う。
 GPU particle layoutは密度・体積・摩擦係数を保持し、readbackと複製でも引き継ぐ。
+ラボはこのモデルを水8,000・油6,000・粉体6,000の20,000粒子で実行し、40,000粒子分の容量を確保する。
+初回 CPU/GPU 比較は各材料の局所粒子サンプルだけを読み戻し、明示的な一時停止状態確認は従来どおり全量を確認する。
+性能欄には描画FPS、step/s、submit換算particle-steps/s、CPU step submit平均とqueue完了待ちを表示する。
+GPU queueに未完了の仕事を積み続けないよう、queue fence完了後に次frameを送信する。
 
-**既知の制限**: 全材料が単一のgrid速度場を共有し、界面張力、非混和性、浮力、粒子接触はない。
-したがって水・油の境界維持や浮沈、粉体の液体との接触をこの試作だけで示せるとは限らない。
-粉体モデルは圧密・凝集・実材料の校正を含まない。shader compile・GPU/CPU比較・長時間挙動は
-WebGPU実機で未確認であり、現段階でGate 4合格とはしない。
+**確認済みのGPU検証**: ローカルデスクトップ Chrome でshader compile、初回 CPU/GPU 比較、
+既定重力90の20,000粒子混合シーンを60 simulated seconds実行し、全粒子状態を30秒ごとに確認した。
+同ブラウザーで単独材料の水・油は重力30・dt=1/480、粉は重力30・dt=1/240で各30 simulated secondsを確認した。
+**既知の制限**: Android/iOS実機、5分以上の熱・持続性能は未確認。全材料が単一のgrid速度場を共有し、
+界面張力、非混和性、浮力、粒子接触はない。したがって水・油の境界維持や浮沈、粉体の液体との接触を
+この試作だけで示せるとは限らない。粉体モデルは圧密・凝集・実材料の校正を含まないため、
+現段階でGate 4合格とはしない。
 
 **判定**: 水・油の分離や粉体挙動に過大な複雑さが必要なら、MLS-MPM コアを全面拡張せず、別の界面モデルまたはハイブリッド方式と比較する。
 

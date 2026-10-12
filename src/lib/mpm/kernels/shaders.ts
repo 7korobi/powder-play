@@ -42,6 +42,8 @@ struct CloneParams {
 	offsetAndDomain: vec4<f32>,
 }
 
+const WALL_CUSHION_CELLS: f32 = 8.0;
+
 @group(0) @binding(0) var<uniform> params: SimulationParams;
 @group(0) @binding(1) var<storage, read> particlesIn: array<Particle>;
 @group(0) @binding(2) var<storage, read_write> particlesOut: array<Particle>;
@@ -62,6 +64,12 @@ const ERROR_DEFORMATION: u32 = 2u;
 const ERROR_P2G: u32 = 4u;
 const ERROR_GRID: u32 = 8u;
 const ERROR_G2P: u32 = 16u;
+const ERROR_DEFORMATION_SUBSTEP_LIMIT: u32 = 32u;
+const ERROR_PROJECTED_DEFORMATION: u32 = 64u;
+const ERROR_P2G_INVALID_MATERIAL: u32 = 128u;
+const ERROR_P2G_NONFINITE_PARTICLE: u32 = 256u;
+const ERROR_P2G_NONFINITE_ACCUMULATION: u32 = 1024u;
+const ERROR_P2G_NONFINITE_NODE: u32 = 2048u;
 const MODEL_NEO_HOOKEAN: u32 = 0u;
 const MODEL_SNOW: u32 = 1u;
 const MODEL_WATER: u32 = 2u;
@@ -73,6 +81,8 @@ const SNOW_HARDENING: f32 = 10.0;
 const SNOW_MIN_PLASTIC_VOLUME: f32 = 0.6;
 const SNOW_MAX_PLASTIC_VOLUME: f32 = 20.0;
 const SNOW_MAX_HARDENING_EXPONENT: f32 = 20.0;
+const MAX_DEFORMATION_INCREMENT: f32 = 0.25;
+const MAX_DEFORMATION_SUBSTEPS: f32 = 64.0;
 
 struct Decomposition2 {
 	sigma: vec2<f32>,
@@ -84,6 +94,32 @@ struct Decomposition2 {
 
 fn finiteFloat(value: f32) -> bool {
 	return (bitcast<u32>(value) & 0x7f800000u) != 0x7f800000u;
+}
+
+fn recordDeformationFailure(
+	particleIndex: u32,
+	failedDeterminant: f32,
+	deformationIncrement: f32,
+	precedingDeterminant: f32,
+) {
+	let previousClaim = atomicOr(&stateError[6], 1u);
+	if (previousClaim == 0u) {
+		atomicStore(&stateError[1], particleIndex);
+		atomicStore(&stateError[2], bitcast<u32>(failedDeterminant));
+		atomicStore(&stateError[3], bitcast<u32>(deformationIncrement));
+		atomicStore(&stateError[4], bitcast<u32>(precedingDeterminant));
+	}
+}
+
+fn recordProjectedDeformationFailure(particleIndex: u32, deformation: vec4<f32>) {
+	let previousClaim = atomicOr(&stateError[6], 2u);
+	if (previousClaim == 0u) {
+		atomicStore(&stateError[1], particleIndex);
+		atomicStore(&stateError[2], bitcast<u32>(deformation.x));
+		atomicStore(&stateError[3], bitcast<u32>(deformation.y));
+		atomicStore(&stateError[4], bitcast<u32>(deformation.z));
+		atomicStore(&stateError[5], bitcast<u32>(deformation.w));
+	}
 }
 
 fn finiteVec2(value: vec2<f32>) -> bool {
@@ -197,6 +233,9 @@ fn projectGranularDeformation(
 	let deviatoricLogStretch = 0.5 * (logStretch.x - logStretch.y);
 	let maximumDeviatoricLogStretch =
 		frictionCoefficient * pressure / (2.0 * mu);
+	if (deviatoricLogStretch <= maximumDeviatoricLogStretch) {
+		return matrix;
+	}
 	let projectedDeviatoricLogStretch =
 		min(deviatoricLogStretch, maximumDeviatoricLogStretch);
 	let meanLogStretch = 0.5 * logVolume;
@@ -205,6 +244,17 @@ fn projectGranularDeformation(
 		meanLogStretch - projectedDeviatoricLogStretch,
 	));
 	return reconstructDeformation(decomposition, projectedSigma);
+}
+
+fn projectLiquidDeformation(matrix: vec4<f32>) -> vec4<f32> {
+	let rotationNumerator = vec2<f32>(matrix.x + matrix.w, matrix.z - matrix.y);
+	let rotationScale = max(abs(rotationNumerator.x), abs(rotationNumerator.y));
+	let normalizedRotation = rotationNumerator / rotationScale;
+	let rotationLength = length(normalizedRotation);
+	let rotation = normalizedRotation / rotationLength;
+	let volume = matrix.x * matrix.w - matrix.y * matrix.z;
+	let scale = sqrt(volume);
+	return scale * vec4<f32>(rotation.x, -rotation.y, rotation.y, rotation.x);
 }
 
 fn quadraticWeights(fraction: f32) -> vec3<f32> {
@@ -377,7 +427,8 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 				particle.plasticVolume < SNOW_MIN_PLASTIC_VOLUME ||
 				particle.plasticVolume > SNOW_MAX_PLASTIC_VOLUME
 			) {
-				atomicOr(&stateError[0], ERROR_P2G);
+				atomicMin(&stateError[1], particleIndex);
+				atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_INVALID_MATERIAL);
 				return;
 			}
 			let decomposition = decompose2x2(particle.f);
@@ -385,7 +436,8 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 				!finiteVec2(decomposition.sigma) ||
 				any(decomposition.sigma <= vec2<f32>(0.0))
 			) {
-				atomicOr(&stateError[0], ERROR_P2G);
+				atomicMin(&stateError[1], particleIndex);
+				atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_INVALID_MATERIAL);
 				return;
 			}
 			let rotation = polarRotation(decomposition);
@@ -418,7 +470,8 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 				!finiteFloat(particle.lambda) ||
 				particle.lambda <= 0.0
 			) {
-				atomicOr(&stateError[0], ERROR_P2G);
+				atomicMin(&stateError[1], particleIndex);
+				atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_INVALID_MATERIAL);
 				return;
 			}
 			let pressure = particle.lambda * min(determinant - 1.0, 0.0);
@@ -431,7 +484,8 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 				!finiteFloat(particle.frictionCoefficient) ||
 				particle.frictionCoefficient < 0.0
 			) {
-				atomicOr(&stateError[0], ERROR_P2G);
+				atomicMin(&stateError[1], particleIndex);
+				atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_INVALID_MATERIAL);
 				return;
 			}
 			stressTimesFt = granularStressTimesFt(
@@ -441,7 +495,8 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 				particle.frictionCoefficient,
 			);
 		} else {
-			atomicOr(&stateError[0], ERROR_P2G);
+			atomicMin(&stateError[1], particleIndex);
+			atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_INVALID_MATERIAL);
 			return;
 		}
 		var particleMass = params.physical.y;
@@ -474,25 +529,18 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			!finiteVec2(dpos) ||
 			!finiteVec2(particleMomentum)
 		) {
-			atomicOr(&stateError[0], ERROR_P2G);
+			atomicMin(&stateError[1], particleIndex);
+			atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_NONFINITE_PARTICLE);
 			return;
 		}
 
 		let weightedMass = weight * particleMass;
 		let weightedMomentum = weight * particleMomentum;
-		if (
-			(weight > 0.0 && weightedMass <= 0.0) ||
-			(weight > 0.0 &&
-				((particleMomentum.x != 0.0 && weightedMomentum.x == 0.0) ||
-					(particleMomentum.y != 0.0 && weightedMomentum.y == 0.0)))
-		) {
-			atomicOr(&stateError[0], ERROR_P2G);
-			return;
-		}
 		mass = mass + weightedMass;
 		momentum = momentum + weightedMomentum;
 		if (!finiteFloat(mass) || !finiteVec2(momentum)) {
-			atomicOr(&stateError[0], ERROR_P2G);
+			atomicMin(&stateError[1], particleIndex);
+			atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_NONFINITE_ACCUMULATION);
 			return;
 		}
 		entry = bucketNext[pairIndex];
@@ -500,12 +548,43 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	}
 
 	if (!finiteFloat(mass) || !finiteVec2(momentum)) {
-		atomicOr(&stateError[0], ERROR_P2G);
+		atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_NONFINITE_NODE);
 		return;
 	}
 	gridNodes[nodeIndex].mass = mass;
 	gridNodes[nodeIndex].momentum = momentum;
 	gridNodes[nodeIndex].velocity = vec2<f32>(0.0, 0.0);
+}
+
+fn applyWallCushion(velocity: f32, coordinate: i32, extent: i32) -> f32 {
+	let cushionCells = min(WALL_CUSHION_CELLS, f32(extent) / 4.0);
+	let wallDistance = select(f32(extent - coordinate), f32(coordinate), velocity < 0.0);
+	return velocity * clamp(wallDistance / cushionCells, 0.0, 1.0);
+}
+
+fn integrateDeformation(
+	deformation: vec4<f32>,
+	velocityGradient: vec4<f32>,
+	dt: f32,
+	substeps: u32,
+) -> vec4<f32> {
+	let substepDt = dt / f32(substeps);
+	let update = vec4<f32>(
+		1.0 + substepDt * velocityGradient.x,
+		substepDt * velocityGradient.y,
+		substepDt * velocityGradient.z,
+		1.0 + substepDt * velocityGradient.w,
+	);
+	var result = deformation;
+	for (var step = 0u; step < substeps; step += 1u) {
+		result = vec4<f32>(
+			update.x * result.x + update.y * result.z,
+			update.x * result.y + update.y * result.w,
+			update.z * result.x + update.w * result.z,
+			update.z * result.y + update.w * result.w,
+		);
+	}
+	return result;
 }
 
 @compute @workgroup_size(64)
@@ -565,18 +644,8 @@ fn updateGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		atomicOr(&stateError[0], ERROR_GRID);
 		return;
 	}
-	if (
-		(nodeCoordinate.x <= 0 && velocity.x < 0.0) ||
-		(nodeCoordinate.x >= i32(params.grid.x) && velocity.x > 0.0)
-	) {
-		velocity.x = 0.0;
-	}
-	if (
-		(nodeCoordinate.y <= 0 && velocity.y < 0.0) ||
-		(nodeCoordinate.y >= i32(params.grid.y) && velocity.y > 0.0)
-	) {
-		velocity.y = 0.0;
-	}
+	velocity.x = applyWallCushion(velocity.x, nodeCoordinate.x, i32(params.grid.x));
+	velocity.y = applyWallCushion(velocity.y, nodeCoordinate.y, i32(params.grid.y));
 	gridNodes[index].velocity = velocity;
 }
 
@@ -641,36 +710,45 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 
 	let updatedC = affine * params.material.w;
 	let dt = params.physical.w;
-	let deformationUpdate = vec4<f32>(
-		1.0 + dt * updatedC.x,
-		dt * updatedC.y,
-		dt * updatedC.z,
-		1.0 + dt * updatedC.w,
-	);
-	let trialF = vec4<f32>(
-		deformationUpdate.x * particle.f.x +
-			deformationUpdate.y * particle.f.z,
-		deformationUpdate.x * particle.f.y +
-			deformationUpdate.y * particle.f.w,
-		deformationUpdate.z * particle.f.x +
-			deformationUpdate.w * particle.f.z,
-		deformationUpdate.z * particle.f.y +
-			deformationUpdate.w * particle.f.w,
-	);
 	let updatedPosition = particle.position + dt * velocity;
-	var updatedF = trialF;
-	var updatedPlasticVolume = particle.plasticVolume;
-	let trialDeterminant = trialF.x * trialF.w - trialF.y * trialF.z;
 	if (
 		!finiteVec2(velocity) ||
 		!finiteVec4(updatedC) ||
-		!finiteVec4(trialF) ||
 		!finiteVec2(updatedPosition)
 	) {
 		atomicOr(&stateError[0], ERROR_G2P);
 		return;
 	}
+	let deformationRowSum = max(
+		abs(updatedC.x) + abs(updatedC.y),
+		abs(updatedC.z) + abs(updatedC.w),
+	);
+	let deformationIncrement = dt * deformationRowSum;
+	let requiredSubsteps = ceil(deformationIncrement / MAX_DEFORMATION_INCREMENT);
+	if (
+		!finiteFloat(requiredSubsteps) ||
+		requiredSubsteps > MAX_DEFORMATION_SUBSTEPS
+	) {
+		atomicMin(&stateError[1], particleIndex);
+		atomicOr(&stateError[0], ERROR_DEFORMATION_SUBSTEP_LIMIT);
+		return;
+	}
+	let substeps = max(1u, u32(requiredSubsteps));
+	let trialF = integrateDeformation(particle.f, updatedC, dt, substeps);
+	var updatedF = trialF;
+	var updatedPlasticVolume = particle.plasticVolume;
+	let trialDeterminant = trialF.x * trialF.w - trialF.y * trialF.z;
+	if (!finiteVec4(trialF)) {
+		atomicOr(&stateError[0], ERROR_G2P);
+		return;
+	}
 	if (!finiteFloat(trialDeterminant) || trialDeterminant <= 0.0) {
+		recordDeformationFailure(
+			particleIndex,
+			trialDeterminant,
+			deformationIncrement,
+			particle.f.x * particle.f.w - particle.f.y * particle.f.z,
+		);
 		atomicOr(&stateError[0], ERROR_DEFORMATION);
 		return;
 	}
@@ -715,6 +793,11 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			particle.frictionCoefficient,
 		);
 	} else if (
+		particle.materialModel == MODEL_WATER ||
+		particle.materialModel == MODEL_OIL
+	) {
+		updatedF = projectLiquidDeformation(trialF);
+	} else if (
 		particle.materialModel != MODEL_NEO_HOOKEAN &&
 		particle.materialModel != MODEL_WATER &&
 		particle.materialModel != MODEL_OIL
@@ -733,7 +816,8 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		return;
 	}
 	if (!finiteFloat(updatedDeterminant) || updatedDeterminant <= 0.0) {
-		atomicOr(&stateError[0], ERROR_DEFORMATION);
+		recordProjectedDeformationFailure(particleIndex, updatedF);
+		atomicOr(&stateError[0], ERROR_PROJECTED_DEFORMATION);
 		return;
 	}
 
