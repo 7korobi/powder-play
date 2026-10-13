@@ -150,6 +150,34 @@ describe('MPM macrostep and CFL microstep scheduling', () => {
 		);
 	});
 
+	it('keeps very high but representable velocity CFL-safe with shorter macro slices', () => {
+		const accumulatedSeconds = 1 / 240;
+		const batch = calculateMpmStepBatch({
+			accumulatorSeconds: accumulatedSeconds,
+			elapsedSeconds: 0,
+			simulationSpeed: 1,
+			fixedStepSeconds: 1 / 240,
+			cellSize: 10,
+			waveSpeedBound: 1_414.214,
+			velocityBound: 1_000_000,
+			courantLimit: 0.3,
+			maxMicrosteps: 512,
+			allowPartialBatch: true
+		});
+
+		expect(batch.macroStepCount).toBe(1);
+		expect(batch.macroDt).toBeLessThan(1 / 240);
+		expect(batch.microstepPlan.stepCount).toBeLessThanOrEqual(512);
+		expect(batch.microstepPlan.microDt).toBeLessThanOrEqual(batch.microstepPlan.safeDt);
+		expect(batch.simulatedSeconds).toBe(batch.macroDt);
+		expect(batch.remainderSeconds).toBeCloseTo(
+			accumulatedSeconds - batch.simulatedSeconds
+		);
+		expect(batch.simulatedSeconds + batch.remainderSeconds).toBeCloseTo(
+			accumulatedSeconds
+		);
+	});
+
 	it('rejects invalid time, speed, and cap inputs', () => {
 		const baseInput = {
 			accumulatorSeconds: 0,

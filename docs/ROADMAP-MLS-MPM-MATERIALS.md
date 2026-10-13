@@ -15,6 +15,12 @@ Gate 1・3・4 の数値／材料機能を深め、Gate 5 に渡すためのサ�
 M0〜M7全体の物理ゲートが合格したことを意味しない。
 M4 prototype の構成、未検証項目、性能上の注意は §4 の M4 に追記した。
 
+追記（2026-10-13）: 作業treeにはM2に関係するadaptive CFL microstep/recoveryの未commit変更がある。
+lab routeは材料由来の波速・速度上限、GPU guard、失敗microstepのrollback/retryを接続しているが、
+型・回帰・実GPUの合格結果はこの追記時点で未確認で、M2ゲートは未完了である。
+2026-10-13の既存benchmark／fixture値はこの変更より前のsourceに対する結果なので、
+現行treeでM2を受け入れる前に再計測する。
+
 ## 1. 到達点と設計境界
 
 最初の到達点は、GPU 上で「柔らかいゼリーの復元、自由表面、
@@ -241,22 +247,30 @@ mobile の総 GPU 予算は初期案 128 MiB とし、実機結果で調整す�
 <a id="m2"></a>
 ### M2 — 全物理 substep と圧力・復元の基準化
 
-**前提**: M0。M1 が採用されれば cache を再利用する。
+**前提**: 変更前のM0 baseline。本書に記録した2026-10-13のM0計測はadaptive CFL変更前の比較用snapshotであり、
+M2受け入れ後に現行source hashのM0を更新する。M1が採用されればcacheを再利用する。
+
+**現状（未受け入れ）**: 現行作業treeは材料由来のCFL boundsとGPU guardを使い、
+違反microstepをrollbackして残り区間を細分化するrecoveryを追加中である。
+これは本節の一部を実装したものだが、M2の解析応力・圧力・収束・保存量gateを通過した意味ではない。
+回帰と実GPUの結果が揃うまでは実験的な作業状態として扱う。
 
 - 1/240 秒を UI の macrostep として維持する場合、内部で
   `k = ceil(macroDt / safeDt)`、`microDt = macroDt/k` に分割する。
   各 microstep で全数値 pass を実行し、macrostep と microstep を別表示する。
 - 初期案は `safeDt <= 0.3*h/(c_bound+v_bound)`。
-  現行液体の静止条件でも `k >= 2` が必要となる。
+  現行液体の静止条件でも `k >= 2` が必要となる。2026-10-13の共有lab snapshotでは
+  初回macrostepが3 microstepだったが、この値は表示中scene・bounds・実装revision固有である。
   既定 60 FPS・2×は概ね８ macrostep/frame なので、２分割なら16 microstep/frame。
-- 最初は材料・想定変形・速度の保守的上限から一定 `k` を決め、
-  prepare/grid/commit 前の GPU 検査で上限逸脱を検出する。
-  逸脱時は rollback と通知を行い、上限や刻みを再設定する。
-  直前 batch の非同期最大速度だけを次 batch の保証として使わない。
+- conservative material/wave-speed boundと速度包絡から初回のmicrostep planを作る。
+  現行の未commit実装はGPUのCFL guard・診断可能な変形失敗を検出し、失敗microstepを戻して
+  最大4回まで細分化retryする。512 microstep/frameの予算はretryにも共有する。
+  fixed conservative planとadaptive retryのどちらを採用するかは、細かいstepのreference、
+  実行時間会計、rollback回数を比較して決める。直前batchの非同期最大速度だけを安全保証にしない。
 - Neo-Hookean の大変形、Snow の硬化を含む接線剛性 bound を CPU で検証する。
   `sqrt((lambda+2*mu)/rho0)` は微小ひずみの目安であり、全状態の bound としない。
 - [scheduler](../src/lib/mpm/kernels/step-scheduler.ts) の仕事上限は microstep 数で制限する。
-  超過時は `dt` を増やさず、実効倍率・破棄時間を表示する。
+  超過時も `dt` を増やしたり時間を黙って捨てたりせず、理由・未完了の要求時間・実効倍率を表示して停止する。
   揺動は実際のシミュレーション区間平均と整合させる。
 - ゼリーは現行 Neo-Hookean を維持し、`mu` と体積応答を別々に校正する。
   等容・体積分離の別モデルは必要性が確認された場合だけ追加する。
@@ -268,8 +282,10 @@ mobile の総 GPU 予算は初期案 128 MiB とし、実機結果で調整す�
   解放後の面積 drift は基準面積の 2% 以内を初期目標とする。
   減衰時間と拘束条件を固定し、形状は並進・回転を除いて比較する。
 - `dt` を半分にしたときの圧力・体積・回転誤差の収束傾向を記録する。
-- 60 simulated seconds の基準 scene で数値 rollback がなく、
-  clamp 発生数を明示する。clamp に依存する試験は物理合格としない。
+- 60 simulated seconds の基準sceneで要求したdurationを全て処理する。
+  recoverable retryとrollbackは回数・理由・成功したsimulation durationを記録し、
+  未回収の時間、重複commit、silent clampがないことを確認する。
+  retry上限・microstep予算に到達した場合は成功扱いせず、未完了durationを伴って停止する。
 
 F-bar 型安定化は全文確認と locking の定量的検出後の別実験。
 単に `J` を平滑化してこの段階の合格にしない。
@@ -452,13 +468,13 @@ raw 最大絶対差は `1.9063e-2`。Gate 4 全体の複数 batch benchmark は 
 - 初期目標は描画 30 FPS、p95 frame interval `<= 40 ms`、
   実効時間倍率 `>= 0.95×`。発熱後の後半でも比較し、達成しない場合は profile を明示して見直す。
 - GPU byte、pass／step 時間、CPU encode、queue 待ち、microstep 数、
-  discarded time、射影・rollback、界面／体積誤差を一緒に残す。
+  要求・完了・未処理のsimulation duration、retry/rollback、射影、界面／体積誤差を一緒に残す。
 - 粒子全量 readback が通常操作にないことを再確認する。
   診断の小さな定期 readback と、ユーザー要求時の full inspection を区別する。
 - 合格後にのみ [既存ロードマップの Gate 5](./ROADMAP-MLS-MPM.md) へ結果を反映し、
   通常画面への段階導入を判断する。
 
-## 5. 依存関係と最初の実装単位
+## 5. 依存関係と現在の実行順
 
 ```text
 M0: 現行再現・計測・容量
@@ -469,11 +485,16 @@ M0: 現行再現・計測・容量
                                       └──────── M7: 実機・採用判断
 ```
 
-最初の実装単位は **M0 → M1 の A/B → M2**。
-圧力・復元・安定性を測れるまで接触・表面張力を一度に増やさない。
-次に M3 とゼリー２体の M4 を進め、その後で水・油・粉を共存させる。
-M3 の表示試作や小規模 reference 試験は独立に進められるが、
-共通 layout の変更は１つの契約としてまとめて統合する。
+図は材料機能の依存関係であり、現行実装順や完了状況ではない。Gate 4の接触・破断prototypeは
+M2/M3の全面受け入れより先に実装されたため、存在をM4合格として扱わない。
+
+現時点の実行順は、まず未commitのM2 CFL経路を検証し、変更後sourceでM0の計測baselineを更新する。
+次にM3の面積field・表示幾何の誤差を確認し、Stage 1–4ロードマップのS3.1 scene-scale
+水・油normal contactとS4 loaded fractureを別々のfixtureで受け入れる。
+その後に流体–破断solid連成、S1/S2操作、S1–S4統合へ進む。表面張力・摩擦・projectionは
+S3/M4の測定結果から必要性を判定して追加し、Gate 5相当の端末・持続性能は採用対象のfeature scopeを
+固定してから確認する。M3表示試作や小規模reference試験は独立して進められるが、
+共通layout変更は１つの契約としてまとめて統合する。
 
 ## 6. 検証の実施契約
 
@@ -507,7 +528,7 @@ source revision + dirty-state identifier
 browser / OS / adapter / device limits / timestamp availability
 active particles / capacity / grid / contact fields / GPU bytes
 model parameters / particle mass-area convention / macroDt / microDt
-render target / requested speed / effective speed / discarded time
+render target / requested speed / effective speed / requested duration / committed duration / remaining duration
 CPU-GPU error by quantity / mass / momentum / area / J / clamp count
 contact gap / interface width / shape error / pressure error
 CPU encode / queue wait / GPU pass time if available / test duration

@@ -2,7 +2,7 @@
 
 更新日: 2026-10-13
 
-状態: ステージ1–4の操作経路と物理prototypeは実装済み。自動テストと一部ブラウザー操作は確認したが、物理受け入れゲートは未完了。設計境界は[全体設計](./DESIGN-LIQUIDFUN-VS-GPU-MPM.md)を参照する。
+状態: ステージ1–4の操作経路と物理prototypeは実装済み。S3/S4の小規模な制御GPU fixtureは通過したが、scene-scale物理受け入れとS1/S2の実機確認は未完了。現在の推奨実施順は[全体ロードマップ](./ROADMAP-MLS-MPM.md)と[引継ぎ手順](./HANDOFF-MLS-MPM-2026-10-13.md)を参照する。本書のS1–S4の並びは機能別の整理で、直近の作業順を示すものではない。
 
 ## 1. 目的と完了の定義
 
@@ -16,12 +16,13 @@
 |---|---|---|---|
 | 1. 傾き重力 | センサー変換、許可状態、手動重力fallbackを実装 | センサー変換の単体テスト、手動重力UI | Android/iOS実機で許可・拒否・画面向き・センサー欠落を確認 |
 | 2. emitter / outlet | 決定論的batch追加、連続追加、停止、outletと容量報告を実装 | ブラウザーで水64粒子を追加し、受入64・拒否0・容量超過0を確認 | 油・固体・連続停止・容量境界・outlet除去の一連の実行を確認 |
-| 3. 水・油界面 | 相別格子状態、相別法線接触、面積場の表示を実装 | 小規模CPU referenceで相identity、相別mass、接触momentumを検査 | 実GPUでの反復界面、任意初期条件での分離、曲率力・表面張力 |
-| 4. 固体破断 | 12×8 node・249 bondのGPU damage/broken prototypeを実装 | 閾値・永続性等のCPU reference、GPU pipeline/layoutのfake tests | 実GPU破断試験、流体荷重を含む再現性、解像度・性能の評価 |
+| 3. 水・油界面 | 相別格子状態、相別法線接触、面積場の表示を実装 | 2粒子・8 stepの実GPU接触fixtureでCPU/GPU差3.87e-5、相別mass各0.25、最大運動量残差1.19e-7、全step非交差 | scene-scale界面貫入、層状・斜め界面、任意初期条件での分離、曲率力・表面張力 |
+| 4. 固体破断 | 12×8 node・249 bondのGPU damage/broken prototypeを実装 | 4粒子・3 bondの実GPU fixtureで閾値下/上/無負荷を比較しbond 1だけ破断。rest lengthの初期破断stateも2 step保持 | 12×8 sceneへの負荷・流体連成でのpattern、fragment挙動、解像度・性能の評価 |
 
-自動検証の基準点は `npm test` 20 files / 170 tests、`npm run check` 0 errors / 0 warnings、`npm run build` 成功。これは各物理ゲートの合格や、実機WebGPUでの完全な検証を意味しない。
+自動検証の過去の基準点は `npm test` 20 files / 170 tests、`npm run check` 0 errors / 0 warnings、`npm run build` 成功。これは各物理ゲートの合格や、実機WebGPUでの完全な検証を意味しない。その後、作業treeにCFL microstep/recoveryの未commit変更があるため、このテスト数と以下のGPU結果は変更前sourceの記録であり、現行treeでは再実行が必要。
+変更前sourceでは、2026-10-13に14,696粒子sceneの実GPU benchmarkを5回実行し、GPU step medianの中央値0.40109 ms/step、p95中央値0.43035 ms/stepを記録した。小規模S3/S4 GPU fixtureの結果もCPU referenceとの制御比較であり、scene-scaleや長時間の受け入れではない。詳細は[性能計測資料](./PERFORMANCE-MLS-MPM.md)を参照する。
 
-## 2. 実装と検証の順序
+## 2. Stage別の実装状況と受け入れ条件
 
 ### S1 — 傾き重力を端末で受け入れる
 
@@ -57,10 +58,18 @@
 
 **S3.1 現行contactのGPU受け入れ**
 
-1. 静止した層状interface、接近する水・油、斜めinterfaceを少数粒子の再現可能なfixtureにする。
-2. GPU実行前後に相identity・相別mass・total momentumを測り、誤差許容値をfloat32基準試験から定めて記録する。
-3. 位置順序だけでなく、interface crossing/penetration、押し戻し、反発振動、空隙、界面の数値拡散を複数stepで計測する。
-4. CPU referenceとの比較で、水・油それぞれの速度と接触impulseを確認する。
+2026-10-13の制御fixtureでは、既存CPU referenceと同じ接近中の水・油2粒子を8 step実行した。
+各stepのGPU readbackでphase identity、相別mass各0.25、最大運動量残差`1.1921e-7`、
+全step非交差を確認し、CPU/GPU状態の最大絶対差は`3.8653e-5`だった。
+状態比較の`1e-3`は数値回帰の許容値であり、
+製品品質の貫入閾値ではない。
+
+**残作業**
+
+1. 静止した層状interface、斜めinterface、複数密度・速度差のfixtureを追加する。
+2. これらの配置でinterface crossing/penetration、押し戻し、反発振動、空隙、数値拡散を複数step計測する。
+3. scene-scaleの相別mass・momentumと物理的に許容できる貫入・分離基準を決める。
+4. 任意初期条件での混和・分離を確認する。CPU referenceとの比較だけでなくGPU結果も測る。
 
 **S3.2 表面張力を追加する判定と実装**
 
@@ -72,14 +81,19 @@
 
 **実装済みprototype**: 12×8 nodeのconnected Neo-Hookean bodyと249本のbondを持つ。引張strainの探索閾値0.12を用いてGPU上でdamage/brokenを更新し、damageを可視化する。破断後はbond stateを維持し、bond bodyのcloneは拒否する。
 
+2026-10-13の制御GPU fixtureでは、failure strain`0.1`に対し入力strain`0.05 / 0.11 / 0`の3 bondを2 step実行し、
+閾値上のbond index 1だけがbroken、閾値下のbond damageは約`0.5`、無負荷bondは未破断となった。
+粒子状態の最大CPU/GPU差は`7.63e-7`、damage差は`7.63e-6`以下、質量4・運動量残差0。
+別fixtureではrest lengthの初期broken bondが2 step後もdamage 1で維持された。
+このfixtureの閾値0.1は式の確認用であり、scene prototypeの0.12を素材強度として校正した結果ではない。
+
 **残作業**
 
-1. 負荷を段階的に増やす決定論的caseで、閾値未満では未破断、閾値超過では想定bondだけが破断することをGPUで確認する。
-2. damageが隣接粒子にだけ伝わること、破断後にbondが再生成されないこと、fragmentが相対移動できることを確認する。
-3. 外力が既知の小規模caseで、粒子数・質量・総運動量・有限値・grid境界を確認する。
-4. 1種類のnode間隔だけでなく粗密複数の解像度、step幅、材料係数でfailure patternを比較する。threshold、stress fade、bond stiffnessを分離して校正する。
-5. 水・油の接触荷重を加えたcaseを作り、contact impulseとfracture passの順序・結果を比較する。
-6. target mobile device上でparticle/bond数、buffer容量、持続時間、FPS/step timeを測る。1M particle capacityの確保量だけで性能を主張しない。
+1. 12×8 bodyに負荷を段階的に加え、期待pattern・damage局所化・fragmentの相対移動をGPUで確認する。
+2. 破断前後のmass/momentum、有限値、grid境界をこのsceneで確認する。
+3. 粗密複数の解像度、step幅、材料係数でfailure patternを比較し、threshold、stress fade、bond stiffnessを分離して校正する。
+4. 水・油の接触荷重を加えたcaseを作り、contact impulseとfracture passの順序・結果を比較する。
+5. target mobile device上でparticle/bond数、buffer容量、持続時間、FPS/step timeを測る。1M particle capacityの確保量だけで性能を主張しない。
 
 **受け入れ条件**: 閾値の上下で結果が再現し、局所damageが安定して伝播し、broken bondが復活しない。破断が質量消失・NaN・境界逸脱を起こさない。解像度ごとの結果と限界を公開する。`0.12`は現状の配置用探索値であり、素材固有の強度・fracture energyとは呼ばない。
 
@@ -93,6 +107,38 @@
 - mobileでの持続FPS、処理時間、メモリ、熱、容量上限を測り、目標未達なら容量・pass・sceneを調整して再測定する。
 - 各gateの結果と未確認を記録してからStage 5–6のruntime設計に進む。
 
-## 3. Stage 5–6へ進む前の停止条件
+## 3. ゲーム規模へ進む前の接触拡張性ゲート
+
+現在の衝突方式は少数の三角形collider向けprototypeである。grid node数 `G=34,119`、
+collider数 `B=200` では、三角形field構築は最大 `G·B ≈ 6.82M` node/body候補/substep、
+小石同士のSAT候補列挙は `B·(B−1) ≈ 39,800` pair/substepとなる。1,000 colliderでは
+約34.12M node/body候補と999k pair候補まで増える。AABB rejectionは詳細判定を省くが、
+現在は候補生成自体を空間的に絞っていない。実測条件と式は
+[性能計測資料](./PERFORMANCE-MLS-MPM.md)、最適化案は
+[性能チューニングロードマップP5](./ROADMAP-MLS-MPM-PERFORMANCE.md)を参照。
+
+大きな構造物を多数particleで表す負荷と、三角形collider数を増やす負荷は分けて測る。
+内部fracture graphが疎ならbond updateは概ね `O(P + E)` だが、構造表面を多数の三角形へ
+分解して全node/all-pair探索へ渡すと再び `O(G·B)` / `O(B²)` に近づく。
+
+**製品規模へ進む前の作業**
+
+1. 200 / 400 / 800 / 1,000以上のcollider、並びに96 / 384 / 1,536以上のparticleから成る
+   疎な大構造を作り、grid・step・seedを固定したsparse sceneとdense sceneを計測する。
+2. node/body候補数、body pair数、詳細判定数、cell list長とoverflow、contact pass p50/p95、
+   CFL substep数、全体frame時間、memoryをGPUで記録する。
+3. uniform grid body-cell listでtriangle fieldを局所候補化し、body pairをcanonical unique pairに
+   絞ってからSATを行う。大型colliderはhierarchical grid/BVH/object-level surface proxyを比較する。
+4. 小規模brute-force結果をoracleとし、接触漏れ、double impulse、penetration、
+   momentum residual、順序依存を比較する。dense worst caseの `O(B²)` 残存を隠さない。
+5. target mobile GPUで、ユーザーが増やす物体数・構造解像度に対する上限を測定から定め、
+   上限超過は明示的に拒否する。
+
+**受け入れ条件**: sparse caseで候補数が全node×bodyと全body pairから局所参照数へ下がる。
+brute-force oracleに対する接触漏れがなく、overflowを黙って無接触扱いにしない。dense caseを
+含む最終sceneのp95時間・buffer memoryがtarget mobile予算内に入り、許容scene budgetを明記する。
+このゲートは現在未実装であり、1M粒子buffer capacityを物体数の性能保証として扱わない。
+
+## 4. Stage 5–6へ進む前の停止条件
 
 Stage 1–4の実装が存在しても、S1–S4統合ゲート未通過なら気体・熱とのcouplingを追加しない。特に、相別mass/momentumのGPU確認、安定したtime stepping、有限容量・エラー通知、実機での最低限の持続測定が済むまでは、新しいphase fieldや温度bufferを粒子layoutへ追加しない。

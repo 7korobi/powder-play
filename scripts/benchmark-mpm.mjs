@@ -40,6 +40,7 @@ async function benchmark(profile) {
 	let device;
 	let buffers;
 	let initialAllocatedBytes = 0;
+	let captureFractureBondReadback = false;
 	GPUAdapter.prototype.requestDevice = async function (descriptor = {}) {
 		device = await requestDevice.call(this, {
 			...descriptor,
@@ -49,7 +50,13 @@ async function benchmark(profile) {
 		initialAllocatedBytes = 0;
 		const createBuffer = device.createBuffer.bind(device);
 		device.createBuffer = (descriptor) => {
-			const buffer = createBuffer(descriptor);
+			// This local harness reads back bond state to verify fracture transitions.
+			const instrumentedDescriptor =
+				captureFractureBondReadback &&
+				descriptor.label === 'MLS-MPM persistent fracture bond state'
+					? { ...descriptor, usage: descriptor.usage | GPUBufferUsage.COPY_SRC }
+					: descriptor;
+			const buffer = createBuffer(instrumentedDescriptor);
 			buffers.set(descriptor.label, buffer);
 			initialAllocatedBytes += descriptor.size;
 			return buffer;
@@ -327,6 +334,335 @@ async function benchmark(profile) {
 				if (!(error instanceof MpmMlsGpuNumericalError) || error.flags !== rollbackFlags) throw error;
 			}
 		);
+		solver.dispose(); solver = null;
+
+		const physicsParityTolerance = 1e-3;
+		const zeroMatrix = { m00: 0, m01: 0, m10: 0, m11: 0 };
+		const identityMatrix = { m00: 1, m01: 0, m10: 0, m11: 1 };
+		const totalMomentum = (state, massOf) => state.reduce(
+			(momentum, particle) => {
+				const mass = massOf(particle);
+				momentum.x += mass * particle.velocity.x;
+				momentum.y += mass * particle.velocity.y;
+				return momentum;
+			},
+			{ x: 0, y: 0 }
+		);
+		const phaseMass = (state, model) => state
+			.filter((particle) => particle.material?.model === model)
+			.reduce((mass, particle) => mass + particle.volume * particle.material.density, 0);
+
+		const waterMaterial = { model: 'water', lambda: 8, mu: 0, density: 1 };
+		const oilMaterial = { model: 'oil', lambda: 8, mu: 0, density: 1 };
+		const contactParticles = [
+			{
+				position: { x: 7.5, y: 8 }, velocity: { x: 5, y: 0 },
+				C: zeroMatrix, F: identityMatrix, volume: 0.25,
+				objectId: 1, material: waterMaterial
+			},
+			{
+				position: { x: 8.5, y: 8 }, velocity: { x: -5, y: 0 },
+				C: zeroMatrix, F: identityMatrix, volume: 0.25,
+				objectId: 2, material: oilMaterial
+			}
+		];
+		const contactConfig = {
+			grid: { cellsX: 16, cellsY: 16, cellSize: 1 },
+			particleMass: 0.1, particleVolume: 0.25,
+			material: { model: 'neo-hookean', lambda: 20, mu: 10 },
+			dt: 0.001, gravity: { x: 0, y: 0 }, capacity: 2
+		};
+		const contactSteps = 8;
+		let expectedContactParticles = contactParticles;
+		let actualContact = contactParticles;
+		let contactMaxAbsoluteError = 0;
+		let contactMaxMomentumResidual = 0;
+		let contactMaxPhaseMassError = 0;
+		const inputWaterMass = phaseMass(contactParticles, 'water');
+		const inputOilMass = phaseMass(contactParticles, 'oil');
+		const contactMassOf = (particle) => particle.volume * particle.material.density;
+		const inputContactMomentum = totalMomentum(contactParticles, contactMassOf);
+		solver = await createMpmMlsGpuSolver(canvas, contactParticles, contactConfig);
+		for (let step = 0; step < contactSteps; step += 1) {
+			const expectedContact = stepMpm(expectedContactParticles, contactConfig);
+			solver.step(contactConfig.dt, contactConfig.gravity);
+			actualContact = await solver.readParticles();
+			await solver.checkNumericalStatus();
+			const contactError = maxDifference(actualContact, expectedContact.particles);
+			if (contactError > physicsParityTolerance) {
+				throw new Error(`Water/oil CPU/GPU parity exceeds tolerance at step ${step + 1}: ${contactError}`);
+			}
+			contactMaxAbsoluteError = Math.max(contactMaxAbsoluteError, contactError);
+			if (
+				actualContact.length !== 2 ||
+				actualContact[0].material.model !== 'water' ||
+				actualContact[1].material.model !== 'oil' ||
+				actualContact[0].objectId !== 1 ||
+				actualContact[1].objectId !== 2
+			) {
+				throw new Error(`Water/oil phase identity changed at step ${step + 1}.`);
+			}
+			const outputWaterMass = phaseMass(actualContact, 'water');
+			const outputOilMass = phaseMass(actualContact, 'oil');
+			const phaseMassError = Math.max(
+				Math.abs(outputWaterMass - inputWaterMass),
+				Math.abs(outputOilMass - inputOilMass)
+			);
+			if (phaseMassError > 1e-6) {
+				throw new Error(`Water/oil contact changed a phase mass at step ${step + 1}.`);
+			}
+			contactMaxPhaseMassError = Math.max(contactMaxPhaseMassError, phaseMassError);
+			const outputContactMomentum = totalMomentum(actualContact, contactMassOf);
+			const momentumResidual = Math.hypot(
+				outputContactMomentum.x - inputContactMomentum.x,
+				outputContactMomentum.y - inputContactMomentum.y
+			);
+			if (momentumResidual > physicsParityTolerance) {
+				throw new Error(`Water/oil contact momentum residual exceeds tolerance at step ${step + 1}: ${momentumResidual}`);
+			}
+			contactMaxMomentumResidual = Math.max(contactMaxMomentumResidual, momentumResidual);
+			if (actualContact[0].position.x > actualContact[1].position.x) {
+				throw new Error(`Water/oil particles crossed at step ${step + 1}.`);
+			}
+			if (
+				step === 0 &&
+				!(
+					actualContact[0].velocity.x < contactParticles[0].velocity.x &&
+					actualContact[1].velocity.x > contactParticles[1].velocity.x
+				)
+			) {
+				throw new Error('Water/oil interface contact did not reduce closing motion.');
+			}
+			expectedContactParticles = expectedContact.particles;
+		}
+		const liquidContactAcceptance = {
+			particles: actualContact.length,
+			steps: contactSteps,
+			maxAbsoluteError: contactMaxAbsoluteError,
+			tolerance: physicsParityTolerance,
+			waterMass: { input: inputWaterMass, output: phaseMass(actualContact, 'water') },
+			oilMass: { input: inputOilMass, output: phaseMass(actualContact, 'oil') },
+			maxPhaseMassError: contactMaxPhaseMassError,
+			maxMomentumResidual: contactMaxMomentumResidual,
+			phaseIdentity: true,
+			closingMotionReducedOnFirstStep: true,
+			noCrossingAcrossAllSteps: true
+		};
+		solver.dispose(); solver = null;
+
+		async function readFractureBondState(bondCount) {
+			const buffer = buffers.get('MLS-MPM persistent fracture bond state');
+			if (!buffer) throw new Error('GPU fracture-bond state buffer was not captured.');
+			const words = await rawState(buffer);
+			const floats = new DataView(Uint32Array.from(words).buffer);
+			return Array.from({ length: bondCount }, (_, index) => {
+				const wordOffset = index * 6;
+				return {
+					firstParticle: words[wordOffset],
+					secondParticle: words[wordOffset + 1],
+					damage: floats.getFloat32((wordOffset + 4) * 4, true),
+					broken: words[wordOffset + 5] !== 0
+				};
+			});
+		}
+		function compareFractureState(actualParticles, actualBonds, expected, stepLabel) {
+			if (!expected.fractureBonds) throw new Error(`${stepLabel}: CPU reference omitted fracture bonds.`);
+			const particleError = maxDifference(actualParticles, expected.particles);
+			if (particleError > physicsParityTolerance) {
+				throw new Error(`${stepLabel}: fracture particle parity exceeds tolerance: ${particleError}`);
+			}
+			if (actualBonds.length !== expected.fractureBonds.length) {
+				throw new Error(`${stepLabel}: GPU fracture-bond count changed.`);
+			}
+			let particleDamageError = 0;
+			for (let index = 0; index < expected.particles.length; index += 1) {
+				const actualDamage = actualParticles[index].damage ?? 0;
+				const expectedDamage = expected.particles[index].damage ?? 0;
+				if (!Number.isFinite(actualDamage)) {
+					throw new Error(`${stepLabel}: GPU particle damage is non-finite.`);
+				}
+				particleDamageError = Math.max(
+					particleDamageError,
+					Math.abs(actualDamage - expectedDamage)
+				);
+			}
+			let bondDamageError = 0;
+			for (let index = 0; index < expected.fractureBonds.length; index += 1) {
+				const actual = actualBonds[index];
+				const reference = expected.fractureBonds[index];
+				if (
+					actual.firstParticle !== reference.firstParticle ||
+					actual.secondParticle !== reference.secondParticle ||
+					actual.broken !== (reference.broken ?? false) ||
+					!Number.isFinite(actual.damage)
+				) {
+					throw new Error(`${stepLabel}: GPU fracture-bond state differs at bond ${index}.`);
+				}
+				bondDamageError = Math.max(
+					bondDamageError,
+					Math.abs(actual.damage - (reference.damage ?? 0))
+				);
+			}
+			if (
+				particleDamageError > physicsParityTolerance ||
+				bondDamageError > physicsParityTolerance
+			) {
+				throw new Error(`${stepLabel}: fracture damage parity exceeds tolerance.`);
+			}
+			return {
+				particleMaxAbsoluteError: particleError,
+				particleDamageMaxAbsoluteError: particleDamageError,
+				bondDamageMaxAbsoluteError: bondDamageError,
+				brokenBondIndices: actualBonds
+					.map((bond, index) => bond.broken ? index : null)
+					.filter((index) => index !== null)
+			};
+		}
+
+		const fractureMaterial = { model: 'neo-hookean', lambda: 20, mu: 10 };
+		const fractureParticles = [16, 17.05, 18.16, 19.16].map((x) => ({
+			position: { x, y: 32 },
+			velocity: { x: 0, y: 0 },
+			C: zeroMatrix,
+			F: identityMatrix,
+			objectId: 41,
+			material: fractureMaterial
+		}));
+		const fractureBonds = [
+			{ firstParticle: 0, secondParticle: 1, restLength: 1, failureStrain: 0.1 },
+			{ firstParticle: 1, secondParticle: 2, restLength: 1, failureStrain: 0.1 },
+			{ firstParticle: 2, secondParticle: 3, restLength: 1, failureStrain: 0.1 }
+		];
+		const fractureConfig = {
+			grid: { cellsX: 64, cellsY: 64, cellSize: 1 },
+			particleMass: 1, particleVolume: 1, material: fractureMaterial,
+			capacity: fractureParticles.length, fractureBonds
+		};
+		const fractureStepConfig = {
+			...fractureConfig, dt: 0.001, gravity: { x: 0, y: 0 }
+		};
+		const expectedBrokenPattern = (result) => {
+			if (!result.fractureBonds) throw new Error('CPU reference omitted fracture bonds.');
+			return result.fractureBonds
+				.map((bond, index) => bond.broken ? index : null)
+				.filter((index) => index !== null);
+		};
+		let expectedFracture = stepMpm(fractureParticles, fractureStepConfig);
+		if (JSON.stringify(expectedBrokenPattern(expectedFracture)) !== '[1]') {
+			throw new Error('Fracture fixture does not isolate below-, above-, and unstrained bonds.');
+		}
+		captureFractureBondReadback = true;
+		solver = await createMpmMlsGpuSolver(canvas, fractureParticles, fractureConfig);
+		solver.step(fractureStepConfig.dt, fractureStepConfig.gravity);
+		let actualFractureParticles = await solver.readParticles();
+		await solver.checkNumericalStatus();
+		let actualFractureBonds = await readFractureBondState(fractureBonds.length);
+		const firstFractureComparison = compareFractureState(
+			actualFractureParticles,
+			actualFractureBonds,
+			expectedFracture,
+			'Fracture step 1'
+		);
+		expectedFracture = stepMpm(expectedFracture.particles, {
+			...fractureStepConfig, fractureBonds: expectedFracture.fractureBonds
+		});
+		solver.step(fractureStepConfig.dt, fractureStepConfig.gravity);
+		actualFractureParticles = await solver.readParticles();
+		await solver.checkNumericalStatus();
+		actualFractureBonds = await readFractureBondState(fractureBonds.length);
+		const secondFractureComparison = compareFractureState(
+			actualFractureParticles,
+			actualFractureBonds,
+			expectedFracture,
+			'Fracture step 2'
+		);
+		const fractureMass = actualFractureParticles.length * fractureConfig.particleMass;
+		const fractureMomentum = totalMomentum(
+			actualFractureParticles,
+			() => fractureConfig.particleMass
+		);
+		if (
+			actualFractureParticles.length !== fractureParticles.length ||
+			Math.abs(fractureMass - fractureParticles.length * fractureConfig.particleMass) > 1e-6 ||
+			Math.hypot(fractureMomentum.x, fractureMomentum.y) > physicsParityTolerance ||
+			actualFractureParticles.some(
+				({ position }) =>
+					position.x < 0 || position.x > fractureConfig.grid.cellsX ||
+					position.y < 0 || position.y > fractureConfig.grid.cellsY
+			)
+		) {
+			throw new Error('Fracture changed particle mass/momentum or moved particles outside the grid.');
+		}
+		solver.dispose(); solver = null;
+
+		const persistentParticles = [20, 21].map((x) => ({
+			position: { x, y: 32 },
+			velocity: { x: 0, y: 0 },
+			C: zeroMatrix,
+			F: identityMatrix,
+			objectId: 42,
+			material: fractureMaterial
+		}));
+		const persistentBond = [{
+			firstParticle: 0, secondParticle: 1, restLength: 1,
+			failureStrain: 0.1, damage: 1, broken: true
+		}];
+		const persistenceConfig = {
+			...fractureConfig,
+			capacity: persistentParticles.length,
+			fractureBonds: persistentBond
+		};
+		const persistenceStepConfig = {
+			...persistenceConfig, dt: 0.001, gravity: { x: 0, y: 0 }
+		};
+		let expectedPersistence = stepMpm(persistentParticles, persistenceStepConfig);
+		expectedPersistence = stepMpm(expectedPersistence.particles, {
+			...persistenceStepConfig, fractureBonds: expectedPersistence.fractureBonds
+		});
+		solver = await createMpmMlsGpuSolver(canvas, persistentParticles, persistenceConfig);
+		solver.stepBatch(2, persistenceStepConfig.dt, persistenceStepConfig.gravity);
+		const actualPersistenceParticles = await solver.readParticles();
+		await solver.checkNumericalStatus();
+		const actualPersistenceBonds = await readFractureBondState(persistentBond.length);
+		const persistenceComparison = compareFractureState(
+			actualPersistenceParticles,
+			actualPersistenceBonds,
+			expectedPersistence,
+			'Broken-bond persistence'
+		);
+		if (!actualPersistenceBonds[0].broken || actualPersistenceBonds[0].damage !== 1) {
+			throw new Error('An initialized broken bond revived below its failure strain.');
+		}
+		const fractureAcceptance = {
+			particles: fractureParticles.length,
+			bonds: fractureBonds.length,
+			steps: 2,
+			failureStrain: 0.1,
+			testBondStrains: [0.05, 0.11, 0],
+			brokenBondIndices: secondFractureComparison.brokenBondIndices,
+			belowThresholdDamage: actualFractureBonds[0].damage,
+			maxParticleError: Math.max(
+				firstFractureComparison.particleMaxAbsoluteError,
+				secondFractureComparison.particleMaxAbsoluteError
+			),
+			maxParticleDamageError: Math.max(
+				firstFractureComparison.particleDamageMaxAbsoluteError,
+				secondFractureComparison.particleDamageMaxAbsoluteError
+			),
+			maxBondDamageError: Math.max(
+				firstFractureComparison.bondDamageMaxAbsoluteError,
+				secondFractureComparison.bondDamageMaxAbsoluteError
+			),
+			persistence: {
+				steps: 2,
+				brokenAtRest: actualPersistenceBonds[0].broken,
+				damage: actualPersistenceBonds[0].damage,
+				maxParticleError: persistenceComparison.particleMaxAbsoluteError
+			},
+			mass: fractureMass,
+			momentumResidual: Math.hypot(fractureMomentum.x, fractureMomentum.y)
+		};
+		solver.dispose(); solver = null;
 		return {
 			performance: performanceResult,
 			regression: {
@@ -335,6 +671,11 @@ async function benchmark(profile) {
 				pick: true, drag: true, cloneStateAndCapacity: true, render: true,
 				rollback: true, rollbackParticles: rollbackParticles.length,
 				persistentNumericalStatus: true, rollbackFlags
+			},
+			physicsAcceptance: {
+				tolerance: physicsParityTolerance,
+				waterOilContact: liquidContactAcceptance,
+				fracture: fractureAcceptance
 			}
 		};
 	} finally {

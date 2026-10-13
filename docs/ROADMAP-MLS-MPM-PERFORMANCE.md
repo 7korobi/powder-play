@@ -12,7 +12,8 @@
 追加16 MBのcache、p95の変動、CPU時計分解能の制限、回帰結果は
 [性能資料の結果欄](./PERFORMANCE-MLS-MPM.md#5-実装後に残す比較) に記録した。
 この測定は後に三粒子弾性小石へ置換された旧20,000粒子・粉体シーンを対象とする。
-14,600粒子・200個の小石を使う現シーンで同じA/B条件を再測定した結果ではない。
+2026-10-12の14,600粒子・200小石sceneは、後に加わった96粒子の破断solidを含まない。
+現行14,696粒子sceneで同じA/B条件を再測定した結果ではない。
 計画を先に確定した履歴が分かるよう、以下の変更内容・採否基準は維持する。
 
 ## P0 — 計測と候補の選定
@@ -129,29 +130,119 @@ workgroup 内 barrier を異なる dispatch の同期の代用品にしない。
 - [既存ロードマップ](./ROADMAP-MLS-MPM.md):
   現行実装の変更と合格範囲。材料機能の gate を勝手に完了扱いにしない。
 
-## Gate 4 接触prototype追加後の補足計測
+## Gate 4 接触prototype追加後の補足計測（14,600粒子、破断solidなし）
 
-M4 の接触dispatchを含む現行シーンを、P0〜P4で使った再現可能benchmarkで追加計測した。
+M4 の接触dispatchを含む当時の水・油・小石シーンを、P0〜P4で使った再現可能benchmarkで追加計測した。
 14,600 active、1,000,000 capacity、200小石、固定 seed、Apple Metal 3 / Chrome 154。
 batch profileは0.37094 ms/step median・0.37371 p95、GPU buffer確保量は221,564,392 byte。
 stages profileは80 compute pass/8-step batchで診断し、`buildTriangleField` 0.13918、
 `solveBondedTriangles` 0.10010 ms/step medianが上位だった。測定条件・全stage値は
-[性能資料](./PERFORMANCE-MLS-MPM.md#現行-66-unit接触prototype高ランダム初速2026-10-12) に記録する。
+[性能資料](./PERFORMANCE-MLS-MPM.md) に記録する。
 
 計測で分かった候補のうち、三角形 SAT の AABB reject、contact impulse gather 範囲の縮小、
 field broad-phase の平方距離化を実装した。変更前後は各１回の参考計測で、制御された反復A/Bではない。
 P4のM1採否を変更する結果ではなく、接触追加後の性能合格も意味しない。
 
+## 2026-10-13計測snapshot: 14,696粒子scene（adaptive CFL変更前）
+
+初期ラボと同じ水8,000・油6,000・小石600粒・破断solid96粒を含むsceneを、
+Mac / Headless Chrome 154 / Apple Metal 3で実GPU計測した。5回のbatch runのGPU step medianは
+0.41254、0.40143、0.40109、0.36103、0.39817 ms、median-of-mediansは0.40109 ms/step。
+runごとのp95の中央値は0.43035 ms/step。第4runは速い側の値で、600 msのwall-clock warmupにより
+runごとのwarmup step数・scene状態が一致しないため、単一runの値だけで評価しない。
+GPU buffer確保量は221,626,976 byte。stage診断では `buildTriangleField` 0.13882、
+`solveBondedTriangles` 0.09796 ms/stepが上位だった。
+
+上記のelapsed-timeとS3/S4 fixture結果は、作業treeにあるadaptive CFL microstep/recovery変更前の
+sourceに対するbaselineである。CFL変更後はsubstep数・retry・時間会計が変わるため、
+以前のms/stepを現行runtimeの性能とみなさず、M2検証後に同一条件・新source hashで再計測する。
+
+2×で必要な480 step/sに対し、GPU timestampから導くcompute時間は約0.193秒/実時間1秒。
+32×の7,680 step/sは約3.080 GPU秒/実時間1秒となり、この端末・sceneでは計算だけでも
+現状のまま持続できない。これは描画なし・短時間のGPU計算からの導出であり、
+画面上の実効時間倍率や発熱後の性能を測ったものではない。
+第5回実行では別途、小規模GPU受け入れfixtureも通過した。水・油2粒子/8 stepで相別質量
+各0.25・最大運動量残差1.1921e-7・CPU/GPU最大差3.8653e-5、4粒子/3 bondの破断fixtureで
+閾値下damage 0.499992・閾値上のbond index 1のみ破断・CPU/GPU最大粒子状態差7.63e-7を確認。
+rest lengthの初期破断bondも2 step保持した。scene-scale接触・運動量・実sceneの破断patternは未検証で、
+物理gateは未通過。詳細な条件・誤差範囲・全stage値は
+[性能資料](./PERFORMANCE-MLS-MPM.md)を参照する。
+
 ## 後続: 今回実装しない調査
 
 - mobile で capacity と機能 profile を見直し、５分以上の持続性能を測る。
-- `buildTriangleField` の全 node×body 探索をGPU spatial tile/bucket候補に置き換え、
-  固定容量・overflow検知・clone後の動的body数を含めて現在の計測と反復A/B比較する。
+- 接触候補の広域探索は下記P5で計画する。物理baselineを固定するまで本最適化を先行実装しない。
 - dense node の list 長・偏りを収集して sort/tile gather を比較する。
 - active node/tile と full-grid の crossover を測る。
 - physics と render の decoupling、queue gate、pick の大粒子数 search を比較する。
 - SoA、workgroup size、subgroup、`f16` は精度と対応端末を確認するまで採用しない。
 - CFL と体積保存・界面機能は材料ロードマップで別に進める。
+
+## P5 — 接触候補の空間索引（提案・未実装）
+
+**問題**: 現行sceneの `G=34,119` halo込みgrid nodes、`B=200` 三角形colliderでは、
+`buildTriangleField` が最大 `G·B ≈ 6.82M` node/body候補をsubstepごとに調べる。
+`solveBondedTriangles` は `B·(B−1) ≈ 39,800` body-pair候補を列挙する。
+1,000 colliderならそれぞれ約34.12Mと999kへ増える。現行AABB testは候補生成後の
+narrow phaseを省略するだけで、この計算量を変えない。
+
+### P5.1 — 同条件の計測・小規模oracleを固定
+
+- collider数を200 / 400 / 800 / 1,000以上へ増やす。grid resolution、材料係数、
+  particle count、dt、seedを固定し、uniform sparse配置とdense pileを別々に測る。
+- 大きなsolidは粒子数 `P` と疎なbond数 `E` を独立に変え、既存の小石collider数 `B`
+  の試験と混同しない。
+- candidate body-node checks、unique body-pair数、exact triangle/SAT narrow-phase数、
+  cell listの平均・p95・最大長、overflow数、`buildTriangleField` / SAT時間、
+  CFL substep数、total batch p50/p95、GPU memoryを記録する。
+- 小さいsceneでは全件走査のbrute-force結果をoracleとして保存する。
+  spatial broad-phaseはfalse positiveを許容するが、false negativeを許容しない。
+
+### P5.2 — triangle field用GPU cell list
+
+1. substepごとに各変形colliderのAABBを計算し、contact skinとそのsubstepで許される
+   最大移動量だけ膨張する。長い・大きいcolliderは後述の階層方式へ分ける。
+2. AABBと交差するcellの参照数を数え、GPU prefix scanでoffsetを作り、
+   triangle IDをcellごとのCSR/bucket listへscatterする。
+3. `buildTriangleField` は各grid nodeから同じcell/隣接cellの候補だけを読み、
+   現在の三角形距離・normal・barycentric narrow phaseを保つ。
+4. cell候補listのcapacityを明示してoverflow statusを持つ。overflow時に接触を黙って
+   省かず、対象batchをrollback/failまたは小規模fallbackへ送る。
+5. topologyは再利用し、位置依存AABB/listは必要なphysics substepで更新する。
+   既存particle bucketはpoint particle用なので、triangle AABBを登録するbody index構造を
+   自動的に再利用できると仮定しない。
+
+期待するsparse/有界密度時の仕事量は `O(G + R + K)` の形に近づく。
+ここで `R` はbody-cell参照数、`K` は局所node-candidate数。これはworst-case保証ではなく、
+巨大AABB、偏ったcell、dense pileではcandidate数が増える。
+
+### P5.3 — body pairのbroad phase
+
+- body AABBを空間cellへ登録し、同一/隣接cell内のpair候補だけを作る。
+- 同じ2 bodyが複数cellで出会っても一度だけSATへ渡す。canonical cell ownerか、
+  `min(id), max(id)` keyのsort/unique等、再現可能な重複除去を比較する。
+- pairごとに狭域SATを一度だけ実行し、両bodyへのequal-and-opposite impulseは既存の
+  owner/gather経路で反映する。floating-point atomic scatterを追加しない。
+- 小石数が少ない場合はbrute-force経路の方が安い可能性があるため、切替閾値は実測で決める。
+
+uniform gridは同程度サイズの小石の第一候補とする。非常に大きな構造物と小石が混在し、
+大AABBが多数cellへ展開される場合は、hierarchical grid、BVH/LBVH、粗いobject proxyを
+比較する。fracture objectは内部bondを疎な局所graph (`O(P + E)`) として維持し、
+外部contactはsurface/粗いSDF等のobject-level proxyで扱う案を優先する。破断後のfragment
+proxy更新は別途測定する。
+
+### P5.4 — 採用ゲート
+
+- 乱数seed付きのsparse/dense、境界、退化三角形、高速移動caseで、candidate listが
+  brute-forceが発見する全接触を含む。overflowが0、またはoverflowを明示的に処理する。
+- 接触後のpenetration、momentum residual、order dependenceが固定baselineの許容範囲を
+  超えない。候補重複でdouble impulseを与えない。
+- collider数と大型solidの `P/E` を別々に増やした実測を公開し、target mobile GPUで
+  選んだscene budgetに対するp95 frame/physics budget、memory、CFL costを満たす。
+- sparse caseで候補数が総 `G·B` / `B²` から局所参照数に縮小することをカウンタで確認する。
+  dense caseで二乗項が残るなら適用範囲と上限を明示し、無理にlinear scalingを主張しない。
+- indexed solverを小規模brute-force oracleと比較する。物理係数、接触skin、描画radiusを
+  変えて候補数増大を見えにくくしない。
 
 ## ソース訂正前チェック
 

@@ -121,7 +121,7 @@
 		| 'unsupported';
 	type GpuSolver = Awaited<ReturnType<typeof createMpmMlsGpuSolver>>;
 	let simulatedTimeSeconds = 0;
-	let simulationAccumulatorSeconds = 0;
+	let simulationAccumulatorSeconds = $state(0);
 	let latestSubmittedCflSequence = 0;
 	let latestPlannedParticleSpeedBound = 0;
 
@@ -157,7 +157,8 @@
 		currentSolver: GpuSolver,
 		input: Omit<MpmStepBatchInput, 'waveSpeedBound' | 'velocityBound'>,
 		gravity: MpmVector2,
-		oscillationAmplitude: number
+		oscillationAmplitude: number,
+		currentParticleSpeedBound = latestPlannedParticleSpeedBound
 	): { readonly batch: MpmStepBatch; readonly velocityBound: number } {
 		const cflBounds = currentSolver.cflBounds;
 		if (cflBounds === null) {
@@ -169,7 +170,11 @@
 			...input,
 			allowPartialBatch: true,
 			waveSpeedBound: cflBounds.waveSpeedBound,
-			currentVelocityBound: latestPlannedParticleSpeedBound,
+			currentVelocityBound: Math.max(
+				cflBounds.velocityBound,
+				latestPlannedParticleSpeedBound,
+				currentParticleSpeedBound
+			),
 			gravityMagnitude: Math.hypot(gravity.x, gravity.y),
 			oscillationAmplitude,
 			dragRadius: dragActive ? BRUSH_RADIUS : 0,
@@ -767,6 +772,24 @@
 		paused = !paused;
 	}
 
+	function discardDeferredSimulationTime(): void {
+		if (
+			phase !== 'ready' ||
+			!paused ||
+			outletPending ||
+			cflSpeedReadbackCount > 0 ||
+			simulationAccumulatorSeconds <= 0
+		) {
+			return;
+		}
+
+		const discardedSeconds = simulationAccumulatorSeconds;
+		simulationAccumulatorSeconds = 0;
+		phaseMessage =
+			`${discardedSeconds.toFixed(3)} 秒分の未処理シミュレーション時間を破棄しました。` +
+			'粒子状態を保持して一時停止中です。';
+	}
+
 	function emitSourceBurst(): MpmMlsGpuAppendResult | null {
 		const currentSolver = solver;
 		if (!currentSolver || phase !== 'ready') return null;
@@ -807,6 +830,46 @@
 			return lastEmission;
 		}
 
+		const emitterSpeedBound = Math.hypot(emitterVelocityX, emitterVelocityY);
+		let cflPreview: ReturnType<typeof calculateBoundedBatch>;
+		try {
+			cflPreview = calculateBoundedBatch(
+				currentSolver,
+				{
+					accumulatorSeconds: FIXED_STEP_SECONDS,
+					elapsedSeconds: 0,
+					simulationSpeed: 1,
+					fixedStepSeconds: FIXED_STEP_SECONDS,
+					cellSize: GRID.cellSize,
+					maxMicrosteps: MAX_MICROSTEPS_PER_FRAME
+				},
+				effectiveGravity(),
+				horizontalOscillationAmplitude,
+				emitterSpeedBound
+			);
+		} catch (error) {
+			if (!(error instanceof RangeError)) {
+				console.error('Emitter CFL preflight failed.', error);
+			}
+			const reason = `CFL事前確認: ${errorText(error)}`;
+			lastEmission = {
+				requested: particles.length,
+				accepted: 0,
+				refused: particles.length,
+				dropped: 0,
+				activeParticleCount: currentSolver.particleCount,
+				allocatedParticleCount: currentSolver.allocatedParticleCount,
+				capacity: currentSolver.particleCapacity,
+				velocityBound: emitterSpeedBound,
+				reason
+			};
+			emissionMessage =
+				`CFL事前確認で追加を拒否しました。accepted 0 / refused ${particles.length} / dropped 0 · ${reason}`;
+			emissionIsError = true;
+			continuousEmission = false;
+			return lastEmission;
+		}
+
 		try {
 			const result = currentSolver.appendParticles(particles);
 			lastEmission = result;
@@ -821,7 +884,10 @@
 			emissionMessage =
 				`要求 ${result.requested} · 受入 ${result.accepted} · 拒否 ${result.refused} · 容量超過で未追加 ${result.dropped}。` +
 				`活動粒子 ${result.activeParticleCount} / 予約スロット ${result.allocatedParticleCount} / 容量 ${result.capacity}.` +
-				(result.reason ? ` ${result.reason}` : '');
+				(result.reason ? ` ${result.reason}` : '') +
+				(cflPreview.batch.macroDt < FIXED_STEP_SECONDS
+					? ` CFL安全のため時間刻みを ${cflPreview.batch.macroDt.toExponential(2)} 秒に短縮。要求倍率より遅く進む場合があります。`
+					: ` CFL事前確認: ${cflPreview.batch.microstepPlan.stepCount} microsteps/macrostep。`);
 			if (result.accepted === 0 && (result.refused > 0 || result.dropped > 0)) {
 				continuousEmission = false;
 			}
@@ -1018,7 +1084,9 @@
 			}
 			if (queueWorkPending) return;
 			if (continuousEmission) {
-				if (lastContinuousEmissionTimestamp === null) {
+				if (paused || document.visibilityState !== 'visible') {
+					lastContinuousEmissionTimestamp = timestamp;
+				} else if (lastContinuousEmissionTimestamp === null) {
 					lastContinuousEmissionTimestamp = timestamp;
 				} else if (
 					cflSpeedReadbackCount === 0 &&
@@ -1173,6 +1241,7 @@
 
 		function handleVisibilityChange(): void {
 			lastFrameTimestamp = null;
+			lastContinuousEmissionTimestamp = null;
 			framePacer.reset();
 			if (
 				document.visibilityState !== 'visible' &&
@@ -1396,13 +1465,27 @@
 			<div>
 				<h2 id="simulation-title">水・油・弾性小石・GPU破断固体 · {GATE4_PARTICLE_COUNT.toLocaleString()}粒子</h2>
 				<p>
-					活動 {particleCount} · 使用スロット {allocatedParticleCount} / 容量 {particleCapacity} · {GRID.cellsX} × {GRID.cellsY} grid
+					活動 {particleCount} · 使用スロット {allocatedParticleCount} / 容量 {particleCapacity} · 空き {Math.max(0, particleCapacity - allocatedParticleCount)} · {GRID.cellsX} × {GRID.cellsY} grid
 				</p>
 			</div>
 			<p class="status" class:error={phase === 'error' || phase === 'lost'} role="status">
 				{phaseMessage}
 			</p>
 		</div>
+		{#if phase === 'error' || phase === 'lost'}
+			<div class="recovery-controls">
+				<p>
+					現在のGPU状態から安全に続行できません。初期シーンで再起動すると、追加した粒子と現在の状態は失われます。
+				</p>
+				<button
+					type="button"
+					class="secondary"
+					onclick={() => window.location.reload()}
+				>
+					初期シーンから再起動
+				</button>
+			</div>
+		{/if}
 
 		<div class="simulation-layout">
 			<section class="simulation-controls" aria-label="シミュレーション操作">
@@ -1586,6 +1669,30 @@
 							選択を複製
 						</button>
 					</div>
+					<div class="simulation-backlog">
+						<p>
+							未処理シミュレーション時間:
+							<output>{simulationAccumulatorSeconds.toFixed(3)} 秒</output>
+						</p>
+						<p id="simulation-backlog-note" class="control-note">
+							処理上限超過分は保持され、要求倍率より遅れて進みます。一時停止中は粒子状態を保ったまま、未処理時間だけを明示的に破棄できます。
+						</p>
+						<button
+							type="button"
+							class="secondary"
+							onclick={discardDeferredSimulationTime}
+							disabled={
+								phase !== 'ready' ||
+								!paused ||
+								outletPending ||
+								cflSpeedReadbackCount > 0 ||
+								simulationAccumulatorSeconds <= 0
+							}
+							aria-describedby="simulation-backlog-note"
+						>
+							未処理時間を破棄して続行
+						</button>
+					</div>
 				</div>
 				<p id="clone-note" class="control-note">
 					通常の選択オブジェクトは clone できます。GPU 破断 body は選択・ドラッグできますが、壊れた bond を再生成しないよう clone は無効です。
@@ -1593,7 +1700,7 @@
 				<section class="source-controls" aria-labelledby="source-title">
 					<h3 id="source-title">材料 emitter · 容量 · outlet</h3>
 					<p class="control-note">
-						各追加は seed + burst 番号から決定論的に配置します。GPU 粒子 state が正本です。容量超過分は追加せず件数を報告し、削除スロットは再利用しません。
+						各追加は seed + burst 番号から決定論的に配置します。GPU 粒子 state が正本です。一時停止中は連続追加も停止します。容量超過分は追加せず件数を報告し、削除スロットは再利用しません。
 					</p>
 					<div class="source-grid">
 						<label>
@@ -1641,13 +1748,28 @@
 						</label>
 						<label>
 							<span>初速 X</span>
-							<input type="number" min="-400" max="400" step="5" bind:value={emitterVelocityX} disabled={phase !== 'ready' || outletPending} />
+							<input
+								type="number"
+								step="any"
+								bind:value={emitterVelocityX}
+								disabled={phase !== 'ready' || outletPending}
+								aria-describedby="emitter-velocity-note"
+							/>
 						</label>
 						<label>
 							<span>初速 Y</span>
-							<input type="number" min="-400" max="400" step="5" bind:value={emitterVelocityY} disabled={phase !== 'ready' || outletPending} />
+							<input
+								type="number"
+								step="any"
+								bind:value={emitterVelocityY}
+								disabled={phase !== 'ready' || outletPending}
+								aria-describedby="emitter-velocity-note"
+							/>
 						</label>
 					</div>
+					<p id="emitter-velocity-note" class="control-note">
+						初速に固定上限はありません。追加前にCFL安全性を確認し、必要なら時間刻みを短縮します。速度が大きいほど要求倍率より遅く進みます。float32で安全な時間刻みを作れない値は追加せず、既存のシミュレーションを継続します。
+					</p>
 					<p class="seed-note">次の burst seed: {(emitterSeed + emitterSequence) >>> 0}</p>
 					<div class="source-buttons">
 						<button
@@ -1764,8 +1886,16 @@
 					</dd>
 				</div>
 				<div>
+					<dt>未処理シミュレーション時間</dt>
+					<dd>{simulationAccumulatorSeconds.toFixed(3)} 秒</dd>
+				</div>
+				<div>
 					<dt>描画目標（上限）</dt>
 					<dd>{renderTargetFps} FPS</dd>
+				</div>
+				<div>
+					<dt>要求時間倍率</dt>
+					<dd>{simulationSpeed.toFixed(2)}×</dd>
 				</div>
 				<div>
 					<dt>物理 macrosteps</dt>
@@ -1828,8 +1958,8 @@
 			</dl>
 			<p>
 				描画目標は15・30・60・90・120 FPSから選択できます。実際の描画FPSはディスプレイの更新頻度と GPU 処理時間に制約されます。
-				物理 macrostep は 1/240 秒で、CFL 条件を満たす数の数値 microstep に分割し、各 microstep で全 solver pass を実行します。1 frame あたりの上限は macrostep 数ではなく合計512 microstepです。
-				必要量がbatch上限を超えた場合は、範囲内の仕事だけを実行して未処理時間を累積し、後続batchへ繰り越します。Gate 4 の波速上限は液体 EOS と Neo-Hookean acoustic tensor から導出し、速度包絡は GPU 上の粒子最大速度と重力・左右揺れ・有限半径ドラッグの入力包絡から batch ごとに計算します。GPU guard は各 microstep の実速度を、選択した float32 microDt で波速と合わせて CFL 条件を満たす速度許容域内か検査します。Neo-Hookean 変形行列の主伸長が安全域[0.05, 20]を外れる場合は範囲内に射影し、float32での特異化・極端な伸長を防ぎます。CFL 違反や診断可能な変形失敗では、違反 microstep を rollback して最後の有効状態から残り時間を少なくとも倍の刻みで最大4回まで再試行します。初回batchは512 microstepまで、適応再試行は失敗済みworkを含め合計1024 microstepまでです。正の安全なmicrostepを1つも確保できない場合、再試行不能な数値異常、または有効な進捗がない場合は、時間を破棄せず理由を表示して停止します。
+				標準物理 macrostep は 1/240 秒で、CFL 条件に応じて数値 microstep に分割します。1 batch の初回処理上限は合計512 microstepです。処理量が上限を超えた場合は一部を実行して未処理時間を累積し、後続batchへ繰り越します。固定macrostepが上限に収まらない高速度では、macrostep自体を正のfloat32安全刻みまで短縮するため、クラッシュではなく時間の進みが遅くなります。未処理時間は自動破棄せず、要求・実効倍率とともに表示します。一時停止中は粒子状態を保ったまま、未処理時間だけを明示的に破棄できます。
+				Gate 4 の波速上限は液体 EOS と Neo-Hookean acoustic tensor から導出し、速度包絡は GPU 上の粒子最大速度と重力・左右揺れ・有限半径ドラッグの入力包絡から batch ごとに計算します。GPU guard は各 microstep の実速度を、選択した float32 microDt で波速と合わせて CFL 条件を満たす速度許容域内か検査します。Neo-Hookean 変形行列の主伸長が安全域[0.05, 20]を外れる場合は範囲内に射影し、float32での特異化・極端な伸長を防ぎます。CFL 違反や診断可能な変形失敗では、違反 microstep を rollback して最後の有効状態から残り時間を少なくとも倍の刻みで最大4回まで再試行します。初回batchは512 microstepまで、適応再試行は失敗済みworkを含め合計1024 microstepまでです。emitterの初速は追加前にCFL事前確認し、float32で正の安全刻みを作れないbatchは既存状態を止めずに拒否します。回復不能な数値異常や有効な進捗がない場合は理由を表示して停止し、初期シーンからの再起動を案内します。
 				左右揺れはシミュレーション時間に同期し、batch区間の平均加速度を適用します（0で停止）。queue 完了待ちは GPU 単体の実行時間ではなく、完了を待ってから次の frame を送信します。毎 physics batch の速度計測は GPU 最大値 reduction と非同期の小さな scalar/status readback で、全 particle state の readback は行いません。表示する readback 平均値にはこのコストを含みます。
 			</p>
 		</section>
@@ -2000,7 +2130,9 @@
 	.seed-note,
 	.emission-status,
 	.outlet-controls p,
-	.fracture-note {
+	.fracture-note,
+	.simulation-backlog p,
+	.recovery-controls p {
 		margin: 0;
 		color: #b8c7d8;
 		font-size: 0.84rem;
@@ -2031,6 +2163,20 @@
 	.source-controls h3 {
 		margin: 0;
 		font-size: 1rem;
+	}
+
+	.simulation-backlog,
+	.recovery-controls {
+		display: grid;
+		gap: 0.55rem;
+		padding: 0.75rem;
+		border: 1px solid #31445a;
+		border-radius: 0.55rem;
+		background: #0d1823;
+	}
+
+	.simulation-backlog output {
+		font-weight: 700;
 	}
 
 	.source-grid {

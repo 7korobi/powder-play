@@ -78,9 +78,16 @@ microstep rates are reported separately. The scheduler caps an initial
 per-frame batch at 512 microsteps and defers excess requested work to later
 batches; adaptive recovery counts failed work and retries against a separate
 1,024-microstep batch budget. Unprocessed simulation time remains in the
-accumulator rather than being clamped or discarded. If even one positive,
-representable CFL-safe slice cannot fit the cap, or a batch makes no valid
-progress, the lab reports an explicit error and stops.
+accumulator rather than being clamped or discarded. When a fixed macrostep
+cannot fit the cap, the scheduler shortens the simulation-time slice to a
+positive, representable CFL-safe duration and retains the rest. The UI shows
+requested/effective time scale and pending simulation time; while paused, the
+user may explicitly discard only that pending time without changing particle
+state. An emitter burst is checked against the current CFL envelope before GPU
+append. Values that cannot produce a positive float32 CFL slice are refused
+without stopping the existing simulation. If no safe slice can be represented
+or a batch makes no valid progress, the lab reports an explicit error and
+offers a reload from the initial scene.
 
 Gate 4 derives the liquid acoustic bounds from its tension-free EOS
 (`c² = lambda / referenceDensity`) and the Neo-Hookean bound from the material
@@ -99,8 +106,8 @@ This is a guarded, evolving bound, not a claim that the initial speeds are a
 lifetime guarantee. The default 1× macro-time scheduling path is exercised by
 tests; the lab's existing 2× default remains unchanged. At most one adaptive
 CFL batch and its compact readback may be pending; later frame time remains in
-the accumulator until it completes, and any resulting work-cap overflow stops
-explicitly instead of dropping simulated time.
+the accumulator until it completes. Work-cap overflow is deferred rather than
+treated as a fatal solver error or silently dropping simulated time.
 
 The Gate 4 sample starts with 8,000 water, 6,000 oil, 200 Neo-Hookean
 elastic pebbles built from three particles each, and a 96-particle connected

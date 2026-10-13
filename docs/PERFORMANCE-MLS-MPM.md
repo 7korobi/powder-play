@@ -23,7 +23,8 @@
 同じ初期 seed と同じ step 列で比較する。描画を外した kernel benchmark と、
 描画・操作を含めた実時間試験を別に行う。
 解像度、粒子数、EOS、密度、`dt`、実効速度の変更を「同じ物理の高速化」と呼ばない。
-１×を維持できずシミュレーション時間を破棄している場合、FPS が高くても solver の成功ではない。
+要求されたsimulation durationを処理できたか、未処理分が明示されているかを確認する。
+時間を黙って破棄・clampしてFPSだけを高く保つことはsolverの成功ではない。
 
 ## 2. 計測する指標
 
@@ -40,7 +41,7 @@
 | frame interval/FPS | rAF・実描画の median/p95、目標に達したか | 60 FPS ceiling では小さな solver 改善を比較できない |
 | input latency | pick/drag/clone の要求から応答・描画まで | 平均 FPS だけでは操作の遅延を説明できない |
 | 実効時間倍率 | 完了 step × `dt` / 実時間 | requested speed と分ける |
-| discarded time | budget 上限で破棄した simulated seconds | 高 FPS のために失った物理時間を隠さない |
+| simulation-time accounting | requested / committed / remaining simulated seconds | 未完了durationを成功扱い・黙って破棄しない。通常はremainingが0、明示停止時は残量を記録する |
 
 サンプルは median と p95、min/max、数を残す。少数試験の p95 は推定が粗いので、
 １回の最高値や細かい小数だけで確信を持たない。
@@ -333,9 +334,9 @@ CPU時計の分解能のため、encode median/p95の0 msは実処理時間ゼ�
 `1.3956e-5`、batch/単発差0、pick・drag・clone・render・rollback・永続数値statusを確認した。
 この短時間試験は長時間弾性復元、頂点間の一体変形、明示的接触を検証するものではない。
 
-### 現行: 66-unit・接触prototype・高ランダム初速（2026-10-12）
+### 2026-10-12時点: 14,600粒子・66-unit・接触prototype・高ランダム初速
 
-接触・辺長制約を含む現在のコードを、同じ固定条件で追加計測した。シーン seed は
+接触・辺長制約を含む当時のsceneを、同じ固定条件で追加計測した。シーン seed は
 `0x4d504d34`、水・油±60、小石頂点±120 world units/s、14,600 active /
 1,000,000 capacity、220×150 cells (`h=10`)、`dt=1/240`、重力 `(0,90)`、
 描画なし。Chrome 154 / Apple Metal 3 (fallbackなし) / `timestamp-query`、
@@ -344,6 +345,8 @@ CPU時計の分解能のため、encode median/p95の0 msは実処理時間ゼ�
 shaders `1e9f3de53af6ad0db3602b2dffce1cdc2a87671ab57f62efead3d486c8a535e4`、
 solver `151f3e05ebeb6233d9915b658ffe91b4908466e78fab2ff4c5d2d6e3584ad893`。
 GPU確保量は `221,564,392 byte`。storage buffer binding上限は8、現在の要求数以内。
+この14,600粒子の計測には現行ラボの96粒子・249 bondの破断solidを含まない。
+したがって2026-10-13の14,696粒子計測との性能差を直接比較しない。
 
 | 指標 | batch profile median / p95 | stages profile median / p95 |
 |---|---:|---:|
@@ -383,6 +386,113 @@ absolute-plus-relative基準を用いる。１回のrandom-seed reloadでは最�
 固定した５ seed の同じ局所CPU/GPU比較もすべて合格し、raw最大絶対差は`1.9063e-2`。
 三角形のGPU clone/readbackと、clone後の追加step・numerical statusも確認した。
 これは接触のscene-scale妥当性、長時間の形状保持、運動量残差の証明ではない。
+
+### 2026-10-13計測snapshot: 14,696粒子・破断solid込み（adaptive CFL変更前）
+
+`/labs/mpm/kernels` と同じ `createMpmGate4Scene(0x4d504d34)` を使い、水8,000・油6,000・
+三粒子小石200個（600粒子）・12×8 nodeの破断solid（96粒子、249 bond）を含む
+14,696 active / 1,000,000 capacityを計測した。220×150 cells (`h=10`)、`dt=1/240`、
+重力 `(0,90)`、描画なし。Headless Chrome 154 / macOS / Apple Metal 3
+（fallbackなし）/ `timestamp-query`。各runで600 msの重力ゼロ暖機、64 stepの重力暖機、
+12 batch×8 stepを計測した。現行sceneのGPU buffer確保量は `221,626,976 byte`。
+
+この計測・下記のS3/S4 fixture・source hashは、作業treeにadaptive CFL
+microstep/recovery変更が入る前のsnapshotである。現在のdirty sourceは `cfl.ts`、`solver.ts`、
+`shaders.ts`、lab route等を変更しているため、この計測値を現行sourceの性能・物理結果として
+引用しない。M2のCFL実装を検証した後、同じ条件と新source hashでbatch、回帰、S3/S4 fixtureを再実行する。
+
+`batch` profileを独立に5回実行した。各runの12サンプルの中央値とp95は次のとおり。
+
+| run | GPU median / p95 (ms/step) | CPU encode median / p95 (ms/batch) | queue wait median / p95 (ms/batch) | pass / 8-step batch |
+|---|---:|---:|---:|---:|
+| 1 | 0.41254 / 0.45756 | 0 / 0.10 | 3.80 / 4.20 | 1 |
+| 2 | 0.40143 / 0.44743 | 0 / 0.10 | 3.60 / 4.00 | 1 |
+| 3 | 0.40109 / 0.43035 | 0 / 0.10 | 3.80 / 3.90 | 1 |
+| 4 | 0.36103 / 0.37224 | 0 / 0.10 | 3.30 / 3.40 | 1 |
+| 5 | 0.39817 / 0.41114 | 0 / 0.10 | 3.60 / 3.90 | 1 |
+
+runごとのGPU medianの中央値は `0.40109 ms/step`、runごとのp95の中央値は
+`0.43035 ms/step`。第4runは他runより速い側の値で、単一結果を基準にせず反復値で扱う。
+stationary warmupは600 msの実時間なので、runごとのwarmup step数とscene状態は完全一致しない。
+CPU時計の分解能でencode medianは0 msに丸められるため、
+CPU時間がゼロという意味ではない。queue waitはGPU timestampではなく、
+GPU実行時間の代用にはしない。
+
+別の `stages` profileは診断のためdispatchごとにcompute passを分割し、
+8-step batchあたり80 passで計測した。通常batchの1 pass構成と時間を直接比較しない。
+診断profileのGPU step intervalはmedian `0.45286` / p95 `0.47742 ms`。
+
+| stage | median / p95 (ms/step) |
+|---|---:|
+| clearGrid | 0.00889 / 0.01341 |
+| prepareParticles | 0.00794 / 0.01452 |
+| buildBuckets | 0.01105 / 0.01844 |
+| P2G | 0.03353 / 0.04076 |
+| buildTriangleField | 0.13882 / 0.14395 |
+| updateGrid | 0.01620 / 0.01815 |
+| G2P | 0.02578 / 0.05711 |
+| applyTriangleContactImpulses | 0.03541 / 0.03703 |
+| solveBondedTriangles | 0.09796 / 0.10159 |
+| commitParticles | 0.00446 / 0.02698 |
+
+最も時間の大きいstageは `buildTriangleField` と `solveBondedTriangles`。
+現行sceneで性能改善に着手する場合の候補だが、接触のscene-scale物理基準を先に固定し、
+最適化で接触結果が変わらないことを検証する。
+
+### 接触候補の計算量と規模リスク
+
+現行のtriangle collider数を `B`、halo込みgrid node数を `G` とすると、
+`buildTriangleField` は各node invocationから全colliderを走査するため候補数の上限は
+`G·B`、`solveBondedTriangles` は各bodyから他bodyを走査するため `B·(B−1)` となる。
+現在の `G=34,119`、`B=200` では、それぞれ約6.82M node/body checksと39,800 body-pair
+checks/substepである。AABB rejectionはnarrow phaseを減らすが、これらの候補列挙は減らさない。
+
+| 三角形collider数 `B` | node/body候補 `G·B` | body pair候補 `B·(B−1)` |
+|---:|---:|---:|
+| 200 | 6.82M | 39,800 |
+| 400 | 13.65M | 159,600 |
+| 1,000 | 34.12M | 999,000 |
+| 5,000 | 170.60M | 24.995M |
+| 10,000 | 341.19M | 99.99M |
+
+この表は演算時間ではなく、1 physics substep当たりの候補チェック上限である。
+CFLでsubstep数が増えれば接触処理も比例して繰り返される。実行時はAABBで詳細判定を
+省略する一方、近接・密集sceneでは広域候補数自体が増える。全体が同じ狭い場所に重なる
+dense worst caseは、正確なpair contactをすべて解く限り `O(B²)` が残り得る。
+
+2026-10-13の200小石scene診断では `buildTriangleField` が0.13882 ms/step、
+`solveBondedTriangles` が0.09796 ms/stepだった。dispatch別stage profileの値であり、
+通常batchや別GPUへの時間予測ではないが、総当たり部分が既に計測上のhot spotである根拠になる。
+従って1M particle buffer capacityを、そのまま実用的なcollider数の保証と解釈しない。
+具体的なbroad-phase方式とscale acceptance gateは
+[性能チューニングロードマップ](./ROADMAP-MLS-MPM-PERFORMANCE.md)のP5に記録する。
+
+この実測値からの単純なGPU仕事量の導出では、既定の2×は480 step/s、
+GPU step時間が約0.193秒/実時間1秒に相当する。一方32×は7,680 step/sを要し、
+同じmedianではGPU計算だけで約3.080秒/実時間1秒となる。描画・CPU・scheduler・
+発熱を含まない概算であり、実効時間倍率の実測ではない。32×を維持するなら、
+少なくとも計算だけで約`0.13021 ms/step`以下が必要になる。
+
+benchmark中に現行14,696粒子sceneのGPU実行と数値status確認は通過した。
+別途45粒子・５モデル・８ stepのCPU/GPU回帰は最大絶対差`1.3955e-5`、
+batch/単発差0。pick、drag、clone、render、rollback、永続numerical statusも確認した。
+同じ第5回実行では、小規模fixtureの物理受け入れも行った。水・油2粒子の8 stepすべてで、
+CPU/GPU最大絶対差`3.8653e-5`、相別質量は水・油とも`0.25`を維持、最大運動量残差
+`1.1921e-7`、初回接近速度の低下と全stepでの非交差を確認した。Neo-Hookean 4粒子・3 bondでは、
+failure strain `0.1`に対する入力strain `0.05 / 0.11 / 0`のうちbond index 1だけが破断し、
+閾値未満bondのdamageは`0.499992`だった。2 step後の最大粒子状態誤差は`7.63e-7`、
+粒子・bond damage誤差はそれぞれ`7.63e-6`以下。別fixtureでは、初期状態で破断済みの
+bondがrest length時に2 step後もdamage 1 / brokenを保持した。破断fixtureの質量は4、
+運動量残差は0。CPU/GPU状態・damage比較の許容差`1e-3`は既存回帰と同じ数値許容値であり、
+製品品質の貫入・形状閾値ではない。
+
+これらは制御された小規模ケースのGPU確認であり、scene全体のCPU readbackは行っていない。
+14,696粒子sceneの界面貫入・反復接触・相別質量/運動量、実sceneの破断pattern、
+長時間形状保持は未検証で、S3/S4物理受け入れゲートの合格とはしない。
+layout / shaders / solverのSHA-256はそれぞれ
+`1655a7f65f4dc37bc57b673f1e4b1661f70f90b2da907cb56705149f7e5559d5`、
+`5d5dc93fd7a92e1dffdf07f31309822067dc305de72c95590741c6d3d8d6af57`、
+`e98c0cd5f2f340bc016f9c889addfdd2d378820cd6d6fbf0df8666dd7a79a7c8`。
 
 ## 6. 参照
 
