@@ -270,6 +270,61 @@ describe('CPU MLS-MPM reference', () => {
 		closeEnough(diagnostics.outputMomentum.y, initialMomentum.y, momentumTolerance);
 	});
 
+	it('keeps solid fracture localized, conserves mass and momentum, and lets broken fragments move independently', () => {
+		const particles = [
+			makeParticle({
+				position: { x: 10, y: 20 },
+				velocity: { x: 1, y: 0 },
+				objectId: 4
+			}),
+			makeParticle({
+				position: { x: 25, y: 20 },
+				velocity: { x: -1, y: 0 },
+				objectId: 4
+			}),
+			makeParticle({
+				position: { x: 35, y: 20 },
+				objectId: 4
+			})
+		];
+		const fractureBonds = [
+			{
+				firstParticle: 0,
+				secondParticle: 1,
+				restLength: 10,
+				failureStrain: 0.1
+			}
+		] as const;
+		const config = makeConfig({
+			dt: 0.001,
+			grid: { cellsX: 64, cellsY: 64, cellSize: 1 },
+			particleMass: 1,
+			fractureBonds
+		});
+		const result = stepMpm(particles, config);
+		const next = stepMpm(result.particles, {
+			...config,
+			fractureBonds: result.fractureBonds
+		});
+
+		expect(result.fractureBonds?.[0]).toMatchObject({ damage: 1, broken: true });
+		expect(result.particles.map(({ damage }) => damage ?? 0)).toEqual([1, 1, 0]);
+		expect(result.diagnostics.inputMass).toBe(3);
+		expect(result.diagnostics.gridMass).toBeCloseTo(3, 12);
+		expect(result.diagnostics.outputMass).toBe(3);
+		expect(result.diagnostics.outputMomentum.x).toBeCloseTo(0, 12);
+		expect(next.fractureBonds?.[0]).toMatchObject({ damage: 1, broken: true });
+		expect(next.particles[0].position.x).toBeGreaterThan(result.particles[0].position.x);
+		expect(next.particles[1].position.x).toBeLessThan(result.particles[1].position.x);
+		expect(next.particles[2].damage).toBeUndefined();
+		for (const particle of [...result.particles, ...next.particles]) {
+			expect(particle.position.x).toBeGreaterThanOrEqual(0);
+			expect(particle.position.x).toBeLessThanOrEqual(config.grid.cellsX);
+			expect(particle.position.y).toBeGreaterThanOrEqual(0);
+			expect(particle.position.y).toBeLessThanOrEqual(config.grid.cellsY);
+		}
+	});
+
 	it('keeps Neo-Hookean and snow objects distinct in one particle array', () => {
 		const particles = [
 			makeParticle({
@@ -391,6 +446,23 @@ describe('CPU MLS-MPM reference', () => {
 
 		expect(result.particles[0].velocity.x).toBeLessThan(5);
 		expect(result.particles[1].velocity.x).toBeGreaterThan(-5);
+		expect(result.particles[0].material?.model).toBe('water');
+		expect(result.particles[1].material?.model).toBe('oil');
+		expect(result.particles[0].position.x).toBeLessThanOrEqual(
+			result.particles[1].position.x
+		);
+		expect(result.diagnostics.inputMass).toBe(0.5);
+		expect(result.diagnostics.outputMass).toBe(0.5);
+		expect(
+			result.particles
+				.filter((particle) => particle.material?.model === 'water')
+				.length * 0.25
+		).toBe(0.25);
+		expect(
+			result.particles
+				.filter((particle) => particle.material?.model === 'oil')
+				.length * 0.25
+		).toBe(0.25);
 		expect(result.diagnostics.outputMomentum.x).toBeCloseTo(
 			result.diagnostics.inputMomentum.x,
 			10

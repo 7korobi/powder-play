@@ -1,11 +1,18 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { projectDeviceOrientationGravity } from '#lib/input/sensors.js';
 	import { encodeMpmConstitutiveModel } from '#lib/mpm/materials.js';
 	import {
 		createMpmMlsGpuSolver,
+		MPM_MLS_GPU_DRAG_DAMPING,
+		MPM_MLS_GPU_DRAG_STIFFNESS,
+		type MpmMlsGpuAppendResult,
+		type MpmMlsGpuOutletBounds,
 		type MpmMlsGpuRenderMode,
-		type MpmMlsGpuSelection
+		type MpmMlsGpuSelection,
+		type MpmMlsGpuSpeedMeasurement
 	} from '#lib/mpm/kernels/solver.js';
+	import { calculateMpmCflVelocityBound } from '#lib/mpm/kernels/cfl-bounds.js';
 	import {
 		DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE,
 		HORIZONTAL_OSCILLATION_FREQUENCY_HZ,
@@ -17,7 +24,12 @@
 		MpmFramePacer,
 		type MpmRenderFps
 	} from '#lib/mpm/kernels/frame-pacer.js';
-	import { calculateMpmStepBatch } from '#lib/mpm/kernels/step-scheduler.js';
+	import {
+		calculateMpmCflStepBatch,
+		calculateMpmStepBatch,
+		type MpmStepBatch,
+		type MpmStepBatchInput
+	} from '#lib/mpm/kernels/step-scheduler.js';
 	import {
 		stepMpm,
 		type MpmParticle,
@@ -28,19 +40,36 @@
 		createMpmCpuParitySample,
 		createMpmGate4Scene,
 		GATE4_CLONE_OFFSET,
+		GATE4_FRACTURE_BOND_COUNT,
+		GATE4_FRACTURE_FAILURE_STRAIN,
+		GATE4_FRACTURE_OBJECT_ID,
+		GATE4_FRACTURE_PARTICLE_COUNT,
 		GATE4_GRID,
 		GATE4_PARTICLE_CAPACITY,
 		GATE4_PARTICLE_COUNT,
 		GATE4_PEBBLE_EDGE_LENGTH
 	} from '#lib/mpm/scenes/gate4.js';
+	import {
+		createMpmEmitterParticles,
+		type MpmEmitterMaterial,
+		type MpmEmitterShape
+	} from '#lib/mpm/scenes/emitter.js';
 
 	const GRID = GATE4_GRID;
 	const WORLD_WIDTH = GRID.cellsX * GRID.cellSize;
 	const WORLD_HEIGHT = GRID.cellsY * GRID.cellSize;
+	const OUTLET_BOUNDS: MpmMlsGpuOutletBounds = {
+		minX: 0,
+		minY: WORLD_HEIGHT - 80,
+		maxX: WORLD_WIDTH,
+		maxY: WORLD_HEIGHT
+	};
 	const FIXED_STEP_SECONDS = 1 / 240;
-	const MAX_FRAME_SECONDS = 0.1;
 	const MAX_SIMULATION_SPEED = 32;
-	const MAX_STEPS_PER_FRAME = Math.ceil(
+	const SENSOR_GRAVITY_MAXIMUM = 180;
+	const CONTINUOUS_EMISSION_INTERVAL_MS = 250;
+	const MAX_IN_FLIGHT_CFL_BATCHES = 2;
+	const MAX_MICROSTEPS_PER_FRAME = Math.ceil(
 		MAX_SIMULATION_SPEED / (MPM_RENDER_FPS_OPTIONS[0] * FIXED_STEP_SECONDS)
 	);
 	const DEFAULT_RENDER_FPS: MpmRenderFps = 60;
@@ -55,12 +84,49 @@
 	const PARITY_ABSOLUTE_TOLERANCE = 0.02;
 	const PARITY_VELOCITY_ABSOLUTE_TOLERANCE = 0.025;
 	const PARITY_VELOCITY_RELATIVE_TOLERANCE = 0.0005;
+	const PARITY_PROBE_LABELS = ['水', '油', '弾性小石'] as const;
+	const PARTICLE_VALUE_LABELS = [
+		'position.x',
+		'position.y',
+		'velocity.x',
+		'velocity.y',
+		'C.m00',
+		'C.m01',
+		'C.m10',
+		'C.m11',
+		'F.m00',
+		'F.m01',
+		'F.m10',
+		'F.m11',
+		'plasticVolume',
+		'material.model',
+		'material.lambda',
+		'material.mu',
+		'material.density',
+		'volume',
+		'material.frictionCoefficient',
+		'fracture.damage',
+		'bondedTriangleVertex'
+	] as const;
 
 	type Phase = 'initializing' | 'ready' | 'error' | 'lost';
+	type OrientationStatus =
+		| 'checking'
+		| 'idle'
+		| 'requesting'
+		| 'enabled'
+		| 'denied'
+		| 'unsupported';
 	type GpuSolver = Awaited<ReturnType<typeof createMpmMlsGpuSolver>>;
 	let simulatedTimeSeconds = 0;
+	let latestSubmittedCflSequence = 0;
+	let latestPlannedParticleSpeedBound = 0;
 
-	function makeStepConfig(gravityMagnitude: number, dt = FIXED_STEP_SECONDS): MpmStepConfig {
+	function makeStepConfig(
+		gravity: MpmVector2,
+		dt = FIXED_STEP_SECONDS,
+		fractureBonds?: MpmStepConfig['fractureBonds']
+	): MpmStepConfig {
 		return {
 			dt,
 			grid: GRID,
@@ -68,36 +134,103 @@
 			particleVolume: PARTICLE_VOLUME,
 			bondRestLength: GATE4_PEBBLE_EDGE_LENGTH,
 			material: MATERIAL,
-			gravity: { x: 0, y: gravityMagnitude }
+			gravity,
+			...(fractureBonds === undefined ? {} : { fractureBonds })
 		};
 	}
 
-	let submittedStepCount = 0;
-	let submittedParticleSteps = 0;
+	let submittedMacroStepCount = 0;
+	let submittedMicroStepCount = 0;
+	let submittedParticleMicrosteps = 0;
 	let submittedBatchCount = 0;
 	let submittedBatchCpuMilliseconds = 0;
 
+	interface CflSpeedReadbackSample extends MpmMlsGpuSpeedMeasurement {
+		readonly elapsedMilliseconds: number;
+	}
+
+	function calculateBoundedBatch(
+		currentSolver: GpuSolver,
+		input: Omit<MpmStepBatchInput, 'waveSpeedBound' | 'velocityBound'>,
+		gravity: MpmVector2,
+		oscillationAmplitude: number
+	): { readonly batch: MpmStepBatch; readonly velocityBound: number } {
+		const cflBounds = currentSolver.cflBounds;
+		if (cflBounds === null) {
+			throw new RangeError(
+				'このシーンには材料・初期状態から導出できる CFL 上限がありません。'
+			);
+		}
+		return calculateMpmCflStepBatch({
+			...input,
+			waveSpeedBound: cflBounds.waveSpeedBound,
+			currentVelocityBound: latestPlannedParticleSpeedBound,
+			gravityMagnitude: Math.hypot(gravity.x, gravity.y),
+			oscillationAmplitude,
+			dragRadius: dragActive ? BRUSH_RADIUS : 0,
+			dragStiffness: MPM_MLS_GPU_DRAG_STIFFNESS,
+			dragDamping: dragActive ? MPM_MLS_GPU_DRAG_DAMPING : 0,
+			courantLimit: cflBounds.courantLimit
+		});
+	}
+
 	function submitBatch(
 		currentSolver: GpuSolver,
-		stepCount: number,
-		verticalGravity: number,
-		oscillationAmplitude: number
-	): void {
-		const durationSeconds = stepCount * FIXED_STEP_SECONDS;
+		batch: MpmStepBatch,
+		gravity: MpmVector2,
+		oscillationAmplitude: number,
+		velocityBound: number
+	): Promise<CflSpeedReadbackSample> {
+		const durationSeconds = batch.simulatedSeconds;
 		const startedAt = performance.now();
-		currentSolver.stepBatch(stepCount, FIXED_STEP_SECONDS, {
-			x: meanSinusoidalAcceleration(
-				simulatedTimeSeconds,
-				durationSeconds,
-				oscillationAmplitude
-			),
-			y: verticalGravity
-		});
+		currentSolver.stepCflBatch(
+			batch.macroStepCount,
+			FIXED_STEP_SECONDS,
+			batch.microstepPlan,
+			velocityBound,
+			MAX_MICROSTEPS_PER_FRAME,
+			{
+				x:
+					gravity.x +
+					meanSinusoidalAcceleration(
+						simulatedTimeSeconds,
+						durationSeconds,
+						oscillationAmplitude
+					),
+				y: gravity.y
+			}
+		);
+		const submittedSequence = latestSubmittedCflSequence + 1;
+		latestSubmittedCflSequence = submittedSequence;
+		latestPlannedParticleSpeedBound = velocityBound;
 		simulatedTimeSeconds += durationSeconds;
 		submittedBatchCount += 1;
-		submittedStepCount += stepCount;
-		submittedParticleSteps += currentSolver.particleCount * stepCount;
+		submittedMacroStepCount += batch.macroStepCount;
+		submittedMicroStepCount += batch.microStepCount;
+		submittedParticleMicrosteps += currentSolver.particleCount * batch.microStepCount;
 		submittedBatchCpuMilliseconds += performance.now() - startedAt;
+		cflSpeedReadbackCount += 1;
+		const readbackStartedAt = performance.now();
+		return currentSolver
+			.measureMaximumParticleSpeed()
+			.then((measurement) => {
+				if (measurement.sequence !== submittedSequence) {
+					throw new Error('GPU CFL speed-readback sequence did not match the submitted batch.');
+				}
+				return {
+					...measurement,
+					elapsedMilliseconds: performance.now() - readbackStartedAt
+				};
+			})
+			.finally(() => {
+				cflSpeedReadbackCount = Math.max(0, cflSpeedReadbackCount - 1);
+			});
+	}
+
+	function applyCflSpeedSample(sample: CflSpeedReadbackSample): void {
+		if (sample.sequence === latestSubmittedCflSequence) {
+			latestPlannedParticleSpeedBound = sample.maximumSpeed;
+		}
 	}
 
 	function errorText(error: unknown): string {
@@ -133,17 +266,39 @@
 			material.mu,
 			density,
 			particle.volume ?? PARTICLE_VOLUME,
-			frictionCoefficient
+			frictionCoefficient,
+			particle.damage ?? 0,
+			particle.bondedTriangleVertex ?? 0
 		];
 	}
 
 	function maxParticleDifference(
 		actual: readonly MpmParticle[],
 		expected: readonly MpmParticle[]
-	): number {
-		if (actual.length !== expected.length) return Number.POSITIVE_INFINITY;
+	): {
+		readonly absoluteDifference: number;
+		readonly probeIndex: number;
+		readonly field: string;
+		readonly actual: number;
+		readonly expected: number;
+	} {
+		if (actual.length !== expected.length) {
+			return {
+				absoluteDifference: Number.POSITIVE_INFINITY,
+				probeIndex: -1,
+				field: 'particle count',
+				actual: actual.length,
+				expected: expected.length
+			};
+		}
 
-		let maximum = 0;
+		let maximum = {
+			absoluteDifference: 0,
+			probeIndex: -1,
+			field: '',
+			actual: 0,
+			expected: 0
+		};
 		for (let index = 0; index < actual.length; index += 1) {
 			const actualValues = particleValues(actual[index]);
 			const expectedValues = particleValues(expected[index]);
@@ -152,9 +307,24 @@
 				const actualValue = actualValues[valueIndex];
 				const expectedValue = expectedValues[valueIndex];
 				if (!Number.isFinite(actualValue) || !Number.isFinite(expectedValue)) {
-					return Number.POSITIVE_INFINITY;
+					return {
+						absoluteDifference: Number.POSITIVE_INFINITY,
+						probeIndex: index,
+						field: PARTICLE_VALUE_LABELS[valueIndex] ?? `value ${valueIndex}`,
+						actual: actualValue,
+						expected: expectedValue
+					};
 				}
-				maximum = Math.max(maximum, Math.abs(actualValue - expectedValue));
+				const absoluteDifference = Math.abs(actualValue - expectedValue);
+				if (absoluteDifference > maximum.absoluteDifference) {
+					maximum = {
+						absoluteDifference,
+						probeIndex: index,
+						field: PARTICLE_VALUE_LABELS[valueIndex] ?? `value ${valueIndex}`,
+						actual: actualValue,
+						expected: expectedValue
+					};
+				}
 			}
 		}
 
@@ -194,6 +364,12 @@
 	let phase = $state<Phase>('initializing');
 	let phaseMessage = $state('WebGPU MLS-MPM を初期化しています…');
 	let gravityMagnitude = $state(90);
+	let manualGravityX = $state(0);
+	let manualGravityY = $state(90);
+	let orientationStatus = $state<OrientationStatus>('checking');
+	let orientationMessage = $state('DeviceOrientation センサーを確認しています…');
+	let sensorGravityUnit = $state<MpmVector2>({ x: 0, y: 0 });
+	let hasSensorGravity = $state(false);
 	let simulationSpeed = $state(DEFAULT_SIMULATION_SPEED);
 	let renderTargetFps: MpmRenderFps = $state(DEFAULT_RENDER_FPS);
 	let horizontalOscillationAmplitude = $state(DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE);
@@ -204,23 +380,137 @@
 	let stateCheckMessage = $state('');
 	let stateCheckIsError = $state(false);
 	let particleCount = $state(GATE4_PARTICLE_COUNT);
+	let allocatedParticleCount = $state(GATE4_PARTICLE_COUNT);
 	let particleCapacity = $state(GPU_PARTICLE_CAPACITY);
 	let measuredFps = $state<number | null>(null);
-	let measuredStepsPerSecond = $state<number | null>(null);
-	let measuredParticleStepsPerSecond = $state<number | null>(null);
-	let measuredDiscardedSimSecondsPerSecond = $state<number | null>(null);
+	let measuredMacroStepsPerSecond = $state<number | null>(null);
+	let measuredMicroStepsPerSecond = $state<number | null>(null);
+	let measuredParticleMicrostepsPerSecond = $state<number | null>(null);
 	let averageBatchSubmitMs = $state<number | null>(null);
 	let averageQueueCompletionMs = $state<number | null>(null);
+	let averageCflReadbackMs = $state<number | null>(null);
+	let cflSpeedReadbackCount = $state(0);
 	let renderMode = $state<MpmMlsGpuRenderMode>('surface');
 	let selection = $state<MpmMlsGpuSelection | null>(null);
 	let interactionMessage = $state('初回の CPU/GPU 1 ステップ比較が完了すると操作できます。');
 	let interactionIsError = $state(false);
+	let emitterMaterial: MpmEmitterMaterial = $state('water');
+	let emitterShape: MpmEmitterShape = $state('circle');
+	let emitterCount = $state(64);
+	let emitterSeed = $state(0x5eed_1234);
+	let emitterSequence = $state(0);
+	let emitterX = $state(1_100);
+	let emitterY = $state(200);
+	let emitterSpacing = $state(9);
+	let emitterVelocityX = $state(0);
+	let emitterVelocityY = $state(30);
+	let continuousEmission = $state(false);
+	let lastEmission = $state<MpmMlsGpuAppendResult | null>(null);
+	let emissionMessage = $state('まだ粒子を追加していません。');
+	let emissionIsError = $state(false);
+	let outletPending = $state(false);
+	let outletMessage = $state('出口は画面下端の80 world unitsです。除去粒子のスロットは再利用しません。');
+	let outletIsError = $state(false);
 
 	let componentMounted = false;
 	let activePointerId = $state<number | null>(null);
 	let pointerGeneration = 0;
 	let pointerPosition: MpmVector2 | null = null;
 	let dragActive = $state(false);
+
+	function effectiveGravity(): MpmVector2 {
+		if (orientationStatus === 'enabled' && hasSensorGravity) {
+			return {
+				x: sensorGravityUnit.x * gravityMagnitude,
+				y: sensorGravityUnit.y * gravityMagnitude
+			};
+		}
+		return { x: manualGravityX, y: manualGravityY };
+	}
+
+	let appliedGravity = $derived(effectiveGravity());
+
+	function refreshDeviceOrientationSupport(): void {
+		const supported =
+			typeof window.DeviceOrientationEvent !== 'undefined' && window.isSecureContext;
+		if (!supported) {
+			orientationStatus = 'unsupported';
+			orientationMessage =
+				'DeviceOrientation は非対応または安全でない接続です。手動の重力ベクトルを使用できます。';
+			return;
+		}
+		orientationStatus = 'idle';
+		orientationMessage =
+			'手動ベクトルを使用中です。センサーはボタンをタップした場合のみ開始します。';
+	}
+
+	function handleDeviceOrientation(event: DeviceOrientationEvent): void {
+		if (
+			event.beta === null ||
+			event.gamma === null ||
+			!Number.isFinite(event.beta) ||
+			!Number.isFinite(event.gamma)
+		) {
+			hasSensorGravity = false;
+			orientationMessage = '傾きデータがありません。手動の重力ベクトルにフォールバックします。';
+			return;
+		}
+		sensorGravityUnit = projectDeviceOrientationGravity(
+			event.beta,
+			event.gamma,
+			window.screen.orientation?.angle ?? 0
+		);
+		hasSensorGravity = true;
+		orientationMessage =
+			'DeviceOrientation を使用中です。重力ベクトルだけが変化し、画面は回転しません。';
+	}
+
+	async function toggleDeviceOrientation(): Promise<void> {
+		if (orientationStatus === 'enabled') {
+			window.removeEventListener('deviceorientation', handleDeviceOrientation);
+			orientationStatus = 'idle';
+			hasSensorGravity = false;
+			orientationMessage = 'センサーを停止しました。手動の重力ベクトルを使用します。';
+			return;
+		}
+		const constructor = window.DeviceOrientationEvent as
+			| (typeof DeviceOrientationEvent & {
+					requestPermission?: () => Promise<'granted' | 'denied'>;
+			  })
+			| undefined;
+		if (!constructor || !window.isSecureContext) {
+			orientationStatus = 'unsupported';
+			orientationMessage =
+				'DeviceOrientation は非対応または安全でない接続です。手動の重力ベクトルを使用できます。';
+			return;
+		}
+
+		orientationStatus = 'requesting';
+		orientationMessage = 'DeviceOrientation の許可を確認しています…';
+		try {
+			const permissionRequest = constructor.requestPermission
+				? constructor.requestPermission.call(constructor)
+				: Promise.resolve('granted' as const);
+			const permission = await permissionRequest;
+			if (permission !== 'granted') {
+				orientationStatus = 'denied';
+				hasSensorGravity = false;
+				orientationMessage =
+					'DeviceOrientation の許可が拒否されました。手動の重力ベクトルを使用できます。';
+				return;
+			}
+			window.addEventListener('deviceorientation', handleDeviceOrientation);
+			orientationStatus = 'enabled';
+			hasSensorGravity = false;
+			orientationMessage =
+				'DeviceOrientation は許可済みでデータを待っています。データ到着までは手動ベクトルを使用します。';
+		} catch {
+			orientationStatus = 'denied';
+			hasSensorGravity = false;
+			orientationMessage =
+				'DeviceOrientation の許可に失敗または拒否されました。手動の重力ベクトルを使用できます。';
+		}
+	}
 
 	function worldPointFromEvent(event: PointerEvent): MpmVector2 | null {
 		if (!canvas) return null;
@@ -292,7 +582,16 @@
 	}
 
 	async function handlePointerDown(event: PointerEvent): Promise<void> {
-		if (!event.isPrimary || event.button !== 0 || phase !== 'ready' || !solver) return;
+		if (
+			!event.isPrimary ||
+			event.button !== 0 ||
+			phase !== 'ready' ||
+			outletPending ||
+			cflSpeedReadbackCount > 0 ||
+			!solver
+		) {
+			return;
+		}
 		const point = worldPointFromEvent(event);
 		if (!point) return;
 
@@ -334,7 +633,10 @@
 			dragActive = true;
 			currentSolver.beginDrag(picked, target, BRUSH_RADIUS);
 			selection = picked;
-			interactionMessage = `オブジェクト ${picked.objectId} を選択しました。有限半径 ${BRUSH_RADIUS} の力でドラッグできます。`;
+			interactionMessage =
+				picked.objectId === GATE4_FRACTURE_OBJECT_ID
+					? `GPU 破断 body を選択しました。損傷は表示色に反映されます。有限半径 ${BRUSH_RADIUS} の力でドラッグできます。結合状態を復活させないため複製は無効です。`
+					: `オブジェクト ${picked.objectId} を選択しました。有限半径 ${BRUSH_RADIUS} の力でドラッグできます。`;
 		} catch (error) {
 			if (
 				!componentMounted ||
@@ -400,7 +702,10 @@
 		if (
 			!currentSolver ||
 			!currentSelection ||
+			currentSelection.objectId === GATE4_FRACTURE_OBJECT_ID ||
 			phase !== 'ready' ||
+			outletPending ||
+			cflSpeedReadbackCount > 0 ||
 			activePointerId !== null ||
 			dragActive
 		) {
@@ -411,12 +716,13 @@
 		try {
 			const cloned = currentSolver.clone(currentSelection, GATE4_CLONE_OFFSET);
 			particleCount = currentSolver.particleCount;
+			allocatedParticleCount = currentSolver.allocatedParticleCount;
 			particleCapacity = currentSolver.particleCapacity;
 			if (cloned) {
-				interactionMessage = `オブジェクト ${currentSelection.objectId} を複製しました。粒子数 ${particleCount} / 容量 ${particleCapacity}。`;
+				interactionMessage = `オブジェクト ${currentSelection.objectId} を複製しました。活動 ${particleCount} / 使用スロット ${allocatedParticleCount} / 容量 ${particleCapacity}。`;
 			} else {
 				interactionIsError = true;
-				interactionMessage = `容量上限のため複製できませんでした。粒子数 ${particleCount} / 容量 ${particleCapacity}。`;
+				interactionMessage = `容量不足または outlet 後の安全制限により複製できませんでした。活動 ${particleCount} / 使用スロット ${allocatedParticleCount} / 容量 ${particleCapacity}。`;
 			}
 		} catch (error) {
 			interactionIsError = true;
@@ -428,17 +734,169 @@
 		paused = !paused;
 	}
 
-	function stepOnce(): void {
-		if (phase !== 'ready' || !paused || !solver) return;
+	function emitSourceBurst(): MpmMlsGpuAppendResult | null {
+		const currentSolver = solver;
+		if (!currentSolver || phase !== 'ready') return null;
+		const seed = (emitterSeed + emitterSequence) >>> 0;
+		emitterSequence += 1;
+		let particles: readonly MpmParticle[];
+		try {
+			particles = createMpmEmitterParticles({
+				count: emitterCount,
+				seed,
+				center: { x: emitterX, y: emitterY },
+				shape: emitterShape,
+				spacing: emitterSpacing,
+				velocity: { x: emitterVelocityX, y: emitterVelocityY },
+				material: emitterMaterial,
+				grid: GRID
+			});
+		} catch (error) {
+			const requestedCount =
+				Number.isSafeInteger(emitterCount) && emitterCount > 0 ? emitterCount : 0;
+			lastEmission = {
+				requested: requestedCount,
+				accepted: 0,
+				refused: requestedCount,
+				dropped: 0,
+				activeParticleCount: currentSolver.particleCount,
+				allocatedParticleCount: currentSolver.allocatedParticleCount,
+				capacity: currentSolver.particleCapacity,
+				velocityBound: 0,
+				reason: errorText(error)
+			};
+			emissionMessage =
+				requestedCount > 0
+					? `source batch を拒否しました。accepted 0 / refused ${requestedCount} / dropped 0 · ${errorText(error)}`
+					: `個数が正の整数ではないため batch を生成しませんでした。accepted 0 / refused 0 / dropped 0 · ${errorText(error)}`;
+			emissionIsError = true;
+			continuousEmission = false;
+			return lastEmission;
+		}
 
 		try {
-			submitBatch(
-				solver,
-				1,
-				gravityMagnitude,
+			const result = currentSolver.appendParticles(particles);
+			lastEmission = result;
+			particleCount = result.activeParticleCount;
+			allocatedParticleCount = result.allocatedParticleCount;
+			particleCapacity = result.capacity;
+			latestPlannedParticleSpeedBound = Math.max(
+				latestPlannedParticleSpeedBound,
+				result.velocityBound
+			);
+			emissionIsError = result.refused > 0 || result.dropped > 0;
+			emissionMessage =
+				`要求 ${result.requested} · 受入 ${result.accepted} · 拒否 ${result.refused} · 容量超過で未追加 ${result.dropped}。` +
+				`活動粒子 ${result.activeParticleCount} / 予約スロット ${result.allocatedParticleCount} / 容量 ${result.capacity}.` +
+				(result.reason ? ` ${result.reason}` : '');
+			if (result.accepted === 0 && (result.refused > 0 || result.dropped > 0)) {
+				continuousEmission = false;
+			}
+			return result;
+		} catch (error) {
+			emissionMessage = `GPU 追加処理に失敗し状態を安全に確認できないため停止しました: ${errorText(error)}`;
+			emissionIsError = true;
+			continuousEmission = false;
+			paused = true;
+			phase = 'error';
+			phaseMessage = '粒子追加処理の GPU state が不確かなため停止しました。';
+			return null;
+		}
+	}
+
+	function toggleContinuousEmission(): void {
+		continuousEmission = !continuousEmission;
+		if (!continuousEmission) {
+			emissionIsError = false;
+		}
+	}
+
+	function resetEmitterSequence(): void {
+		continuousEmission = false;
+		emitterSequence = 0;
+		lastEmission = null;
+		emissionIsError = false;
+		emissionMessage = 'seed sequence をリセットしました。同じ設定で同じ particle batch を再現できます。';
+	}
+
+	async function drainOutlet(): Promise<void> {
+		const currentSolver = solver;
+		if (
+			!currentSolver ||
+			phase !== 'ready' ||
+			outletPending ||
+			cflSpeedReadbackCount > 0 ||
+			activePointerId !== null ||
+			dragActive
+		) {
+			return;
+		}
+		outletPending = true;
+		outletIsError = false;
+		outletMessage = '出口内の水・油粒子を GPU 上で確認しています…';
+		try {
+			const removed = await currentSolver.removeParticlesInOutlet(OUTLET_BOUNDS);
+			if (solver !== currentSolver || phase !== 'ready') return;
+			particleCount = currentSolver.particleCount;
+			allocatedParticleCount = currentSolver.allocatedParticleCount;
+			particleCapacity = currentSolver.particleCapacity;
+			if (removed > 0) {
+				selection = null;
+				interactionMessage = 'outlet で particle slot を除去したため、選択を解除しました。';
+			}
+			outletMessage =
+				`${removed} 粒子を除去しました。活動粒子 ${particleCount} / 予約スロット ${currentSolver.allocatedParticleCount}。` +
+				'除去済みスロットは安全のため再利用しません。';
+		} catch (error) {
+			if (solver !== currentSolver || phase !== 'ready') return;
+			outletIsError = true;
+			outletMessage = `出口の除去に失敗しました: ${errorText(error)}`;
+			paused = true;
+			phase = 'error';
+			phaseMessage = '出口処理の GPU readback に失敗したため停止しました。';
+		} finally {
+			outletPending = false;
+		}
+	}
+
+	async function stepOnce(): Promise<void> {
+		if (
+			phase !== 'ready' ||
+			!paused ||
+			outletPending ||
+			!solver ||
+			cflSpeedReadbackCount > 0
+		) {
+			return;
+		}
+		const currentSolver = solver;
+		const gravity = effectiveGravity();
+
+		try {
+			const planned = calculateBoundedBatch(
+				currentSolver,
+				{
+					accumulatorSeconds: 0,
+					elapsedSeconds: FIXED_STEP_SECONDS,
+					simulationSpeed: 1,
+					fixedStepSeconds: FIXED_STEP_SECONDS,
+					cellSize: GRID.cellSize,
+					maxMicrosteps: MAX_MICROSTEPS_PER_FRAME
+				},
+				gravity,
 				horizontalOscillationAmplitude
 			);
-			solver.render(renderMode);
+			const sample = await submitBatch(
+				currentSolver,
+				planned.batch,
+				gravity,
+				horizontalOscillationAmplitude,
+				planned.velocityBound
+			);
+			if (solver !== currentSolver || phase !== 'ready') return;
+			applyCflSpeedSample(sample);
+			averageCflReadbackMs = sample.elapsedMilliseconds;
+			currentSolver.render(renderMode);
 		} catch (error) {
 			finishPointerInteraction();
 			phase = 'error';
@@ -448,7 +906,16 @@
 
 	async function checkGpuState(): Promise<void> {
 		const currentSolver = solver;
-		if (!currentSolver || phase !== 'ready' || !paused || stateCheckPending) return;
+		if (
+			!currentSolver ||
+			phase !== 'ready' ||
+			!paused ||
+			outletPending ||
+			cflSpeedReadbackCount > 0 ||
+			stateCheckPending
+		) {
+			return;
+		}
 
 		stateCheckPending = true;
 		stateCheckIsError = false;
@@ -472,18 +939,21 @@
 	onMount(() => {
 		let mounted = true;
 		componentMounted = true;
+		refreshDeviceOrientationSupport();
 		let activeSolver: GpuSolver | null = null;
 		let frameRequest: number | null = null;
 		const framePacer = new MpmFramePacer();
 		let lastFrameTimestamp: number | null = null;
 		let accumulator = 0;
-		let discardedSimulationSeconds = 0;
 		let metricsStartTimestamp: number | null = null;
 		let performanceFrameCount = 0;
 		let queueWorkPending = false;
 		let queueSampleCount = 0;
 		let queueSampleTotalMs = 0;
+		let cflReadbackSampleCount = 0;
+		let cflReadbackTotalMs = 0;
 		let lastNumericalStatusCheckTimestamp = 0;
+		let lastContinuousEmissionTimestamp: number | null = null;
 		const canvasElement = canvas;
 
 		const resizeCanvas = () => {
@@ -510,43 +980,67 @@
 			if (!mounted || !activeSolver || phase !== 'ready') return;
 			frameRequest = requestAnimationFrame(renderFrame);
 			if (!framePacer.shouldRender(timestamp, renderTargetFps)) return;
+			if (outletPending) {
+				lastFrameTimestamp = null;
+				return;
+			}
 			if (queueWorkPending) return;
+			if (continuousEmission) {
+				if (lastContinuousEmissionTimestamp === null) {
+					lastContinuousEmissionTimestamp = timestamp;
+				} else if (
+					cflSpeedReadbackCount === 0 &&
+					timestamp - lastContinuousEmissionTimestamp >=
+					CONTINUOUS_EMISSION_INTERVAL_MS
+				) {
+					lastContinuousEmissionTimestamp = timestamp;
+					emitSourceBurst();
+				}
+			} else {
+				lastContinuousEmissionTimestamp = null;
+			}
 
 			const elapsed =
 				lastFrameTimestamp === null
 					? 0
-					: Math.min(
-							Math.max(0, (timestamp - lastFrameTimestamp) / 1000),
-							MAX_FRAME_SECONDS
-						);
+					: Math.max(0, (timestamp - lastFrameTimestamp) / 1000);
 			lastFrameTimestamp = timestamp;
+			const gravity = effectiveGravity();
 
+			let cflSpeedMeasurement: Promise<CflSpeedReadbackSample> | null = null;
 			if (!paused && document.visibilityState === 'visible') {
 				try {
-					const batch = calculateMpmStepBatch({
-						accumulatorSeconds: accumulator,
-						elapsedSeconds: elapsed,
-						simulationSpeed,
-						fixedStepSeconds: FIXED_STEP_SECONDS,
-						maxSteps: Math.min(
-							MAX_STEPS_PER_FRAME,
-							Math.max(
-								1,
-								Math.ceil(
-									(accumulator + simulationSpeed * elapsed) / FIXED_STEP_SECONDS
-								)
-							)
-						)
-					});
-					accumulator = batch.remainderSeconds;
-					discardedSimulationSeconds += batch.discardedSeconds;
-					if (batch.stepCount > 0) {
-						submitBatch(
+					if (cflSpeedReadbackCount >= MAX_IN_FLIGHT_CFL_BATCHES) {
+						accumulator += elapsed * simulationSpeed;
+						if (!Number.isFinite(accumulator)) {
+							throw new RangeError(
+								'accumulated simulation time is outside the supported range.'
+							);
+						}
+					} else {
+						const planned = calculateBoundedBatch(
 							activeSolver,
-							batch.stepCount,
-							gravityMagnitude,
+							{
+								accumulatorSeconds: accumulator,
+								elapsedSeconds: elapsed,
+								simulationSpeed,
+								fixedStepSeconds: FIXED_STEP_SECONDS,
+								cellSize: GRID.cellSize,
+								maxMicrosteps: MAX_MICROSTEPS_PER_FRAME
+							},
+							gravity,
 							horizontalOscillationAmplitude
 						);
+						if (planned.batch.macroStepCount > 0) {
+							cflSpeedMeasurement = submitBatch(
+								activeSolver,
+								planned.batch,
+								gravity,
+								horizontalOscillationAmplitude,
+								planned.velocityBound
+							);
+						}
+						accumulator = planned.batch.remainderSeconds;
 					}
 				} catch (error) {
 					finishPointerInteraction();
@@ -554,13 +1048,16 @@
 					phaseMessage = `シミュレーションを停止しました: ${errorText(error)}`;
 					return;
 				}
-			} else {
-				accumulator = 0;
 			}
 
 			try {
 				activeSolver.render(renderMode);
 			} catch (error) {
+				if (cflSpeedMeasurement !== null) {
+					void cflSpeedMeasurement.catch((readbackError) => {
+						if (mounted && activeSolver) fail(readbackError);
+					});
+				}
 				finishPointerInteraction();
 				phase = 'error';
 				phaseMessage = `描画を停止しました: ${errorText(error)}`;
@@ -573,29 +1070,50 @@
 			if (metricsElapsed >= 1_000) {
 				const samplesPerSecond = 1_000 / metricsElapsed;
 				measuredFps = performanceFrameCount * samplesPerSecond;
-				measuredStepsPerSecond = submittedStepCount * samplesPerSecond;
-				measuredParticleStepsPerSecond = submittedParticleSteps * samplesPerSecond;
-				measuredDiscardedSimSecondsPerSecond =
-					discardedSimulationSeconds * samplesPerSecond;
+				measuredMacroStepsPerSecond =
+					submittedMacroStepCount * samplesPerSecond;
+				measuredMicroStepsPerSecond =
+					submittedMicroStepCount * samplesPerSecond;
+				measuredParticleMicrostepsPerSecond =
+					submittedParticleMicrosteps * samplesPerSecond;
 				averageBatchSubmitMs =
 					submittedBatchCount > 0
 						? submittedBatchCpuMilliseconds / submittedBatchCount
 						: null;
 				averageQueueCompletionMs =
 					queueSampleCount > 0 ? queueSampleTotalMs / queueSampleCount : null;
+				averageCflReadbackMs =
+					cflReadbackSampleCount > 0
+						? cflReadbackTotalMs / cflReadbackSampleCount
+						: null;
 
 				metricsStartTimestamp = timestamp;
 				performanceFrameCount = 0;
-				submittedStepCount = 0;
-				submittedParticleSteps = 0;
+				submittedMacroStepCount = 0;
+				submittedMicroStepCount = 0;
+				submittedParticleMicrosteps = 0;
 				submittedBatchCount = 0;
 				submittedBatchCpuMilliseconds = 0;
-				discardedSimulationSeconds = 0;
 				queueSampleCount = 0;
 				queueSampleTotalMs = 0;
+				cflReadbackSampleCount = 0;
+				cflReadbackTotalMs = 0;
 			}
 
 			const submittedSolver = activeSolver;
+			if (cflSpeedMeasurement !== null) {
+				void cflSpeedMeasurement
+					.then((sample) => {
+						if (!mounted || activeSolver !== submittedSolver) return;
+						applyCflSpeedSample(sample);
+						cflReadbackSampleCount += 1;
+						cflReadbackTotalMs += sample.elapsedMilliseconds;
+					})
+					.catch((error) => {
+						if (!mounted || activeSolver !== submittedSolver) return;
+						fail(error);
+					});
+			}
 			queueWorkPending = true;
 			void submittedSolver
 				.measureQueueCompletionMs()
@@ -619,7 +1137,6 @@
 
 		function handleVisibilityChange(): void {
 			lastFrameTimestamp = null;
-			accumulator = 0;
 			framePacer.reset();
 			if (
 				document.visibilityState !== 'visible' &&
@@ -641,14 +1158,18 @@
 
 			try {
 				resizeCanvas();
-				const initialScene = createMpmGate4Scene();
+				const initialScene = createMpmGate4Scene(0x4d504d34);
 				const paritySample = createMpmCpuParitySample(
 					initialScene.particles,
 					initialScene.parityProbeIndices,
 					GRID.cellSize
 				);
 				const initialParticles = initialScene.particles;
-				const config = makeStepConfig(gravityMagnitude);
+				const config = makeStepConfig(
+					effectiveGravity(),
+					FIXED_STEP_SECONDS,
+					initialScene.fractureBonds
+				);
 				const candidate = await createMpmMlsGpuSolver(
 					canvasElement,
 					initialParticles,
@@ -661,10 +1182,17 @@
 					candidate.dispose();
 					return;
 				}
+				if (candidate.cflBounds === null) {
+					candidate.dispose();
+					throw new RangeError(
+						'Gate 4 の構成材料に対する安全な波速上限を導出できないため、CFL microstep は実行できません。'
+					);
+				}
 
 				activeSolver = candidate;
 				solver = candidate;
 				particleCount = candidate.particleCount;
+				allocatedParticleCount = candidate.allocatedParticleCount;
 				particleCapacity = candidate.particleCapacity;
 				candidate.deviceLost.then((info) => {
 					if (!mounted || activeSolver !== candidate) return;
@@ -675,34 +1203,83 @@
 					phaseMessage = info.message || 'WebGPU デバイスが失われました。';
 				});
 
-				const expectedSample = stepMpm(paritySample.particles, config).particles;
-				candidate.step(FIXED_STEP_SECONDS, config.gravity);
-				const actual = await candidate.readParticles(initialScene.parityProbeIndices);
+				const parityVelocityBound = calculateMpmCflVelocityBound({
+					currentVelocityBound: candidate.cflBounds.velocityBound,
+					durationSeconds: FIXED_STEP_SECONDS,
+					gravityMagnitude: Math.hypot(config.gravity.x, config.gravity.y),
+					oscillationAmplitude: 0,
+					dragRadius: 0,
+					dragStiffness: MPM_MLS_GPU_DRAG_STIFFNESS,
+					dragDamping: 0
+				});
+				const parityBatch = calculateMpmStepBatch({
+					accumulatorSeconds: 0,
+					elapsedSeconds: FIXED_STEP_SECONDS,
+					simulationSpeed: 1,
+					fixedStepSeconds: FIXED_STEP_SECONDS,
+					cellSize: GRID.cellSize,
+					...candidate.cflBounds,
+					velocityBound: parityVelocityBound,
+					maxMicrosteps: MAX_MICROSTEPS_PER_FRAME
+				});
+				const parityMicrostepConfig = makeStepConfig(
+					config.gravity,
+					parityBatch.microstepPlan.microDt
+				);
+				let expectedSample = paritySample.particles;
+				for (
+					let microstep = 0;
+					microstep < parityBatch.microstepPlan.stepCount;
+					microstep += 1
+				) {
+					expectedSample = stepMpm(expectedSample, parityMicrostepConfig).particles;
+				}
+				candidate.stepCflBatch(
+					parityBatch.macroStepCount,
+					FIXED_STEP_SECONDS,
+					parityBatch.microstepPlan,
+					parityVelocityBound,
+					MAX_MICROSTEPS_PER_FRAME,
+					config.gravity
+				);
+				const [actual, maximumParticleSpeed] = await Promise.all([
+					candidate.readParticles(initialScene.parityProbeIndices),
+					candidate.measureMaximumParticleSpeed()
+				]);
 				if (!mounted || activeSolver !== candidate || phase === 'lost') return;
+				latestSubmittedCflSequence = maximumParticleSpeed.sequence;
+				applyCflSpeedSample({
+					...maximumParticleSpeed,
+					elapsedMilliseconds: 0
+				});
 
 				const expected = paritySample.probeSampleIndices.map(
 					(index) => expectedSample[index]
 				);
 				const maxError = maxParticleDifference(actual, expected);
 				parityPassed = particleDifferenceWithinTolerance(actual, expected);
-				parityMessage = Number.isFinite(maxError)
-					? `初回1ステップ・各材料中央3粒子の CPU reference 比較: 最大絶対誤差 ${maxError.toExponential(2)} ${
+				const probeLabel = PARITY_PROBE_LABELS[maxError.probeIndex] ?? '粒子';
+				parityMessage = Number.isFinite(maxError.absoluteDifference)
+					? `初回1 macrostep・${parityBatch.microstepPlan.stepCount} CFL microsteps、各材料中央3粒子の CPU reference 比較: 最大絶対誤差 ${maxError.absoluteDifference.toExponential(2)}（${probeLabel} ${maxError.field}: GPU ${maxError.actual.toExponential(2)} / CPU ${maxError.expected.toExponential(2)}）${
 							parityPassed ? '· 誤差基準内' : '· 誤差基準超過'
 						}`
-					: '初回1ステップの CPU reference 比較で粒子数または数値が一致しません。';
-				submittedStepCount = 0;
-				submittedParticleSteps = 0;
+					: '初回1 macrostepの CPU reference 比較で粒子数または数値が一致しません。';
+				submittedMacroStepCount = 0;
+				submittedMicroStepCount = 0;
+				submittedParticleMicrosteps = 0;
 				submittedBatchCount = 0;
 				submittedBatchCpuMilliseconds = 0;
-				discardedSimulationSeconds = 0;
 				queueSampleCount = 0;
 				queueSampleTotalMs = 0;
 				simulatedTimeSeconds = 0;
 				metricsStartTimestamp = null;
 				performanceFrameCount = 0;
-				measuredDiscardedSimSecondsPerSecond = null;
+				measuredMacroStepsPerSecond = null;
+				measuredMicroStepsPerSecond = null;
+				measuredParticleMicrostepsPerSecond = null;
 				averageBatchSubmitMs = null;
 				averageQueueCompletionMs = null;
+				averageCflReadbackMs = null;
 				phase = 'ready';
 				phaseMessage = `GPU MLS-MPM を実行中です · ${particleCount.toLocaleString()} 粒子`;
 				interactionMessage = '準備完了。粒子をタップ／クリックして、押したままドラッグできます。';
@@ -727,6 +1304,7 @@
 		return () => {
 			mounted = false;
 			componentMounted = false;
+			window.removeEventListener('deviceorientation', handleDeviceOrientation);
 			finishPointerInteraction();
 			resizeObserver.disconnect();
 			window.removeEventListener('resize', resizeCanvas);
@@ -754,24 +1332,23 @@
 />
 
 <svelte:head>
-	<title>GPU MLS-MPM 水・油・弾性小石ラボ · powder-play</title>
+	<title>GPU 2D MLS-MPM インタラクティブサンドボックス · powder-play</title>
 	<meta
 		name="description"
-		content="水・油と、ランダム初速を持つ200個の Neo-Hookean 弾性小石を CPU reference と比較し、GPU 粒子操作を検証します。"
+		content="2D GPU MLS-MPM の水・油相、材料 emitter、傾き重力と局所破断する弾性体を操作する実験サンドボックスです。"
 	/>
 </svelte:head>
 
 <main class="lab">
 	<header class="header">
 		<div>
-			<p class="eyebrow">GATE 4 · WATER / OIL / ELASTIC PEBBLE</p>
-			<h1>GPU 2D MLS-MPM 混合材料ラボ</h1>
+			<p class="eyebrow">STAGES 1–4 · INTERACTIVE 2D GPU MLS-MPM</p>
+			<h1>GPU 2D MLS-MPM サンドボックス</h1>
 			<p class="intro">
-				水8,000粒子・油6,000粒子と、枠幅の3%（66 world units）の三粒子弾性小石200個
-				（計600粒子）を WebGPU で計算します。初期速度は水・油の各成分±60、小石の各頂点±120
-				world units/s の範囲で粒子ごとにランダムに与えます。小石頂点の辺長制約、水・油の相別格子接触、
-				液体と小石の双方向接触、小石同士の三角形接触を GPU で解きます。初回ステップは各材料の局所粒子で
-				CPU reference と比較し、描画・粒子更新量・queue 完了待ちを実測できます。
+				水・油・Neo-Hookean 固体を repeatable / continuous emitter から追加し、傾きまたは手動の2D重力で操作します。
+				水と油は相別速度場・node-owned normal contact で接触し、各相の mass と接触 impulse を小規模 CPU reference で検証します。
+				既存の三粒子小石に加え、12×8ノード・{GATE4_FRACTURE_BOND_COUNT} bond の固体を GPU 上で損傷・局所破断させます。
+				これは制御可能な研究用 vertical slice であり、一般用途の流体・破壊エンジンや物理精度保証ではありません。
 			</p>
 		</div>
 		<nav aria-label="実験ページ">
@@ -783,9 +1360,9 @@
 	<section class="panel" aria-labelledby="simulation-title">
 		<div class="panel-heading">
 			<div>
-				<h2 id="simulation-title">水・油・200個の弾性小石・14,600粒子シーン</h2>
+				<h2 id="simulation-title">水・油・弾性小石・GPU破断固体 · {GATE4_PARTICLE_COUNT.toLocaleString()}粒子</h2>
 				<p>
-					{particleCount} / {particleCapacity} 粒子 · {GRID.cellsX} × {GRID.cellsY} grid
+					活動 {particleCount} · 使用スロット {allocatedParticleCount} / 容量 {particleCapacity} · {GRID.cellsX} × {GRID.cellsY} grid
 				</p>
 			</div>
 			<p class="status" class:error={phase === 'error' || phase === 'lost'} role="status">
@@ -796,24 +1373,81 @@
 		<div class="simulation-layout">
 			<section class="simulation-controls" aria-label="シミュレーション操作">
 				<div class="controls">
-					<label class="gravity-control">
-						<span>重力</span>
-						<input
-							type="range"
-							min="0"
-							max="180"
-							step="5"
-							bind:value={gravityMagnitude}
-							disabled={phase !== 'ready'}
-							aria-label="重力の大きさ"
-						/>
-						<output>{gravityMagnitude}</output>
-					</label>
+					<fieldset class="gravity-controls">
+						<legend>2D 重力 · {orientationStatus === 'enabled' && hasSensorGravity ? 'センサー' : '手動'}</legend>
+						<label>
+							<span>手動 X</span>
+							<input
+								type="range"
+								min="-180"
+								max="180"
+								step="5"
+								bind:value={manualGravityX}
+								disabled={phase !== 'ready' || (orientationStatus === 'enabled' && hasSensorGravity)}
+								aria-label="手動重力 X 成分"
+							/>
+							<output>{manualGravityX}</output>
+						</label>
+						<label>
+							<span>手動 Y</span>
+							<input
+								type="range"
+								min="-180"
+								max="180"
+								step="5"
+								bind:value={manualGravityY}
+								disabled={phase !== 'ready' || (orientationStatus === 'enabled' && hasSensorGravity)}
+								aria-label="手動重力 Y 成分"
+							/>
+							<output>{manualGravityY}</output>
+						</label>
+						<label>
+							<span>センサー強度</span>
+							<input
+								type="range"
+								min="0"
+								max={SENSOR_GRAVITY_MAXIMUM}
+								step="5"
+								bind:value={gravityMagnitude}
+								disabled={phase !== 'ready'}
+								aria-label="センサー重力の大きさ"
+							/>
+							<output>{gravityMagnitude}</output>
+						</label>
+						<p class="gravity-readout">
+							適用中: X {appliedGravity.x.toFixed(1)} / Y {appliedGravity.y.toFixed(1)} world units/s²
+						</p>
+						<button
+							type="button"
+							class="secondary"
+							onclick={toggleDeviceOrientation}
+							disabled={
+								phase !== 'ready' ||
+								orientationStatus === 'checking' ||
+								orientationStatus === 'requesting' ||
+								orientationStatus === 'unsupported'
+							}
+							aria-pressed={orientationStatus === 'enabled'}
+						>
+							{orientationStatus === 'requesting'
+								? '許可を確認中…'
+								: orientationStatus === 'enabled'
+									? '傾きセンサーを停止'
+									: '傾きセンサーを有効化'}
+						</button>
+						<p
+							class="sensor-status"
+							class:error={orientationStatus === 'denied' || orientationStatus === 'unsupported'}
+							role="status"
+						>
+							{orientationStatus.toUpperCase()}: {orientationMessage}
+						</p>
+					</fieldset>
 					<label class="simulation-speed-control">
 						<span>速度</span>
 						<select
 							bind:value={simulationSpeed}
-							disabled={phase !== 'ready'}
+							disabled={phase !== 'ready' || outletPending}
 							aria-label="シミュレーション速度倍率"
 						>
 							{#each SIMULATION_SPEED_OPTIONS as speed}
@@ -865,7 +1499,7 @@
 						<button
 							type="button"
 							onclick={togglePaused}
-							disabled={phase !== 'ready'}
+							disabled={phase !== 'ready' || outletPending}
 							aria-pressed={paused}
 						>
 							{paused ? '再開' : '一時停止'}
@@ -874,7 +1508,13 @@
 							type="button"
 							class="secondary"
 							onclick={stepOnce}
-							disabled={phase !== 'ready' || !paused || stateCheckPending}
+							disabled={
+								phase !== 'ready' ||
+								!paused ||
+								outletPending ||
+								stateCheckPending ||
+								cflSpeedReadbackCount > 0
+							}
 						>
 							1 ステップ
 						</button>
@@ -882,7 +1522,13 @@
 							type="button"
 							class="secondary"
 							onclick={checkGpuState}
-							disabled={phase !== 'ready' || !paused || stateCheckPending}
+							disabled={
+								phase !== 'ready' ||
+								!paused ||
+								outletPending ||
+								cflSpeedReadbackCount > 0 ||
+								stateCheckPending
+							}
 						>
 							{stateCheckPending ? '確認中…' : '状態を確認'}
 						</button>
@@ -890,14 +1536,143 @@
 							type="button"
 							class="secondary"
 							onclick={cloneSelection}
-							disabled={phase !== 'ready' || !selection || activePointerId !== null || dragActive}
+							disabled={
+								phase !== 'ready' ||
+								!selection ||
+								selection.objectId === GATE4_FRACTURE_OBJECT_ID ||
+								outletPending ||
+								cflSpeedReadbackCount > 0 ||
+								activePointerId !== null ||
+								dragActive
+							}
 							aria-label={`選択オブジェクトを複製（+${GATE4_CLONE_OFFSET.x}, ${GATE4_CLONE_OFFSET.y}）`}
 							title={`選択オブジェクトを複製（+${GATE4_CLONE_OFFSET.x}, ${GATE4_CLONE_OFFSET.y}）`}
+							aria-describedby="clone-note"
 						>
 							選択を複製
 						</button>
 					</div>
 				</div>
+				<p id="clone-note" class="control-note">
+					通常の選択オブジェクトは clone できます。GPU 破断 body は選択・ドラッグできますが、壊れた bond を再生成しないよう clone は無効です。
+				</p>
+				<section class="source-controls" aria-labelledby="source-title">
+					<h3 id="source-title">材料 emitter · 容量 · outlet</h3>
+					<p class="control-note">
+						各追加は seed + burst 番号から決定論的に配置します。GPU 粒子 state が正本です。容量超過分は追加せず件数を報告し、削除スロットは再利用しません。
+					</p>
+					<div class="source-grid">
+						<label>
+							<span>材料</span>
+							<select bind:value={emitterMaterial} disabled={phase !== 'ready' || outletPending}>
+								<option value="water">水</option>
+								<option value="oil">油</option>
+								<option value="neo-hookean">弾性固体（bondなし）</option>
+							</select>
+						</label>
+						<label>
+							<span>形状</span>
+							<select bind:value={emitterShape} disabled={phase !== 'ready' || outletPending}>
+								<option value="circle">円</option>
+								<option value="rectangle">矩形</option>
+							</select>
+						</label>
+						<label>
+							<span>個数 / burst</span>
+							<input type="number" min="1" max="100000" step="1" bind:value={emitterCount} disabled={phase !== 'ready' || outletPending} />
+						</label>
+						<label>
+							<span>seed (uint32)</span>
+							<input
+								type="number"
+								min="0"
+								max="4294967295"
+								step="1"
+								bind:value={emitterSeed}
+								onchange={resetEmitterSequence}
+								disabled={phase !== 'ready' || outletPending}
+							/>
+						</label>
+						<label>
+							<span>中心 X · 0–{WORLD_WIDTH}</span>
+							<input type="number" min="0" max={WORLD_WIDTH} step="5" bind:value={emitterX} disabled={phase !== 'ready' || outletPending} />
+						</label>
+						<label>
+							<span>中心 Y · 0–{WORLD_HEIGHT}</span>
+							<input type="number" min="0" max={WORLD_HEIGHT} step="5" bind:value={emitterY} disabled={phase !== 'ready' || outletPending} />
+						</label>
+						<label>
+							<span>粒子間隔</span>
+							<input type="number" min="0.1" max="100" step="0.5" bind:value={emitterSpacing} disabled={phase !== 'ready' || outletPending} />
+						</label>
+						<label>
+							<span>初速 X</span>
+							<input type="number" min="-400" max="400" step="5" bind:value={emitterVelocityX} disabled={phase !== 'ready' || outletPending} />
+						</label>
+						<label>
+							<span>初速 Y</span>
+							<input type="number" min="-400" max="400" step="5" bind:value={emitterVelocityY} disabled={phase !== 'ready' || outletPending} />
+						</label>
+					</div>
+					<p class="seed-note">次の burst seed: {(emitterSeed + emitterSequence) >>> 0}</p>
+					<div class="source-buttons">
+						<button
+							type="button"
+							class="secondary"
+							onclick={emitSourceBurst}
+							disabled={phase !== 'ready' || outletPending || cflSpeedReadbackCount > 0 || activePointerId !== null || dragActive}
+						>
+							1回追加
+						</button>
+						<button
+							type="button"
+							class="secondary"
+							onclick={toggleContinuousEmission}
+							disabled={phase !== 'ready' || outletPending}
+							aria-pressed={continuousEmission}
+						>
+							{continuousEmission ? '連続追加を停止' : '連続追加を開始'}
+						</button>
+						<button
+							type="button"
+							class="secondary"
+							onclick={resetEmitterSequence}
+							disabled={phase !== 'ready' || outletPending}
+						>
+							seed 列をリセット
+						</button>
+					</div>
+					<p class="emission-status" class:error={emissionIsError} role="status" aria-live="polite" aria-atomic="true">
+						{emissionMessage}
+					</p>
+					<div class="outlet-controls">
+						<p>
+							出口領域: X 0–{WORLD_WIDTH}, Y {OUTLET_BOUNDS.minY}–{WORLD_HEIGHT} · 水・油のみ GPU 上で除去
+						</p>
+						<button
+							type="button"
+							class="secondary"
+							onclick={drainOutlet}
+							disabled={
+								phase !== 'ready' ||
+								outletPending ||
+								cflSpeedReadbackCount > 0 ||
+								activePointerId !== null ||
+								dragActive
+							}
+						>
+							{outletPending ? '出口処理中…' : '出口粒子を除去'}
+						</button>
+						<p class="outlet-status" class:error={outletIsError} role="status" aria-live="polite">
+							{outletMessage}
+						</p>
+					</div>
+					<p class="fracture-note">
+						GPU 破断 body: {GATE4_FRACTURE_PARTICLE_COUNT} node · {GATE4_FRACTURE_BOND_COUNT} 初期 bond · 引張 strain 閾値 {GATE4_FRACTURE_FAILURE_STRAIN}。
+						損傷に応じた赤色化は粒子診断表示でも確認できます。bond の破断は永続し、複製は無効です。bond は初期 body のみを接続し emitter 粒子には追加されません。
+						表示は格子解像度と node spacing に依存する離散近似で、連続体の破壊強度を表しません。
+					</p>
+				</section>
 				<p id="render-mode-description" class="render-mode-note">
 					自由表面は粒子の現在面積から GPU 上で作る表示専用フィールドです。青は水、金色は油を示し、表面表示では液体の粒子マーカーを重ねません。粒子マーカー（診断）では全材料の粒子位置を表示します。表示色・境界は物理的な表面張力や界面曲率を表しません。材料間接触は表示場とは別の物理 pass で解きます。
 				</p>
@@ -941,7 +1716,8 @@
 			<span><i class="water-swatch"></i> 水（密度 0.02・圧縮係数 40,000）</span>
 			<span><i class="oil-swatch"></i> 油（密度 0.016・圧縮係数 30,000）</span>
 			<span><i class="pebble-swatch"></i> 弾性小石200個（各3粒子・Neo-Hookean・λ 20・μ 10）</span>
-			初期速度は水・油の各成分±60、小石の各頂点±120 world units/s の独立した擬似乱数です。小石頂点ごとの速度差により回転運動も初期化されます。小石は一辺・水平幅66 world units（枠幅の3%）の正三角形で、14列×15行の並び（最終行は4個）、中心間隔68 world unitsで配置します。各三角形は別々の弾性 object です。Neo-Hookean 粒子に3辺の位置制約を加え、液体粒子は三角形の符号付き距離場で投影し、法線 impulse を小石頂点へ反力として返します。小石同士は三角形接触で貫入を補正します。水と油は別々の格子速度場を持ち、相別体積勾配に沿う法線接触を解きます。接線摩擦・表面張力・濡れ・完全な界面分離・連続衝突検出は未実装で、長時間の安定性も未検証です。
+			<span><i class="fracture-swatch"></i> GPU fracture body（96 node・249 bond・赤は damage）</span>
+			初期シーンは水8,000・油6,000・小石600・連結固体96 particle です。小石の初期速度は頂点ごとに独立した擬似乱数（各成分±120）で回転運動も初期化されます。小石は一辺66 world units の正三角形が200 object あり、頂点間隔約6.6 grid cells の離散形状です。水と油は材料 ID と相別 grid field を保ち、相別密度から求める法線接触を node-owned impulse で解きます。接触・質量保存の小規模 controlled reference test は通りますが、幅広い速度・解像度・長時間挙動を保証しません。表面張力、濡れ、接線摩擦、連続衝突検出、界面の微視的物理は未実装です。
 		</p>
 
 		<section class="performance" aria-labelledby="performance-title">
@@ -958,35 +1734,35 @@
 					<dd>{renderTargetFps} FPS</dd>
 				</div>
 				<div>
-					<dt>シミュレーション</dt>
+					<dt>物理 macrosteps</dt>
 					<dd>
-						{measuredStepsPerSecond === null
+						{measuredMacroStepsPerSecond === null
 							? '計測中'
-							: `${measuredStepsPerSecond.toFixed(1)} steps/s`}
+							: `${measuredMacroStepsPerSecond.toFixed(1)} macrosteps/s`}
+					</dd>
+				</div>
+				<div>
+					<dt>CFL 数値 microsteps</dt>
+					<dd>
+						{measuredMicroStepsPerSecond === null
+							? '計測中'
+							: `${measuredMicroStepsPerSecond.toFixed(1)} microsteps/s`}
 					</dd>
 				</div>
 				<div>
 					<dt>実効時間倍率</dt>
 					<dd>
-						{measuredStepsPerSecond === null
+						{measuredMacroStepsPerSecond === null
 							? '計測中'
-							: `${(measuredStepsPerSecond * FIXED_STEP_SECONDS).toFixed(2)}×`}
+							: `${(measuredMacroStepsPerSecond * FIXED_STEP_SECONDS).toFixed(2)}×`}
 					</dd>
 				</div>
 				<div>
-					<dt>実効時間倍率</dt>
+					<dt>粒子 microstep 更新量</dt>
 					<dd>
-						{measuredDiscardedSimSecondsPerSecond === null
+						{measuredParticleMicrostepsPerSecond === null
 							? '計測中'
-							: `${measuredDiscardedSimSecondsPerSecond.toFixed(2)} sim s/s`}
-					</dd>
-				</div>
-				<div>
-					<dt>粒子更新量（submit 換算）</dt>
-					<dd>
-						{measuredParticleStepsPerSecond === null
-							? '計測中'
-							: `${Math.round(measuredParticleStepsPerSecond)} particle-steps/s`}
+							: `${Math.round(measuredParticleMicrostepsPerSecond)} particle-microsteps/s`}
 					</dd>
 				</div>
 				<div>
@@ -1005,12 +1781,22 @@
 							: `${averageQueueCompletionMs.toFixed(2)} ms`}
 					</dd>
 				</div>
+				<div>
+					<dt>GPU 速度 scalar readback 平均</dt>
+					<dd>
+						{averageCflReadbackMs === null
+							? cflSpeedReadbackCount > 0
+								? '計測中'
+								: '—'
+							: `${averageCflReadbackMs.toFixed(2)} ms`}
+					</dd>
+				</div>
 			</dl>
 			<p>
 				描画目標は15・30・60・90・120 FPSから選択できます。実際の描画FPSはディスプレイの更新頻度と GPU 処理時間に制約されます。
-				固定刻みは 1/240 秒のまま、複数ステップを1つの GPU batch にまとめ、フレーム間隔に応じて最大32×のシミュレーション速度を保てるようにします。
-				上限を超えたシミュレーション時間は破棄し、実効時間倍率と破棄量に反映します。
-				左右揺れはシミュレーション時間に同期し、batch区間の平均加速度を適用します（0で停止）。queue 完了待ちは GPU 単体の実行時間ではなく、完了を待ってから次の frame を送信します。数値異常フラグは1秒ごとに小さな状態だけを読み戻して監視します。
+				物理 macrostep は 1/240 秒で、CFL 条件を満たす数の数値 microstep に分割し、各 microstep で全 solver pass を実行します。1 frame あたりの上限は macrostep 数ではなく合計512 microstepです。
+				必要量が上限を超えた場合は時間を破棄・clampせず、理由を表示してシミュレーションを停止します。Gate 4 の波速上限は液体 EOS と Neo-Hookean acoustic tensor から導出し、速度包絡は GPU 上の粒子最大速度と重力・左右揺れ・有限半径ドラッグの入力包絡から batch ごとに計算します。GPU guard は各 microstep の実速度を、選択した float32 microDt で波速と合わせて CFL 条件を満たす速度許容域内か検査します。許容域や更新後の波速を超えた microstep は commit 前にロールバックして数値エラーとして停止します。
+				左右揺れはシミュレーション時間に同期し、batch区間の平均加速度を適用します（0で停止）。queue 完了待ちは GPU 単体の実行時間ではなく、完了を待ってから次の frame を送信します。毎 physics batch の速度計測は GPU 最大値 reduction と非同期の小さな scalar/status readback で、全 particle state の readback は行いません。表示する readback 平均値にはこのコストを含みます。
 			</p>
 		</section>
 
@@ -1028,13 +1814,10 @@
 	</section>
 
 	<aside class="note">
-		<strong>検証範囲:</strong> P2G・grid update・G2Pで水・油の弱圧縮性EOSと200個の三粒子 Neo-Hookean 弾性小石を
-		計算します。水–油の法線 impulse、小石–液体の符号付き距離接触と両側反力、小石–小石の三角形接触、各小石の辺長制約を含みます。objectIdによる選択・力ベースドラッグ・複製は密度・材料・結合情報も保持します。
-		水・油の局所密度差による相対沈降・浮上は近似実装です。水と油が静止状態ですでに強く混合している場合の完全な分離は保証しません。
-		水・油の圧縮係数は従来比10倍です。液体の変形面積比 det(F) は0.5〜2に制限します。
-		小石の頂点間隔は約6.6格子セル幅です。各三角形は3点と辺長制約による離散近似であり、連続体メッシュではありません。接線摩擦・表面張力・濡れ・連続衝突検出、長時間安定性は未実装または未検証です。
-		初回CPU/GPU比較は材料ごとの局所サンプルです。数値異常フラグは1秒ごとに状態のみを読み取り、粒子状態の全量 GPU readback は一時停止中の明示的な状態確認時だけです。
-		CPU/GPU比較はCPUの倍精度とGPUの単精度による差を考慮し、位置・変形などは絶対誤差0.02、速度は絶対誤差0.025に参照速度の0.05%を加えた基準で判定します。表示される最大絶対誤差は判定基準とは別にそのまま表示します。
+		<strong>検証範囲と限界:</strong> 2D weakly-compressible MLS-MPM の P2G・grid update・G2P、水・油の別々の材料/速度場、node-owned normal contact、粒子 emitter、GPU outlet、GPU solid-bond damage を含みます。Controlled reference tests は相 identity、相ごとの mass と接触 momentum、fracture damage の閾値・保存・局所化・fragment motion・bounds を確認します。初回 CPU/GPU 比較は fluid と既存小石の局所 sample で、GPU fracture の定量精度比較ではありません。
+		水・油は field 分離と相別の法線接触によって制御ケースで非混合 interface を維持しますが、任意初期配置での完全分離は保証しません。relative buoyancy は近似、surface tension・wetting・接線摩擦・gas pressure・cavitation・bubble transport は未実装です。出口は water/oil のみを除去し、removed slot は圧縮・再利用しません。粒子数は容量を一度予約すると減りません。
+		連結 fracture body は96個の node と局所 bond topology を GPU 上で更新し、damage を赤色化します。閾値はこの配置用の探索値で、破壊エネルギーや解像度非依存の material strength ではありません。mesh spacing 9 world units と grid cell 10 の解像度に依存し、fragment は bond failure 後も粒子/弾性 constitutive response で近似します。bonded body は clone を禁止し、broken topology を再生成しません。continuous solid fracture の一般性・負荷範囲・性能は未検証です。
+		一時停止中の状態確認以外に全 particle state を CPU に readback しません。GPU 数値 guard・CFL 上限と初回 CPU parity は異常検出/局所比較であり、実機での網羅性や数値 fidelity の証明ではありません。液体の det(F) は既存の0.5〜2制限です。
 	</aside>
 </main>
 
@@ -1133,6 +1916,149 @@
 	.simulation-controls {
 		grid-area: controls;
 		min-width: 0;
+	}
+
+	.gravity-controls {
+		display: grid;
+		gap: 0.65rem;
+		min-width: 0;
+		margin: 0;
+		padding: 0.75rem;
+		border: 1px solid #31445a;
+		border-radius: 0.55rem;
+		background: #0d1823;
+	}
+
+	.gravity-controls legend {
+		padding: 0 0.35rem;
+		font-weight: 650;
+	}
+
+	.gravity-controls label {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
+		align-items: center;
+		gap: 0.35rem 0.65rem;
+		min-width: 0;
+	}
+
+	.gravity-controls label span {
+		grid-column: 1;
+		grid-row: 1;
+	}
+
+	.gravity-controls label input {
+		grid-column: 1 / -1;
+		grid-row: 2;
+		width: 100%;
+		min-width: 0;
+		margin: 0;
+	}
+
+	.gravity-controls label output {
+		grid-column: 2;
+		grid-row: 1;
+	}
+
+	.gravity-readout,
+	.sensor-status,
+	.control-note,
+	.seed-note,
+	.emission-status,
+	.outlet-controls p,
+	.fracture-note {
+		margin: 0;
+		color: #b8c7d8;
+		font-size: 0.84rem;
+		line-height: 1.5;
+		overflow-wrap: anywhere;
+	}
+
+	.sensor-status.error,
+	.emission-status.error,
+	.outlet-status.error {
+		color: #ffb4a9;
+	}
+
+	.gravity-controls button {
+		width: 100%;
+	}
+
+	.source-controls {
+		display: grid;
+		gap: 0.7rem;
+		margin-top: 0.9rem;
+		padding: 0.8rem;
+		border: 1px solid #31445a;
+		border-radius: 0.55rem;
+		background: #0d1823;
+	}
+
+	.source-controls h3 {
+		margin: 0;
+		font-size: 1rem;
+	}
+
+	.source-grid {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 0.6rem;
+	}
+
+	.source-grid label {
+		display: grid;
+		gap: 0.3rem;
+		min-width: 0;
+		color: #d5e9fa;
+		font-size: 0.83rem;
+	}
+
+	.source-grid input,
+	.source-grid select {
+		box-sizing: border-box;
+		width: 100%;
+		min-width: 0;
+		min-height: 2.5rem;
+		padding: 0.35rem 0.45rem;
+		border: 1px solid #31445a;
+		border-radius: 0.4rem;
+		color: inherit;
+		background: #0b1725;
+		font: inherit;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.source-grid input:focus-visible,
+	.source-grid select:focus-visible,
+	.gravity-controls input:focus-visible {
+		outline: 3px solid #8ec9ff;
+		outline-offset: 2px;
+	}
+
+	.source-buttons {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 0.55rem;
+	}
+
+	.outlet-controls {
+		display: grid;
+		gap: 0.5rem;
+		padding-top: 0.7rem;
+		border-top: 1px solid #31445a;
+	}
+
+	.outlet-status {
+		margin: 0;
+		color: #9de2bc;
+		font-size: 0.84rem;
+		line-height: 1.5;
+		overflow-wrap: anywhere;
+	}
+
+	.fracture-note {
+		padding-top: 0.65rem;
+		border-top: 1px solid #31445a;
 	}
 
 	.panel-heading {
@@ -1249,6 +2175,10 @@
 		background: #47c7b8;
 	}
 
+	.fracture-swatch {
+		background: #ef2921;
+	}
+
 	canvas {
 		display: block;
 		width: 100%;
@@ -1316,7 +2246,6 @@
 		gap: 0.75rem;
 	}
 
-	.gravity-control,
 	.rocking-control,
 	.simulation-speed-control,
 	.display-mode-control,
@@ -1328,7 +2257,6 @@
 		min-width: 0;
 	}
 
-	.gravity-control > span,
 	.rocking-control > span,
 	.simulation-speed-control > span,
 	.display-mode-control > span,
@@ -1337,7 +2265,6 @@
 		grid-row: 1;
 	}
 
-	.gravity-control input,
 	.rocking-control input,
 	.simulation-speed-control select,
 	.display-mode-control select,
@@ -1348,12 +2275,10 @@
 		min-width: 0;
 	}
 
-	.gravity-control input,
 	.rocking-control input {
 		margin: 0;
 	}
 
-	.gravity-control output,
 	.rocking-control output,
 	.simulation-speed-control output,
 	.render-fps-control output {
@@ -1448,6 +2373,10 @@
 
 		.controls {
 			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+
+		.gravity-controls {
+			grid-column: 1 / -1;
 		}
 
 		.rocking-control {

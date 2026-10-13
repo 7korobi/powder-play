@@ -35,6 +35,33 @@ export function screenAccelerationForce(
 	};
 }
 
+export function projectDeviceOrientationGravity(
+	beta: number | null,
+	gamma: number | null,
+	orientationAngle = 0
+): Vector {
+	if (beta === null || gamma === null || !Number.isFinite(beta) || !Number.isFinite(gamma)) {
+		return { x: 0, y: 0 };
+	}
+
+	const betaRadians = (clamp(beta, -180, 180) * Math.PI) / 180;
+	const gammaRadians = (clamp(gamma, -90, 90) * Math.PI) / 180;
+	const projected = rotateToScreen(
+		Math.sin(gammaRadians),
+		-Math.sin(betaRadians) * Math.cos(gammaRadians),
+		orientationAngle
+	);
+	const magnitude = Math.hypot(projected.x, projected.y);
+	if (!Number.isFinite(magnitude) || magnitude <= 1e-12) {
+		return { x: 0, y: 0 };
+	}
+	const scale = Math.min(1, magnitude) / magnitude;
+	return {
+		x: projected.x * scale,
+		y: projected.y * scale
+	};
+}
+
 export function blendVector(previous: Vector, next: Vector, amount: number): Vector {
 	if (!Number.isFinite(amount) || amount < 0 || amount > 1) {
 		throw new RangeError('Blend amount must be between 0 and 1.');

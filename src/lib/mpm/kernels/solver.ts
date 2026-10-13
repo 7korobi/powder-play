@@ -7,6 +7,16 @@ import type {
 import { decodeMpmConstitutiveModel } from '../materials.js';
 import { createMpmWebGpuSession } from '../platform/webgpu.js';
 import {
+	calculateMpmCflVelocityLimit,
+	calculateMpmCflMicrosteps,
+	type MpmCflMicrostepInput,
+	type MpmCflMicrostepPlan
+} from './cfl.js';
+import {
+	deriveMpmMlsGpuCflBounds,
+	type MpmMlsGpuCflBounds as DerivedMpmMlsGpuCflBounds
+} from './cfl-bounds.js';
+import {
 	calculateMpmMlsGpuBufferLayout,
 	COMPUTE_WORKGROUP_SIZE,
 	NUMERICAL_STATUS_BYTES,
@@ -34,18 +44,58 @@ export interface MpmMlsGpuSelection {
 	readonly anchor: MpmVector2;
 }
 
+export interface MpmMlsGpuSpeedMeasurement {
+	readonly maximumSpeed: number;
+	readonly sequence: number;
+}
+
+export interface MpmMlsGpuAppendResult {
+	readonly requested: number;
+	readonly accepted: number;
+	readonly refused: number;
+	readonly dropped: number;
+	readonly activeParticleCount: number;
+	readonly allocatedParticleCount: number;
+	readonly capacity: number;
+	readonly velocityBound: number;
+	readonly reason?: string;
+}
+
+export interface MpmMlsGpuOutletBounds {
+	readonly minX: number;
+	readonly minY: number;
+	readonly maxX: number;
+	readonly maxY: number;
+}
+
+export type MpmMlsGpuCflBounds = DerivedMpmMlsGpuCflBounds &
+	Pick<MpmCflMicrostepInput, 'courantLimit'>;
+
 export type MpmMlsGpuRenderMode = 'surface' | 'particles';
 
 export interface MpmMlsGpuSolver {
 	readonly deviceLost: Promise<GPUDeviceLostInfo>;
 	readonly particleCount: number;
+	readonly allocatedParticleCount: number;
 	readonly particleCapacity: number;
+	readonly cflBounds: MpmMlsGpuCflBounds | null;
 	step(dt: number, gravity: MpmVector2): void;
 	stepBatch(stepCount: number, dt: number, gravity: MpmVector2): void;
+	stepCflBatch(
+		macroStepCount: number,
+		macroDt: number,
+		microstepPlan: MpmCflMicrostepPlan,
+		velocityBound: number,
+		maxMicrosteps: number,
+		gravity: MpmVector2
+	): void;
 	render(mode?: MpmMlsGpuRenderMode): void;
 	readParticles(particleIndices?: readonly number[]): Promise<readonly MpmParticle[]>;
+	measureMaximumParticleSpeed(): Promise<MpmMlsGpuSpeedMeasurement>;
 	checkNumericalStatus(): Promise<void>;
 	measureQueueCompletionMs(): Promise<number>;
+	appendParticles(particles: readonly MpmParticle[]): MpmMlsGpuAppendResult;
+	removeParticlesInOutlet(bounds: MpmMlsGpuOutletBounds): Promise<number>;
 	pick(point: MpmVector2, radius: number): Promise<MpmMlsGpuSelection | null>;
 	beginDrag(selection: MpmMlsGpuSelection, target: MpmVector2, radius: number): void;
 	updateDrag(target: MpmVector2): void;
@@ -79,7 +129,9 @@ export class MpmMlsGpuNumericalError extends Error {
 			[1024, 'non-finite P2G node accumulation'],
 			[2048, 'non-finite P2G node output'],
 			[4096, 'invalid triangle contact field or reaction'],
-			[8192, 'invalid bonded triangle state']
+			[8192, 'invalid bonded triangle state'],
+			[16384, 'particle exceeded the enforced CFL wave-speed or velocity bound'],
+			[32768, 'invalid persistent solid-fracture bond state']
 		] as const;
 		const message = details
 			.filter(([flag]) => (flags & flag) !== 0)
@@ -186,8 +238,14 @@ interface MpmMlsGpuPipelines {
 	readonly p2g: GPUComputePipeline;
 	readonly updateGrid: GPUComputePipeline;
 	readonly g2p: GPUComputePipeline;
+	readonly validateCflParticles: GPUComputePipeline;
+	readonly measureParticleSpeedPartials: GPUComputePipeline;
+	readonly reduceParticleSpeedPartials: GPUComputePipeline;
 	readonly applyTriangleContactImpulses: GPUComputePipeline;
 	readonly solveBondedTriangles: GPUComputePipeline;
+	readonly updateFractureBonds: GPUComputePipeline;
+	readonly applyFractureParticleDamage: GPUComputePipeline;
+	readonly removeParticlesInOutlet: GPUComputePipeline;
 	readonly commitParticles: GPUComputePipeline;
 	readonly pick: GPUComputePipeline;
 	readonly cloneObject: GPUComputePipeline;
@@ -203,8 +261,13 @@ interface MpmMlsGpuStepBindings {
 	readonly p2g: GPUBindGroup;
 	readonly updateGrid: GPUBindGroup;
 	readonly g2p: GPUBindGroup;
+	readonly validateCflParticles: GPUBindGroup;
+	readonly measureParticleSpeedPartials: GPUBindGroup;
 	readonly applyTriangleContactImpulses: GPUBindGroup;
 	readonly solveBondedTriangles: GPUBindGroup;
+	readonly updateFractureBonds: GPUBindGroup;
+	readonly applyFractureParticleDamage: GPUBindGroup;
+	readonly removeParticlesInOutlet: GPUBindGroup;
 	readonly commitParticles: GPUBindGroup;
 	readonly pick: GPUBindGroup;
 	readonly render: GPUBindGroup;
@@ -214,11 +277,13 @@ const INTERACTION_PARAMS_BYTES = 32;
 const PICK_PARAMS_BYTES = 32;
 const PICK_RESULT_BYTES = 16;
 const CLONE_PARAMS_BYTES = 48;
+const OUTLET_PARAMS_BYTES = 16;
+const OUTLET_COUNTER_BYTES = Uint32Array.BYTES_PER_ELEMENT;
 const SURFACE_STATUS_WORD_INDEX = 7;
 const SURFACE_PARAMETER_DT = 1;
 const MAX_U32 = 0xffff_ffff;
-const DRAG_STIFFNESS = 20;
-const DRAG_DAMPING = 8;
+export const MPM_MLS_GPU_DRAG_STIFFNESS = 20;
+export const MPM_MLS_GPU_DRAG_DAMPING = 8;
 const BUFFER_USAGE = {
 	MAP_READ: 0x0001,
 	COPY_SRC: 0x0004,
@@ -231,12 +296,19 @@ const MAP_MODE_READ = 0x0001;
 export async function createMpmMlsGpuSolver(
 	canvas: HTMLCanvasElement,
 	particles: readonly MpmParticle[],
-	config: MpmMlsGpuConfig
+	config: MpmMlsGpuConfig,
+	cflBounds?: MpmMlsGpuCflBounds
 ): Promise<MpmMlsGpuSolver> {
 	if (canvas === null || typeof canvas?.getContext !== 'function') {
 		throw new TypeError('canvas must be an HTML canvas with getContext()');
 	}
 	const initialState = validateMpmMlsGpuInput(particles, config);
+	const derivedCflBounds = deriveMpmMlsGpuCflBounds(particles, initialState.config);
+	const certifiedCflBounds = validateCflBounds(
+		cflBounds,
+		initialState,
+		derivedCflBounds
+	);
 	const session = await createMpmWebGpuSession(canvas);
 	const ownedBuffers = new Set<GPUBuffer>();
 
@@ -254,7 +326,14 @@ export async function createMpmMlsGpuSolver(
 					ownedBuffers
 				)
 		);
-		return createSolver(session, initialState, layout, runtime, ownedBuffers);
+		return createSolver(
+			session,
+			initialState,
+			layout,
+			runtime,
+			ownedBuffers,
+			certifiedCflBounds
+		);
 	} catch (cause) {
 		const cleanupErrors = destroyBuffers(ownedBuffers);
 		try {
@@ -275,6 +354,65 @@ export async function createMpmMlsGpuSolver(
 	}
 }
 
+function validateCflBounds(
+	bounds: MpmMlsGpuCflBounds | undefined,
+	state: ValidatedMpmMlsGpuInput,
+	derived: DerivedMpmMlsGpuCflBounds | null
+): MpmMlsGpuCflBounds | null {
+	if (bounds === undefined) return derived;
+	if (typeof bounds !== 'object' || bounds === null) {
+		throw new RangeError('cflBounds must be an object of valid speed bounds.');
+	}
+	if (derived === null) {
+		throw new RangeError(
+			'this solver configuration has no derived CFL bounds for its constitutive material.'
+		);
+	}
+	if (!Number.isFinite(bounds.waveSpeedBound) || bounds.waveSpeedBound < 0) {
+		throw new RangeError('cflBounds.waveSpeedBound must be finite and non-negative.');
+	}
+	if (!Number.isFinite(bounds.velocityBound) || bounds.velocityBound < 0) {
+		throw new RangeError('cflBounds.velocityBound must be finite and non-negative.');
+	}
+	if (
+		bounds.courantLimit !== undefined &&
+		(!Number.isFinite(bounds.courantLimit) || bounds.courantLimit <= 0)
+	) {
+		throw new RangeError('cflBounds.courantLimit must be positive and finite.');
+	}
+	if (bounds.waveSpeedBound < derived.waveSpeedBound) {
+		throw new RangeError(
+			'cflBounds.waveSpeedBound must not be lower than the material-derived initial bound.'
+		);
+	}
+	if (bounds.velocityBound < derived.velocityBound) {
+		throw new RangeError(
+			'cflBounds.velocityBound must not be lower than the configured initial-state bound.'
+		);
+	}
+
+	for (let particleIndex = 0; particleIndex < state.particleCount; particleIndex += 1) {
+		const offset = particleIndex * PARTICLE_FLOATS;
+		const speed = Math.hypot(
+			state.packedParticles[offset + 2],
+			state.packedParticles[offset + 3]
+		);
+		if (speed > bounds.velocityBound) {
+			throw new RangeError(
+				`initial velocity at particle ${particleIndex} exceeds cflBounds.velocityBound.`
+			);
+		}
+	}
+
+	return Object.freeze({
+		waveSpeedBound: bounds.waveSpeedBound,
+		velocityBound: bounds.velocityBound,
+		...(bounds.courantLimit === undefined
+			? {}
+			: { courantLimit: bounds.courantLimit })
+	});
+}
+
 interface MpmMlsGpuRuntime {
 	readonly buffers: {
 		readonly simulationParams: GPUBuffer;
@@ -288,11 +426,17 @@ interface MpmMlsGpuRuntime {
 		readonly surfaceFields: GPUBuffer;
 		readonly triangleFieldNodes: GPUBuffer;
 		readonly bondedBodyStarts: GPUBuffer;
+		readonly fractureBonds: GPUBuffer;
+		readonly fractureBondTopology: GPUBuffer;
 		readonly preparedAffines: GPUBuffer;
 		readonly particleObjectIds: GPUBuffer;
+		readonly outletParams: GPUBuffer;
+		readonly outletRemovalCounter: GPUBuffer;
 		readonly pickParams: GPUBuffer;
 		readonly pickResult: GPUBuffer;
 		readonly cloneParams: GPUBuffer;
+		readonly cflSpeedPartials: GPUBuffer;
+		readonly cflMaximumSpeed: GPUBuffer;
 		readonly particles: readonly [GPUBuffer, GPUBuffer];
 	};
 	readonly pipelines: MpmMlsGpuPipelines;
@@ -301,6 +445,7 @@ interface MpmMlsGpuRuntime {
 	readonly surfaceRender: GPUBindGroup;
 	readonly bindings: readonly [MpmMlsGpuStepBindings, MpmMlsGpuStepBindings];
 	readonly cloneBindings: readonly [GPUBindGroup, GPUBindGroup];
+	readonly reduceParticleSpeedPartials: GPUBindGroup;
 }
 
 async function createRuntime(
@@ -343,6 +488,21 @@ async function createRuntime(
 		p2g: await createComputePipeline(device, computeModule, 'p2g'),
 		updateGrid: await createComputePipeline(device, computeModule, 'updateGrid'),
 		g2p: await createComputePipeline(device, computeModule, 'g2p'),
+		validateCflParticles: await createComputePipeline(
+			device,
+			computeModule,
+			'validateCflParticles'
+		),
+		measureParticleSpeedPartials: await createComputePipeline(
+			device,
+			computeModule,
+			'measureParticleSpeedPartials'
+		),
+		reduceParticleSpeedPartials: await createComputePipeline(
+			device,
+			computeModule,
+			'reduceParticleSpeedPartials'
+		),
 		applyTriangleContactImpulses: await createComputePipeline(
 			device,
 			computeModule,
@@ -352,6 +512,21 @@ async function createRuntime(
 			device,
 			computeModule,
 			'solveBondedTriangles'
+		),
+		updateFractureBonds: await createComputePipeline(
+			device,
+			computeModule,
+			'updateFractureBonds'
+		),
+		applyFractureParticleDamage: await createComputePipeline(
+			device,
+			computeModule,
+			'applyFractureParticleDamage'
+		),
+		removeParticlesInOutlet: await createComputePipeline(
+			device,
+			computeModule,
+			'removeParticlesInOutlet'
 		),
 		commitParticles: await createComputePipeline(device, computeModule, 'commitParticles'),
 		pick: await createComputePipeline(device, computeModule, 'pickParticle'),
@@ -371,6 +546,10 @@ async function createRuntime(
 	};
 	const particleBufferUsage =
 		BUFFER_USAGE.STORAGE | BUFFER_USAGE.COPY_SRC | BUFFER_USAGE.COPY_DST;
+	const cflSpeedPartialCount = Math.max(
+		1,
+		Math.ceil(layout.particleCapacity / COMPUTE_WORKGROUP_SIZE)
+	);
 
 	const buffers = {
 		simulationParams: createBuffer(
@@ -428,6 +607,16 @@ async function createRuntime(
 			layout.bondedBodyStartBytes,
 			BUFFER_USAGE.STORAGE | BUFFER_USAGE.COPY_DST
 		),
+		fractureBonds: createBuffer(
+			'MLS-MPM persistent fracture bond state',
+			layout.fractureBondBufferBytes,
+			BUFFER_USAGE.STORAGE | BUFFER_USAGE.COPY_DST
+		),
+		fractureBondTopology: createBuffer(
+			'MLS-MPM fracture bond adjacency',
+			layout.fractureBondTopologyBufferBytes,
+			BUFFER_USAGE.STORAGE | BUFFER_USAGE.COPY_DST
+		),
 		preparedAffines: createBuffer(
 			'MLS-MPM prepared affine momentum',
 			layout.preparedAffineBytes,
@@ -437,6 +626,16 @@ async function createRuntime(
 			'MLS-MPM particle object ids',
 			layout.objectIdBufferBytes,
 			particleBufferUsage
+		),
+		outletParams: createBuffer(
+			'MLS-MPM outlet bounds',
+			OUTLET_PARAMS_BYTES,
+			BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST
+		),
+		outletRemovalCounter: createBuffer(
+			'MLS-MPM outlet removal count',
+			OUTLET_COUNTER_BYTES,
+			BUFFER_USAGE.STORAGE | BUFFER_USAGE.COPY_SRC | BUFFER_USAGE.COPY_DST
 		),
 		pickParams: createBuffer(
 			'MLS-MPM on-demand particle pick parameters',
@@ -452,6 +651,16 @@ async function createRuntime(
 			'MLS-MPM GPU object clone parameters',
 			CLONE_PARAMS_BYTES,
 			BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST
+		),
+		cflSpeedPartials: createBuffer(
+			'MLS-MPM CFL maximum-speed partials',
+			cflSpeedPartialCount * Float32Array.BYTES_PER_ELEMENT,
+			BUFFER_USAGE.STORAGE
+		),
+		cflMaximumSpeed: createBuffer(
+			'MLS-MPM CFL maximum-speed scalar',
+			Float32Array.BYTES_PER_ELEMENT,
+			BUFFER_USAGE.STORAGE | BUFFER_USAGE.COPY_SRC
 		),
 		particles: [
 			createBuffer(
@@ -482,6 +691,11 @@ async function createRuntime(
 	device.queue.writeBuffer(buffers.interactionParams, 0, new Float32Array(8));
 	device.queue.writeBuffer(buffers.pickResult, 0, new Uint32Array([MAX_U32, 0, 0, 0]));
 	device.queue.writeBuffer(
+		buffers.outletRemovalCounter,
+		0,
+		new Uint32Array([0])
+	);
+	device.queue.writeBuffer(
 		buffers.renderParams,
 		0,
 		createRenderParameters(state, 'particles')
@@ -500,6 +714,14 @@ async function createRuntime(
 			buffers.bondedBodyStarts,
 			0,
 			state.bondedBodyStarts
+		);
+	}
+	if (state.packedFractureBonds.byteLength > 0) {
+		device.queue.writeBuffer(buffers.fractureBonds, 0, state.packedFractureBonds);
+		device.queue.writeBuffer(
+			buffers.fractureBondTopology,
+			0,
+			state.packedFractureBondTopology
 		);
 	}
 
@@ -587,6 +809,24 @@ async function createRuntime(
 			bufferEntry(6, buffers.stateError),
 			bufferEntry(16, buffers.triangleFieldNodes)
 		]);
+		const validateCflParticles = createBindGroup(
+			device,
+			pipelines.validateCflParticles,
+			[
+				bufferEntry(0, buffers.simulationParams),
+				bufferEntry(1, output),
+				bufferEntry(6, buffers.stateError)
+			]
+		);
+		const measureParticleSpeedPartials = createBindGroup(
+			device,
+			pipelines.measureParticleSpeedPartials,
+			[
+				bufferEntry(0, buffers.simulationParams),
+				bufferEntry(1, input),
+				bufferEntry(18, buffers.cflSpeedPartials)
+			]
+		);
 		const applyTriangleContactImpulses = createBindGroup(
 			device,
 			pipelines.applyTriangleContactImpulses,
@@ -609,6 +849,38 @@ async function createRuntime(
 				bufferEntry(6, buffers.stateError),
 				bufferEntry(8, buffers.particleObjectIds),
 				bufferEntry(17, buffers.bondedBodyStarts)
+			]
+		);
+		const updateFractureBonds = createBindGroup(
+			device,
+			pipelines.updateFractureBonds,
+			[
+				bufferEntry(0, buffers.simulationParams),
+				bufferEntry(2, output),
+				bufferEntry(6, buffers.stateError),
+				bufferEntry(20, buffers.fractureBonds)
+			]
+		);
+		const applyFractureParticleDamage = createBindGroup(
+			device,
+			pipelines.applyFractureParticleDamage,
+			[
+				bufferEntry(0, buffers.simulationParams),
+				bufferEntry(2, output),
+				bufferEntry(6, buffers.stateError),
+				bufferEntry(20, buffers.fractureBonds),
+				bufferEntry(21, buffers.fractureBondTopology)
+			]
+		);
+		const removeParticlesInOutlet = createBindGroup(
+			device,
+			pipelines.removeParticlesInOutlet,
+			[
+				bufferEntry(0, buffers.simulationParams),
+				bufferEntry(1, input),
+				bufferEntry(2, output),
+				bufferEntry(22, buffers.outletParams),
+				bufferEntry(23, buffers.outletRemovalCounter)
 			]
 		);
 		const commitParticles = createBindGroup(device, pipelines.commitParticles, [
@@ -635,8 +907,13 @@ async function createRuntime(
 			p2g,
 			updateGrid,
 			g2p,
+			validateCflParticles,
+			measureParticleSpeedPartials,
 			applyTriangleContactImpulses,
 			solveBondedTriangles,
+			updateFractureBonds,
+			applyFractureParticleDamage,
+			removeParticlesInOutlet,
 			commitParticles,
 			pick,
 			render
@@ -657,6 +934,15 @@ async function createRuntime(
 		createCloneBinding(0),
 		createCloneBinding(1)
 	];
+	const reduceParticleSpeedPartials = createBindGroup(
+		device,
+		pipelines.reduceParticleSpeedPartials,
+		[
+			bufferEntry(0, buffers.simulationParams),
+			bufferEntry(18, buffers.cflSpeedPartials),
+			bufferEntry(19, buffers.cflMaximumSpeed)
+		]
+	);
 
 	return {
 		buffers,
@@ -665,7 +951,8 @@ async function createRuntime(
 		clearSurfaceOccupancy,
 		surfaceRender,
 		bindings,
-		cloneBindings
+		cloneBindings,
+		reduceParticleSpeedPartials
 	};
 }
 
@@ -674,14 +961,24 @@ function createSolver(
 	state: ValidatedMpmMlsGpuInput,
 	layout: MpmMlsGpuBufferLayout,
 	runtime: MpmMlsGpuRuntime,
-	ownedBuffers: Set<GPUBuffer>
+	ownedBuffers: Set<GPUBuffer>,
+	cflBounds: MpmMlsGpuCflBounds | null
 ): MpmMlsGpuSolver {
 	let currentBuffer = 0;
-	let particleCount = state.particleCount;
+	let particleSlotCount = state.particleCount;
+	let activeParticleCount = state.particleCount;
 	let disposed = false;
 	let lostInfo: GPUDeviceLostInfo | null = null;
 	let pickPending = false;
+	let removalPending = false;
+	let hasRemovedParticles = false;
+	let cflSpeedReadbacksPending = 0;
 	let activeDrag: { readonly radius: number } | null = null;
+	let cflSpeedMeasurementSubmitted = false;
+	let cflStateCflUsable = cflBounds !== null;
+	let lastScheduledVelocityBound = cflBounds?.velocityBound ?? null;
+	let latestCflBatchSequence = 0;
+	let latestCompletedCflMeasurementSequence = 0;
 	let currentRenderMode: MpmMlsGpuRenderMode = 'particles';
 	let bondedBodyCount = state.bondedBodyStarts.length;
 	const temporaryReadbacks = new Set<GPUBuffer>();
@@ -689,6 +986,7 @@ function createSolver(
 		state.objectRanges.map((range) => [range.objectId, range])
 	);
 	const bondedBodyCountsByObjectId = new Map(state.bondedBodyCountsByObjectId);
+	const fractureBondCountsByObjectId = new Map(state.fractureBondCountsByObjectId);
 	let nextObjectId = 0;
 	for (const range of state.objectRanges) {
 		nextObjectId = Math.max(nextObjectId, range.objectId + 1);
@@ -714,7 +1012,7 @@ function createSolver(
 		if (
 			!Number.isSafeInteger(selection.particleIndex) ||
 			selection.particleIndex < 0 ||
-			selection.particleIndex >= particleCount ||
+			selection.particleIndex >= particleSlotCount ||
 			!Number.isSafeInteger(selection.objectId) ||
 			selection.objectId < 0 ||
 			selection.objectId > MAX_U32
@@ -738,8 +1036,8 @@ function createSolver(
 			target.x,
 			target.y,
 			radius,
-			DRAG_STIFFNESS,
-			DRAG_DAMPING,
+			MPM_MLS_GPU_DRAG_STIFFNESS,
+			MPM_MLS_GPU_DRAG_DAMPING,
 			0,
 			0,
 			0
@@ -751,18 +1049,38 @@ function createSolver(
 		stepBatch(1, dt, gravity);
 	}
 
-	function stepBatch(stepCount: number, dt: number, gravity: MpmVector2): void {
+	function stepBatch(
+		stepCount: number,
+		dt: number,
+		gravity: MpmVector2,
+		cflVelocityBound?: number
+	): void {
 		assertActive();
 		if (!Number.isSafeInteger(stepCount) || stepCount < 1) {
 			throw new RangeError('stepCount must be a positive safe integer.');
+		}
+		let cflGuard: Pick<MpmMlsGpuCflBounds, 'waveSpeedBound' | 'velocityBound'> | null =
+			null;
+		if (cflVelocityBound !== undefined) {
+			if (cflBounds === null) {
+				throw new RangeError('this solver configuration has no safely derived CFL bounds.');
+			}
+			if (!Number.isFinite(cflVelocityBound) || cflVelocityBound < 0) {
+				throw new RangeError('velocityBound must be finite and non-negative.');
+			}
+			cflGuard = {
+				waveSpeedBound: cflBounds.waveSpeedBound,
+				velocityBound: cflVelocityBound
+			};
 		}
 		const parameters = packMpmMlsGpuStepParameters(
 			state,
 			layout,
 			dt,
 			gravity,
-			particleCount,
-			bondedBodyCount
+			particleSlotCount,
+			bondedBodyCount,
+			cflGuard
 		);
 		let inputIndex = currentBuffer;
 		try {
@@ -786,13 +1104,13 @@ function createSolver(
 					pass,
 					runtime.pipelines.prepareParticles,
 					groups.prepareParticles,
-					particleCount
+					particleSlotCount
 				);
 				dispatchCompute(
 					pass,
 					runtime.pipelines.buildBuckets,
 					groups.buildBuckets,
-					particleCount
+					particleSlotCount
 				);
 				dispatchCompute(pass, runtime.pipelines.p2g, groups.p2g, layout.nodeCount);
 				if (bondedBodyCount > 0) {
@@ -813,7 +1131,7 @@ function createSolver(
 					pass,
 					runtime.pipelines.g2p,
 					groups.g2p,
-					particleCount
+					particleSlotCount
 				);
 				if (bondedBodyCount > 0) {
 					dispatchCompute(
@@ -829,23 +1147,165 @@ function createSolver(
 						bondedBodyCount
 					);
 				}
+				if (cflGuard !== null) {
+					dispatchCompute(
+						pass,
+						runtime.pipelines.validateCflParticles,
+						groups.validateCflParticles,
+						particleSlotCount
+					);
+				}
+				if (state.fractureBondCount > 0) {
+					dispatchCompute(
+						pass,
+						runtime.pipelines.updateFractureBonds,
+						groups.updateFractureBonds,
+						state.fractureBondCount
+					);
+					dispatchCompute(
+						pass,
+						runtime.pipelines.applyFractureParticleDamage,
+						groups.applyFractureParticleDamage,
+						particleSlotCount
+					);
+				}
 				dispatchCompute(
 					pass,
 					runtime.pipelines.commitParticles,
 					groups.commitParticles,
-					particleCount
+					particleSlotCount
 				);
 				inputIndex = 1 - inputIndex;
+			}
+			if (cflGuard !== null) {
+				const finalGroups = runtime.bindings[inputIndex];
+				dispatchCompute(
+					pass,
+					runtime.pipelines.measureParticleSpeedPartials,
+					finalGroups.measureParticleSpeedPartials,
+					particleSlotCount
+				);
+				dispatchCompute(
+					pass,
+					runtime.pipelines.reduceParticleSpeedPartials,
+					runtime.reduceParticleSpeedPartials,
+					1
+				);
 			}
 			pass.end();
 			session.device.queue.submit([encoder.finish()]);
 			currentBuffer = inputIndex;
+			cflSpeedMeasurementSubmitted = cflGuard !== null;
+			if (cflGuard === null) cflStateCflUsable = false;
 		} catch (cause) {
+			cflStateCflUsable = false;
+			cflSpeedMeasurementSubmitted = false;
 			throw new Error(
 				`Failed to encode or submit an MLS-MPM batch of ${stepCount} step(s).`,
 				{ cause }
 			);
 		}
+	}
+
+	function stepCflBatch(
+		macroStepCount: number,
+		macroDt: number,
+		microstepPlan: MpmCflMicrostepPlan,
+		velocityBound: number,
+		maxMicrosteps: number,
+		gravity: MpmVector2
+	): void {
+		assertActive();
+		if (cflBounds === null) {
+			throw new RangeError(
+				'CFL stepping requires a material-derived wave-speed bound; this solver configuration has no safely derived CFL bounds.'
+			);
+		}
+		if (!cflStateCflUsable) {
+			throw new Error(
+				'a direct non-CFL GPU step or a failed CFL measurement invalidated the tracked velocity bound; recreate the solver before CFL stepping.'
+			);
+		}
+		if (cflSpeedMeasurementSubmitted) {
+			throw new Error(
+				'queue measureMaximumParticleSpeed() after the previous CFL batch before submitting another one.'
+			);
+		}
+		if (
+			lastScheduledVelocityBound !== null &&
+			velocityBound < lastScheduledVelocityBound
+		) {
+			throw new RangeError(
+				'velocityBound must cover the last submitted GPU maximum-particle envelope.'
+			);
+		}
+		if (!Number.isSafeInteger(macroStepCount) || macroStepCount < 1) {
+			throw new RangeError('macroStepCount must be a positive safe integer.');
+		}
+		if (!Number.isSafeInteger(maxMicrosteps) || maxMicrosteps < 1) {
+			throw new RangeError('maxMicrosteps must be a positive safe integer.');
+		}
+
+		const expectedPlan = calculateMpmCflMicrosteps({
+			macroDt,
+			cellSize: state.config.grid.cellSize,
+			waveSpeedBound: cflBounds.waveSpeedBound,
+			velocityBound,
+			courantLimit: cflBounds.courantLimit,
+			maxMicrosteps
+		});
+		if (
+			typeof microstepPlan !== 'object' ||
+			microstepPlan === null ||
+			microstepPlan.stepCount !== expectedPlan.stepCount ||
+			microstepPlan.microDt !== expectedPlan.microDt ||
+			microstepPlan.safeDt !== expectedPlan.safeDt
+		) {
+			throw new RangeError(
+				'microstepPlan does not match this solver configuration and certified CFL bounds.'
+			);
+		}
+
+		const microStepCount = macroStepCount * expectedPlan.stepCount;
+		if (!Number.isSafeInteger(microStepCount) || microStepCount > maxMicrosteps) {
+			throw new RangeError(
+				`requested microstep count (${microStepCount}) exceeds maxMicrosteps (${maxMicrosteps}).`
+			);
+		}
+		const representedMacroDt = expectedPlan.microDt * expectedPlan.stepCount;
+		const durationTolerance =
+			Math.max(macroDt, Number.MIN_VALUE) * Number.EPSILON * 4;
+		if (Math.abs(representedMacroDt - macroDt) > durationTolerance) {
+			throw new RangeError('microstepPlan does not preserve the requested macro dt.');
+		}
+		const gpuMicroDt = Math.fround(expectedPlan.microDt);
+		if (
+			activeDrag !== null &&
+			(!Number.isFinite(gpuMicroDt) ||
+				gpuMicroDt <= 0 ||
+				gpuMicroDt * MPM_MLS_GPU_DRAG_DAMPING > 1)
+		) {
+			throw new RangeError(
+				'CFL microDt is too large for the explicit drag damping update to remain dissipative.'
+			);
+		}
+
+		const runtimeVelocityLimit = calculateMpmCflVelocityLimit({
+			cellSize: state.config.grid.cellSize,
+			waveSpeedBound: cflBounds.waveSpeedBound,
+			microDt: expectedPlan.microDt,
+			courantLimit: cflBounds.courantLimit
+		});
+		if (runtimeVelocityLimit < velocityBound) {
+			throw new RangeError(
+				'float32 microDt does not preserve the planned CFL velocity bound; increase the microstep count.'
+			);
+		}
+
+		// stepBatch encodes every full P2G -> grid update -> G2P sequence using microDt.
+		stepBatch(microStepCount, expectedPlan.microDt, gravity, runtimeVelocityLimit);
+		latestCflBatchSequence += 1;
+		lastScheduledVelocityBound = velocityBound;
 	}
 
 	function render(mode: MpmMlsGpuRenderMode = 'particles'): void {
@@ -883,7 +1343,7 @@ function createSolver(
 					computePass,
 					runtime.pipelines.buildBuckets,
 					groups.buildBuckets,
-					particleCount
+					particleSlotCount
 				);
 				dispatchCompute(
 					computePass,
@@ -910,7 +1370,7 @@ function createSolver(
 			}
 			pass.setPipeline(runtime.pipelines.render);
 			pass.setBindGroup(0, runtime.bindings[currentBuffer].render);
-			pass.draw(6, particleCount);
+			pass.draw(6, particleSlotCount);
 			pass.end();
 			session.device.queue.submit([encoder.finish()]);
 		} catch (cause) {
@@ -926,6 +1386,390 @@ function createSolver(
 		await session.device.queue.onSubmittedWorkDone();
 		assertActive();
 		return performance.now() - startedAt;
+	}
+
+	function appendParticles(particles: readonly MpmParticle[]): MpmMlsGpuAppendResult {
+		assertActive();
+		if (!Array.isArray(particles)) {
+			throw new TypeError('particles must be an array of emitter particles.');
+		}
+		const requested = particles.length;
+		const emptyResult = (
+			accepted: number,
+			refused: number,
+			dropped: number,
+			velocityBound = 0,
+			reason?: string
+		): MpmMlsGpuAppendResult => ({
+			requested,
+			accepted,
+			refused,
+			dropped,
+			activeParticleCount,
+			allocatedParticleCount: particleSlotCount,
+			capacity: layout.particleCapacity,
+			velocityBound,
+			...(reason === undefined ? {} : { reason })
+		});
+		if (requested === 0) return emptyResult(0, 0, 0);
+		if (cflSpeedReadbacksPending > 0) {
+			return emptyResult(
+				0,
+				requested,
+				0,
+				0,
+				'wait for the submitted CFL speed readback before emitting particles'
+			);
+		}
+		if (removalPending) {
+			return emptyResult(0, requested, 0, 0, 'outlet removal is still in progress');
+		}
+		const available = layout.particleCapacity - particleSlotCount;
+		if (available <= 0) {
+			return emptyResult(
+				0,
+				0,
+				requested,
+				0,
+				`particle slot capacity ${layout.particleCapacity} is full`
+			);
+		}
+		if (nextObjectId > MAX_U32) {
+			return emptyResult(0, requested, 0, 0, 'no object ids remain for a new emitter group');
+		}
+
+		const objectId = nextObjectId;
+		const sourceParticles = particles.map((particle) => ({
+			...particle,
+			objectId
+		}));
+		if (sourceParticles.some((particle) => particle.bondedTriangleVertex !== undefined)) {
+			return emptyResult(
+				0,
+				requested,
+				0,
+				0,
+				'triangle-bonded particles cannot be appended without a complete object topology'
+			);
+		}
+
+		let candidateState: ValidatedMpmMlsGpuInput;
+		try {
+			candidateState = validateMpmMlsGpuInput(
+				sourceParticles,
+				{
+					...state.config,
+					capacity: requested,
+					fractureBonds: []
+				}
+			);
+		} catch (error) {
+			const reason =
+				error instanceof Error && error.message.trim()
+					? error.message
+					: 'emitter particles failed GPU input validation';
+			return emptyResult(0, requested, 0, 0, reason);
+		}
+		if (candidateState.bondedBodyStarts.length > 0) {
+			return emptyResult(
+				0,
+				requested,
+				0,
+				0,
+				'triangle-bonded particles cannot be appended without a complete object topology'
+			);
+		}
+
+		const accepted = Math.min(requested, available);
+		const acceptedParticles = sourceParticles.slice(0, accepted);
+		const additionBounds = deriveMpmMlsGpuCflBounds(
+			acceptedParticles,
+			candidateState.config
+		);
+		if (cflBounds !== null && additionBounds === null) {
+			return emptyResult(
+				0,
+				requested,
+				0,
+				0,
+				'appended material has no safely derived CFL wave-speed bound'
+			);
+		}
+
+		const destinationStart = particleSlotCount;
+		const destinationOffset = destinationStart * PARTICLE_STRIDE_BYTES;
+		const appendedWords = accepted * PARTICLE_FLOATS;
+		const nextSlotCount = particleSlotCount + accepted;
+		try {
+			for (const particleBuffer of runtime.buffers.particles) {
+				session.device.queue.writeBuffer(
+					particleBuffer,
+					destinationOffset,
+					candidateState.packedParticles.subarray(0, appendedWords)
+				);
+			}
+			session.device.queue.writeBuffer(
+				runtime.buffers.particleObjectIds,
+				destinationStart * OBJECT_ID_STRIDE_BYTES,
+				candidateState.packedObjectIds.subarray(0, accepted)
+			);
+			session.device.queue.writeBuffer(
+				runtime.buffers.simulationParams,
+				16,
+				new Uint32Array([
+					nextSlotCount,
+					layout.nodeCount,
+					nextSlotCount * 9,
+					bondedBodyCount
+				])
+			);
+		} catch (cause) {
+			cflStateCflUsable = false;
+			throw new Error('Failed to append a validated GPU MLS-MPM emitter batch.', {
+				cause
+			});
+		}
+
+		objectRanges.set(objectId, {
+			objectId,
+			start: destinationStart,
+			count: accepted
+		});
+		particleSlotCount = nextSlotCount;
+		activeParticleCount += accepted;
+		nextObjectId += 1;
+		if (additionBounds !== null && cflBounds !== null) {
+			cflBounds = {
+				...cflBounds,
+				waveSpeedBound: Math.max(cflBounds.waveSpeedBound, additionBounds.waveSpeedBound),
+				velocityBound: Math.max(cflBounds.velocityBound, additionBounds.velocityBound)
+			};
+			lastScheduledVelocityBound = Math.max(
+				lastScheduledVelocityBound ?? 0,
+				additionBounds.velocityBound
+			);
+		}
+		return emptyResult(
+			accepted,
+			0,
+			requested - accepted,
+			additionBounds?.velocityBound ?? 0,
+			requested === accepted
+				? undefined
+				: `accepted only ${accepted} of ${requested}; GPU slot capacity is exhausted`
+		);
+	}
+
+	async function removeParticlesInOutlet(
+		bounds: MpmMlsGpuOutletBounds
+	): Promise<number> {
+		assertActive();
+		if (typeof bounds !== 'object' || bounds === null) {
+			throw new TypeError('outlet bounds must be an object.');
+		}
+		const minimum = validateMpmWorldPoint(
+			{ x: bounds.minX, y: bounds.minY },
+			state,
+			'outlet minimum'
+		);
+		const maximum = validateMpmWorldPoint(
+			{ x: bounds.maxX, y: bounds.maxY },
+			state,
+			'outlet maximum'
+		);
+		if (minimum.x > maximum.x || minimum.y > maximum.y) {
+			throw new RangeError('outlet minimum coordinates must not exceed the maximum.');
+		}
+		if (removalPending) {
+			throw new Error('An MLS-MPM outlet removal is already in progress.');
+		}
+		if (pickPending) {
+			throw new Error('Wait for the active particle pick before removing outlet particles.');
+		}
+		if (particleSlotCount === 0 || activeParticleCount === 0) return 0;
+		removalPending = true;
+
+		let staging: GPUBuffer | null = null;
+		let mapped = false;
+		try {
+			staging = session.device.createBuffer({
+				label: 'MLS-MPM outlet removal count readback',
+				size: OUTLET_COUNTER_BYTES,
+				usage: BUFFER_USAGE.MAP_READ | BUFFER_USAGE.COPY_DST
+			});
+			ownedBuffers.add(staging);
+			temporaryReadbacks.add(staging);
+			session.device.queue.writeBuffer(
+				runtime.buffers.outletParams,
+				0,
+				new Float32Array([minimum.x, minimum.y, maximum.x, maximum.y])
+			);
+			session.device.queue.writeBuffer(
+				runtime.buffers.outletRemovalCounter,
+				0,
+				new Uint32Array([0])
+			);
+
+			const encoder = session.device.createCommandEncoder({
+				label: 'GPU MLS-MPM liquid outlet removal'
+			});
+			const pass = encoder.beginComputePass({
+				label: 'mark liquid particles inside the outlet'
+			});
+			dispatchCompute(
+				pass,
+				runtime.pipelines.removeParticlesInOutlet,
+				runtime.bindings[currentBuffer].removeParticlesInOutlet,
+				particleSlotCount
+			);
+			pass.end();
+			encoder.copyBufferToBuffer(
+				runtime.buffers.outletRemovalCounter,
+				0,
+				staging,
+				0,
+				OUTLET_COUNTER_BYTES
+			);
+			session.device.queue.submit([encoder.finish()]);
+			currentBuffer = 1 - currentBuffer;
+
+			await staging.mapAsync(MAP_MODE_READ);
+			mapped = true;
+			assertActive();
+			const removed = new Uint32Array(staging.getMappedRange().slice(0))[0];
+			if (removed > activeParticleCount) {
+				throw new Error('GPU reported an outlet removal count above the active particle count.');
+			}
+			activeParticleCount -= removed;
+			hasRemovedParticles ||= removed > 0;
+			return removed;
+		} catch (cause) {
+			cflStateCflUsable = false;
+			throw new Error('Failed to remove liquid particles from the GPU outlet region.', {
+				cause
+			});
+		} finally {
+			if (mapped && staging) {
+				try {
+					staging.unmap();
+				} catch {
+					// Device teardown may already have unmapped the staging buffer.
+				}
+			}
+			if (staging && temporaryReadbacks.delete(staging)) {
+				ownedBuffers.delete(staging);
+				try {
+					staging.destroy();
+				} catch {
+					// The GPU state transition already settled; device teardown owns recovery.
+				}
+			}
+			removalPending = false;
+		}
+	}
+
+	async function measureMaximumParticleSpeed(): Promise<MpmMlsGpuSpeedMeasurement> {
+		assertActive();
+		if (!cflSpeedMeasurementSubmitted) {
+			throw new Error('No completed CFL batch has a maximum-speed measurement to read.');
+		}
+		cflSpeedMeasurementSubmitted = false;
+		const measurementSequence = latestCflBatchSequence;
+
+		const readbackBytes = Float32Array.BYTES_PER_ELEMENT + NUMERICAL_STATUS_BYTES;
+		let readback: GPUBuffer;
+		try {
+			readback = session.device.createBuffer({
+				label: 'MLS-MPM compact CFL speed/status readback',
+				size: readbackBytes,
+				usage: BUFFER_USAGE.MAP_READ | BUFFER_USAGE.COPY_DST
+			});
+		} catch (cause) {
+			cflStateCflUsable = false;
+			throw new Error('Failed to allocate the compact CFL speed readback buffer.', {
+				cause
+			});
+		}
+		ownedBuffers.add(readback);
+		temporaryReadbacks.add(readback);
+		cflSpeedReadbacksPending += 1;
+
+		let mapped = false;
+		try {
+			const encoder = session.device.createCommandEncoder({
+				label: 'MLS-MPM compact CFL speed/status readback'
+			});
+			encoder.copyBufferToBuffer(
+				runtime.buffers.cflMaximumSpeed,
+				0,
+				readback,
+				0,
+				Float32Array.BYTES_PER_ELEMENT
+			);
+			encoder.copyBufferToBuffer(
+				runtime.buffers.stateError,
+				0,
+				readback,
+				Float32Array.BYTES_PER_ELEMENT,
+				NUMERICAL_STATUS_BYTES
+			);
+			session.device.queue.submit([encoder.finish()]);
+			await readback.mapAsync(MAP_MODE_READ);
+			mapped = true;
+			assertActive();
+			const snapshot = readback.getMappedRange().slice(0);
+			readback.unmap();
+			mapped = false;
+
+			const numericalError = decodeNumericalError(
+				snapshot,
+				Float32Array.BYTES_PER_ELEMENT
+			);
+			if (numericalError) throw numericalError;
+			const surfaceError = decodeSurfaceError(
+				snapshot,
+				Float32Array.BYTES_PER_ELEMENT
+			);
+			if (surfaceError) throw surfaceError;
+			const maximumSpeed = new Float32Array(snapshot, 0, 1)[0];
+			if (!Number.isFinite(maximumSpeed) || maximumSpeed < 0) {
+				throw new RangeError('GPU returned an invalid maximum-particle-speed scalar.');
+			}
+			if (measurementSequence >= latestCompletedCflMeasurementSequence) {
+				latestCompletedCflMeasurementSequence = measurementSequence;
+				if (measurementSequence === latestCflBatchSequence) {
+					lastScheduledVelocityBound = maximumSpeed;
+				}
+			}
+			return { maximumSpeed, sequence: measurementSequence };
+		} catch (cause) {
+			cflStateCflUsable = false;
+			if (
+				cause instanceof MpmMlsGpuNumericalError ||
+				cause instanceof MpmMlsGpuSurfaceError ||
+				cause instanceof RangeError
+			) {
+				throw cause;
+			}
+			throw new Error('Failed to read the compact GPU CFL speed measurement.', { cause });
+		} finally {
+			if (mapped) {
+				try {
+					readback.unmap();
+				} catch {
+					// Device teardown may already have unmapped the staging buffer.
+				}
+			}
+			if (temporaryReadbacks.delete(readback)) {
+				ownedBuffers.delete(readback);
+				try {
+					readback.destroy();
+				} catch {
+					// The speed measurement is already settled; device teardown owns recovery.
+				}
+			}
+			cflSpeedReadbacksPending = Math.max(0, cflSpeedReadbacksPending - 1);
+		}
 	}
 
 	async function checkNumericalStatus(): Promise<void> {
@@ -1001,7 +1845,7 @@ function createSolver(
 			throw new TypeError('particleIndices must be an array of active particle indices.');
 		}
 		for (const index of indices) {
-			if (!Number.isSafeInteger(index) || index < 0 || index >= particleCount) {
+			if (!Number.isSafeInteger(index) || index < 0 || index >= particleSlotCount) {
 				throw new RangeError('particleIndices must identify active GPU particles.');
 			}
 		}
@@ -1014,7 +1858,7 @@ function createSolver(
 		assertActive();
 		const selectedIndices =
 			particleIndices === undefined ? null : validateReadbackIndices(particleIndices);
-		const readParticleCount = selectedIndices?.length ?? particleCount;
+		const readParticleCount = selectedIndices?.length ?? particleSlotCount;
 		const particleStateBytes = readParticleCount * PARTICLE_STRIDE_BYTES;
 		const objectIdBytes = readParticleCount * OBJECT_ID_STRIDE_BYTES;
 		const errorOffset = particleStateBytes + objectIdBytes;
@@ -1097,15 +1941,21 @@ function createSolver(
 				readParticleCount,
 				new Uint32Array(snapshot, particleStateBytes, readParticleCount)
 			);
-			const numericalError = decodeNumericalError(snapshot, errorOffset, (particleIndex) => {
-				const stateIndex =
-					particleIndex === undefined
-						? -1
-						: selectedIndices === null
-							? particleIndex
-							: selectedIndices.indexOf(particleIndex);
-				return stateIndex >= 0 ? particles[stateIndex] : undefined;
-			});
+			const numericalError = decodeNumericalError(
+				snapshot,
+				errorOffset,
+				hasRemovedParticles
+					? undefined
+					: (particleIndex) => {
+							const stateIndex =
+								particleIndex === undefined
+									? -1
+									: selectedIndices === null
+										? particleIndex
+										: selectedIndices.indexOf(particleIndex);
+							return stateIndex >= 0 ? particles[stateIndex] : undefined;
+						}
+			);
 			if (numericalError) {
 				throw numericalError;
 			}
@@ -1148,7 +1998,7 @@ function createSolver(
 		assertActive();
 		const query = validateMpmWorldPoint(point, state, 'pick point');
 		const pickRadius = validateMpmPickRadius(radius, state);
-		if (particleCount === 0) return null;
+		if (activeParticleCount === 0) return null;
 		if (pickPending) {
 			throw new Error('An MLS-MPM particle pick is already in progress.');
 		}
@@ -1156,7 +2006,7 @@ function createSolver(
 
 		let staging: GPUBuffer | null = null;
 		let mapped = false;
-		const queryParticleCount = particleCount;
+		const queryParticleCount = particleSlotCount;
 		try {
 			staging = session.device.createBuffer({
 				label: 'one-particle MLS-MPM pick readback',
@@ -1264,7 +2114,14 @@ function createSolver(
 		assertActive();
 		const source = resolveSelection(selection);
 		const translation = validateMpmCloneOffset(offset);
-		if (source.count > layout.particleCapacity - particleCount) return false;
+		if (
+			hasRemovedParticles ||
+			removalPending ||
+			(fractureBondCountsByObjectId.get(source.objectId) ?? 0) > 0
+		) {
+			return false;
+		}
+		if (source.count > layout.particleCapacity - particleSlotCount) return false;
 		const sourceBondedBodyCount = bondedBodyCountsByObjectId.get(source.objectId) ?? 0;
 		if (sourceBondedBodyCount > layout.bondedBodyCapacity - bondedBodyCount) {
 			return false;
@@ -1273,7 +2130,7 @@ function createSolver(
 			throw new RangeError('No unsigned 32-bit object ids remain for MLS-MPM cloning.');
 		}
 
-		const destinationStart = particleCount;
+		const destinationStart = particleSlotCount;
 		const clonedObjectId = nextObjectId;
 		const parameters = new ArrayBuffer(CLONE_PARAMS_BYTES);
 		new Uint32Array(parameters, 0, 4).set([
@@ -1322,7 +2179,9 @@ function createSolver(
 			count: source.count
 		});
 		bondedBodyCountsByObjectId.set(clonedObjectId, sourceBondedBodyCount);
-		particleCount += source.count;
+		fractureBondCountsByObjectId.set(clonedObjectId, 0);
+		particleSlotCount += source.count;
+		activeParticleCount += source.count;
 		bondedBodyCount += sourceBondedBodyCount;
 		nextObjectId++;
 		try {
@@ -1331,9 +2190,9 @@ function createSolver(
 				runtime.buffers.simulationParams,
 				16,
 				new Uint32Array([
-					particleCount,
+					particleSlotCount,
 					layout.nodeCount,
-					particleCount * 9,
+					particleSlotCount * 9,
 					bondedBodyCount
 				])
 			);
@@ -1364,17 +2223,27 @@ function createSolver(
 	return {
 		deviceLost,
 		get particleCount() {
-			return particleCount;
+			return activeParticleCount;
+		},
+		get allocatedParticleCount() {
+			return particleSlotCount;
 		},
 		get particleCapacity() {
 			return layout.particleCapacity;
 		},
+		get cflBounds() {
+			return cflBounds;
+		},
 		step,
 		stepBatch,
+		stepCflBatch,
 		render,
 		readParticles,
+		measureMaximumParticleSpeed,
 		checkNumericalStatus,
 		measureQueueCompletionMs,
+		appendParticles,
+		removeParticlesInOutlet,
 		pick,
 		beginDrag,
 		updateDrag,
@@ -1523,6 +2392,7 @@ function unpackParticles(
 	const particles: MpmParticle[] = [];
 	for (let index = 0; index < particleCount; index++) {
 		const offset = index * PARTICLE_FLOATS;
+		if (words[offset + 13] === MAX_U32) continue;
 		const model = decodeMpmConstitutiveModel(words[offset + 13]);
 		const bondedVertexMarker = words[offset + 19];
 		if (bondedVertexMarker > 3) {
@@ -1574,6 +2444,9 @@ function unpackParticles(
 			plasticVolume: values[offset + 12],
 			volume: values[offset + 17],
 			material,
+			...(model === 'neo-hookean' && values[offset + 18] > 0
+				? { damage: values[offset + 18] }
+				: {}),
 			...(bondedTriangleVertex === undefined ? {} : { bondedTriangleVertex }),
 			objectId: objectIds[index]
 		});

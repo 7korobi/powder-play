@@ -2,6 +2,10 @@ import {
 	normalizeMpmConstitutiveModel,
 	SNOW_PLASTICITY
 } from '../materials.js';
+import {
+	updateMpmSolidBondDamage,
+	validateMpmSolidBondGraph
+} from './solid-bonds.js';
 
 export interface MpmVector2 {
 	readonly x: number;
@@ -22,9 +26,19 @@ export interface MpmParticle {
 	readonly F: MpmMatrix2;
 	readonly objectId?: number;
 	readonly bondedTriangleVertex?: 0 | 1 | 2;
+	readonly damage?: number;
 	readonly plasticVolume?: number;
 	readonly volume?: number;
 	readonly material?: MpmMaterialParameters;
+}
+
+export interface MpmSolidBond {
+	readonly firstParticle: number;
+	readonly secondParticle: number;
+	readonly restLength: number;
+	readonly failureStrain: number;
+	readonly damage?: number;
+	readonly broken?: boolean;
 }
 
 export interface MpmGridParameters {
@@ -64,6 +78,7 @@ export interface MpmStepConfig {
 	readonly particleVolume: number;
 	readonly bondRestLength?: number;
 	readonly bondStiffness?: number;
+	readonly fractureBonds?: readonly MpmSolidBond[];
 	readonly material: MpmMaterialParameters;
 	readonly gravity: MpmVector2;
 }
@@ -80,6 +95,7 @@ export interface MpmStepDiagnostics {
 export interface MpmStepResult {
 	readonly particles: readonly MpmParticle[];
 	readonly diagnostics: MpmStepDiagnostics;
+	readonly fractureBonds?: readonly MpmSolidBond[];
 }
 
 interface ValidatedConfig {
@@ -89,6 +105,7 @@ interface ValidatedConfig {
 	readonly particleVolume: number;
 	readonly bondRestLength: number | undefined;
 	readonly bondStiffness: number;
+	readonly fractureBonds: readonly MpmSolidBond[] | undefined;
 	readonly material: MpmMaterialParameters;
 	readonly gravity: MpmVector2;
 	readonly domainWidth: number;
@@ -177,6 +194,9 @@ export function stepMpm(
 ): MpmStepResult {
 	const validated = validateConfig(config);
 	validateParticles(particles, validated);
+	if (validated.fractureBonds !== undefined) {
+		validateMpmSolidBondGraph(particles, validated.fractureBonds, validated.material);
+	}
 	const bondedBodyStarts = collectBondedBodyStarts(particles, validated);
 	const particleStates = particles.map((particle) => resolveParticleState(particle, validated));
 
@@ -194,7 +214,8 @@ export function stepMpm(
 		const stressTimesFt = constitutiveStressTimesFt(
 			particle.F,
 			plasticVolume,
-			state.material
+			state.material,
+			particle.damage ?? 0
 		);
 		const stressScale = -validated.dt * state.volume * validated.gradientScale;
 		assertComputedFinite(stressScale, 'particle stress scale');
@@ -496,6 +517,7 @@ export function stepMpm(
 			...(particle.bondedTriangleVertex === undefined
 				? {}
 				: { bondedTriangleVertex: particle.bondedTriangleVertex }),
+			...(particle.damage === undefined ? {} : { damage: particle.damage }),
 			plasticVolume: nextPlasticVolume,
 			volume: state.volume,
 			material: state.material
@@ -519,17 +541,26 @@ export function stepMpm(
 		bondedBodyStarts,
 		validated
 	);
+	const fractureResult =
+		validated.fractureBonds === undefined
+			? undefined
+			: updateMpmSolidBondDamage(
+					outputParticles,
+					validated.fractureBonds,
+					validated.material
+				);
+	const finalParticles = fractureResult?.particles ?? outputParticles;
 
 	const outputMass = totalMass(particleStates, 'output mass');
 	assertComputedFinite(outputMass, 'output mass');
 	const outputMomentum = totalMomentum(
-		outputParticles,
+		finalParticles,
 		particleStates,
 		'output momentum'
 	);
 
 	return {
-		particles: outputParticles,
+		particles: finalParticles,
 		diagnostics: {
 			inputMass,
 			gridMass,
@@ -537,7 +568,10 @@ export function stepMpm(
 			inputMomentum,
 			gridMomentum: { x: gridMomentumX, y: gridMomentumY },
 			outputMomentum
-		}
+		},
+		...(fractureResult === undefined
+			? {}
+			: { fractureBonds: fractureResult.bonds })
 	};
 }
 
@@ -561,6 +595,10 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 		raw.bondStiffness === undefined
 			? DEFAULT_BONDED_TRIANGLE_STIFFNESS
 			: raw.bondStiffness;
+	const fractureBonds =
+		raw.fractureBonds === undefined
+			? undefined
+			: validateSolidBondArray(raw.fractureBonds);
 	const lambda = material.lambda;
 	const mu = material.mu;
 	const gravity = raw.gravity;
@@ -628,6 +666,7 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 		particleVolume,
 		bondRestLength,
 		bondStiffness,
+		fractureBonds,
 		material,
 		gravity: { x: gravity.x, y: gravity.y },
 		domainWidth,
@@ -660,6 +699,17 @@ function validateParticles(
 			assertFiniteNumber(value.volume, `particles[${index}].volume`);
 			if (value.volume <= 0) {
 				throw new RangeError(`particles[${index}].volume must be greater than zero`);
+			}
+		}
+		if (value.damage !== undefined) {
+			assertFiniteNumber(value.damage, `particles[${index}].damage`);
+			if (value.damage < 0 || value.damage > 1) {
+				throw new RangeError(`particles[${index}].damage must be between zero and one`);
+			}
+			if (particleMaterial(particle, config.material).model !== 'neo-hookean') {
+				throw new RangeError(
+					`particles[${index}].damage is only valid for neo-hookean solids`
+				);
 			}
 		}
 		if (value.plasticVolume !== undefined) {
@@ -1465,7 +1515,8 @@ function resolveParticleState(
 function constitutiveStressTimesFt(
 	F: MpmMatrix2,
 	plasticVolume: number,
-	material: MpmMaterialParameters
+	material: MpmMaterialParameters,
+	damage = 0
 ): MpmMatrix2 {
 	if (material.model === 'water' || material.model === 'oil') {
 		const pressure = material.lambda * Math.min(determinant(F) - 1, 0);
@@ -1511,7 +1562,17 @@ function constitutiveStressTimesFt(
 		return granularStressTimesFt(F, material);
 	}
 	const firstPiola = neoHookeanFirstPiola(F, material);
-	return multiplyMatrices(firstPiola, transposeMatrix(F));
+	return scaleMatrix(
+		multiplyMatrices(firstPiola, transposeMatrix(F)),
+		Math.max(0, 1 - damage)
+	);
+}
+
+function validateSolidBondArray(value: unknown): readonly MpmSolidBond[] {
+	if (!Array.isArray(value)) {
+		throw new TypeError('fractureBonds must be an array');
+	}
+	return value as readonly MpmSolidBond[];
 }
 
 function granularStressTimesFt(

@@ -1,4 +1,9 @@
-import type { MpmMaterialParameters, MpmParticle, MpmVector2 } from '../reference/solver.js';
+import type {
+	MpmMaterialParameters,
+	MpmParticle,
+	MpmSolidBond,
+	MpmVector2
+} from '../reference/solver.js';
 
 export const GATE4_GRID = { cellsX: 220, cellsY: 150, cellSize: 10 } as const;
 export const GATE4_PARTICLE_CAPACITY = 1_000_000;
@@ -7,6 +12,17 @@ export const GATE4_PEBBLE_COUNT = 200;
 export const GATE4_PEBBLE_PARTICLES_PER_OBJECT = 3;
 export const GATE4_PEBBLE_PARTICLE_COUNT =
 	GATE4_PEBBLE_COUNT * GATE4_PEBBLE_PARTICLES_PER_OBJECT;
+export const GATE4_FRACTURE_COLUMNS = 12;
+export const GATE4_FRACTURE_ROWS = 8;
+export const GATE4_FRACTURE_SPACING = 9;
+export const GATE4_FRACTURE_PARTICLE_COUNT =
+	GATE4_FRACTURE_COLUMNS * GATE4_FRACTURE_ROWS;
+export const GATE4_FRACTURE_BOND_COUNT =
+	(GATE4_FRACTURE_COLUMNS - 1) * GATE4_FRACTURE_ROWS +
+	(GATE4_FRACTURE_ROWS - 1) * GATE4_FRACTURE_COLUMNS +
+	(GATE4_FRACTURE_COLUMNS - 1) * (GATE4_FRACTURE_ROWS - 1);
+export const GATE4_FRACTURE_OBJECT_ID = 3 + GATE4_PEBBLE_COUNT;
+export const GATE4_FRACTURE_FAILURE_STRAIN = 0.12;
 export const GATE4_PEBBLE_COLUMNS = 14;
 export const GATE4_PEBBLE_ROWS = 15;
 export const GATE4_PEBBLE_SPACING = 68;
@@ -20,11 +36,13 @@ export const GATE4_PEBBLE_EDGE_LENGTH =
 	GATE4_GRID.cellSize *
 	PEBBLE_BASE_WIDTH_RATIO *
 	PEBBLE_SIZE_MULTIPLIER;
-export const GATE4_PARTICLE_COUNT = 14_000 + GATE4_PEBBLE_PARTICLE_COUNT;
+export const GATE4_PARTICLE_COUNT =
+	14_000 + GATE4_PEBBLE_PARTICLE_COUNT + GATE4_FRACTURE_PARTICLE_COUNT;
 
 const PARTICLE_SPACING = 9;
 const PEBBLE_CENTER: MpmVector2 = { x: 1_520, y: 750 };
 const PEBBLE_FIRST_OBJECT_ID = 3;
+const FRACTURE_CENTER: MpmVector2 = { x: 1_520, y: 1_380 };
 const PEBBLE_MATERIAL = {
 	lambda: 20,
 	mu: 10,
@@ -106,6 +124,7 @@ function createRandomVelocity(random: () => number, componentMax: number): MpmVe
 export interface MpmGate4Scene {
 	readonly particles: readonly MpmParticle[];
 	readonly parityProbeIndices: readonly number[];
+	readonly fractureBonds: readonly MpmSolidBond[];
 }
 
 export interface MpmCpuParitySample {
@@ -191,11 +210,70 @@ export function createMpmGate4Scene(
 		}
 	}
 
+	const fractureStart = particles.length;
+	const fractureVelocity = createRandomVelocity(random, 10);
+	for (let row = 0; row < GATE4_FRACTURE_ROWS; row += 1) {
+		for (let column = 0; column < GATE4_FRACTURE_COLUMNS; column += 1) {
+			const centeredColumn = column - (GATE4_FRACTURE_COLUMNS - 1) / 2;
+			const centeredRow = row - (GATE4_FRACTURE_ROWS - 1) / 2;
+			particles.push({
+				position: {
+					x: FRACTURE_CENTER.x + centeredColumn * GATE4_FRACTURE_SPACING,
+					y: FRACTURE_CENTER.y + centeredRow * GATE4_FRACTURE_SPACING
+				},
+				velocity: fractureVelocity,
+				C: ZERO_MATRIX,
+				F: INITIAL_DEFORMATION,
+				objectId: GATE4_FRACTURE_OBJECT_ID,
+				plasticVolume: 1,
+				material: PEBBLE_MATERIAL
+			});
+		}
+	}
+	const fractureBonds: MpmSolidBond[] = [];
+	const fractureIndex = (row: number, column: number) =>
+		fractureStart + row * GATE4_FRACTURE_COLUMNS + column;
+	for (let row = 0; row < GATE4_FRACTURE_ROWS; row += 1) {
+		for (let column = 0; column < GATE4_FRACTURE_COLUMNS; column += 1) {
+			const firstParticle = fractureIndex(row, column);
+			if (column + 1 < GATE4_FRACTURE_COLUMNS) {
+				fractureBonds.push({
+					firstParticle,
+					secondParticle: firstParticle + 1,
+					restLength: GATE4_FRACTURE_SPACING,
+					failureStrain: GATE4_FRACTURE_FAILURE_STRAIN
+				});
+			}
+			if (row + 1 < GATE4_FRACTURE_ROWS) {
+				fractureBonds.push({
+					firstParticle,
+					secondParticle: firstParticle + GATE4_FRACTURE_COLUMNS,
+					restLength: GATE4_FRACTURE_SPACING,
+					failureStrain: GATE4_FRACTURE_FAILURE_STRAIN
+				});
+			}
+			if (
+				row + 1 < GATE4_FRACTURE_ROWS &&
+				column + 1 < GATE4_FRACTURE_COLUMNS
+			) {
+				fractureBonds.push({
+					firstParticle,
+					secondParticle: firstParticle + GATE4_FRACTURE_COLUMNS + 1,
+					restLength: GATE4_FRACTURE_SPACING * Math.SQRT2,
+					failureStrain: GATE4_FRACTURE_FAILURE_STRAIN
+				});
+			}
+		}
+	}
+
+	if (fractureBonds.length !== GATE4_FRACTURE_BOND_COUNT) {
+		throw new Error(`Gate 4 fracture body must contain ${GATE4_FRACTURE_BOND_COUNT} bonds.`);
+	}
 	if (particles.length !== GATE4_PARTICLE_COUNT) {
 		throw new Error(`Gate 4 scene must contain ${GATE4_PARTICLE_COUNT} particles.`);
 	}
 
-	return { particles, parityProbeIndices };
+	return { particles, parityProbeIndices, fractureBonds };
 }
 
 export function createMpmCpuParitySample(
@@ -216,7 +294,7 @@ export function createMpmCpuParitySample(
 		}
 		return particles[index];
 	});
-	const interactionRadius = gridCellSize * 3;
+	const interactionRadius = gridCellSize * 7;
 	const sourceIndices = new Set<number>();
 	for (let index = 0; index < particles.length; index += 1) {
 		const particle = particles[index];

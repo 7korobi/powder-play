@@ -43,6 +43,14 @@ struct TriangleDistanceSample {
 	valid: u32,
 }
 
+struct SolidBond {
+	endpoints: vec2<u32>,
+	restLength: f32,
+	failureStrain: f32,
+	damage: f32,
+	broken: u32,
+}
+
 struct SimulationParams {
 	grid: vec4<u32>,
 	counts: vec4<u32>,
@@ -50,6 +58,8 @@ struct SimulationParams {
 	material: vec4<f32>,
 	gravityAndDomain: vec4<f32>,
 	bonding: vec4<f32>,
+	cflBounds: vec4<f32>,
+	fracture: vec4<u32>,
 }
 
 struct InteractionParams {
@@ -66,6 +76,10 @@ struct CloneParams {
 	rangeAndObjectId: vec4<u32>,
 	offsetAndDomain: vec4<f32>,
 	bondRangeAndCapacity: vec4<u32>,
+}
+
+struct OutletParams {
+	bounds: vec4<f32>,
 }
 
 const WALL_CUSHION_CELLS: f32 = 8.0;
@@ -88,6 +102,14 @@ const WALL_CUSHION_CELLS: f32 = 8.0;
 @group(0) @binding(15) var<storage, read_write> surfaceFields: array<vec2<f32>>;
 @group(0) @binding(16) var<storage, read_write> triangleFieldNodes: array<TriangleFieldNode>;
 @group(0) @binding(17) var<storage, read_write> bondedBodyStarts: array<u32>;
+@group(0) @binding(18) var<storage, read_write> cflSpeedPartials: array<f32>;
+@group(0) @binding(19) var<storage, read_write> cflMaximumSpeed: array<f32>;
+@group(0) @binding(20) var<storage, read_write> fractureBonds: array<SolidBond>;
+@group(0) @binding(21) var<storage, read> fractureBondTopology: array<u32>;
+@group(0) @binding(22) var<uniform> outletParams: OutletParams;
+@group(0) @binding(23) var<storage, read_write> outletRemovalCounter: array<atomic<u32>>;
+
+var<workgroup> cflSpeedReduction: array<f32, 64>;
 
 const ERROR_STENCIL: u32 = 1u;
 const ERROR_DEFORMATION: u32 = 2u;
@@ -102,6 +124,8 @@ const ERROR_P2G_NONFINITE_ACCUMULATION: u32 = 1024u;
 const ERROR_P2G_NONFINITE_NODE: u32 = 2048u;
 const ERROR_TRIANGLE_CONTACT: u32 = 4096u;
 const ERROR_TRIANGLE_BOND: u32 = 8192u;
+const ERROR_CFL_BOUND: u32 = 16384u;
+const ERROR_FRACTURE_BOND: u32 = 32768u;
 const BONDED_TRIANGLE_SOLVER_ITERATIONS: u32 = 2u;
 const TRIANGLE_CONTACT_SKIN_CELLS: f32 = 0.1;
 const SURFACE_ERROR_BUCKET: u32 = 1u;
@@ -112,6 +136,7 @@ const MODEL_SNOW: u32 = 1u;
 const MODEL_WATER: u32 = 2u;
 const MODEL_OIL: u32 = 3u;
 const MODEL_POWDER: u32 = 4u;
+const MODEL_REMOVED: u32 = 0xffffffffu;
 const SNOW_COMPRESSION_YIELD: f32 = 0.025;
 const SNOW_STRETCH_YIELD: f32 = 0.0075;
 const SNOW_HARDENING: f32 = 10.0;
@@ -173,13 +198,88 @@ fn finiteVec4(value: vec4<f32>) -> bool {
 		finiteFloat(value.w);
 }
 
+fn determinant2x2(matrix: vec4<f32>) -> f32 {
+	let secondProduct = matrix.y * matrix.z;
+	// Keep the product residual when the determinant terms nearly cancel.
+	let secondProductError = fma(matrix.y, matrix.z, -secondProduct);
+	return fma(matrix.x, matrix.w, -secondProduct) - secondProductError;
+}
+
+fn particleWaveSpeedBound(particle: Particle) -> f32 {
+	if (
+		particle.materialModel == MODEL_WATER ||
+		particle.materialModel == MODEL_OIL
+	) {
+		if (
+			!finiteFloat(particle.lambda) ||
+			!finiteFloat(particle.density) ||
+			particle.lambda <= 0.0 ||
+			particle.density <= 0.0
+		) {
+			return 3.402823466e38;
+		}
+		return sqrt(particle.lambda / particle.density);
+	}
+	if (particle.materialModel != MODEL_NEO_HOOKEAN) {
+		return 3.402823466e38;
+	}
+	if (!finiteFloat(particle.frictionCoefficient)) {
+		return 3.402823466e38;
+	}
+	let remainingStrength = 1.0 - clamp(particle.frictionCoefficient, 0.0, 1.0);
+	if (remainingStrength <= 0.0) {
+		return 0.0;
+	}
+	let lambda = particle.lambda * remainingStrength;
+	let mu = particle.mu * remainingStrength;
+
+	let determinant = determinant2x2(particle.f);
+	let deformationTrace =
+		particle.f.x * particle.f.x +
+		particle.f.y * particle.f.y +
+		particle.f.z * particle.f.z +
+		particle.f.w * particle.f.w;
+	if (
+		!finiteFloat(determinant) ||
+		determinant <= 0.0 ||
+		!finiteFloat(deformationTrace) ||
+		!finiteFloat(lambda) ||
+		!finiteFloat(mu) ||
+		mu < 0.0
+	) {
+		return 3.402823466e38;
+	}
+	let discriminant = sqrt(max(
+		0.0,
+		deformationTrace * deformationTrace -
+			4.0 * determinant * determinant,
+	));
+	let maximumStretchSquared = 0.5 * (deformationTrace + discriminant);
+	let volumetricTangent = abs(
+		lambda + mu - lambda * log(determinant),
+	);
+	let referenceDensity = params.physical.y / particle.volume;
+	let waveSpeedSquared =
+		(mu * maximumStretchSquared + volumetricTangent) /
+		referenceDensity;
+	if (
+		!finiteFloat(referenceDensity) ||
+		referenceDensity <= 0.0 ||
+		!finiteFloat(waveSpeedSquared) ||
+		waveSpeedSquared < 0.0
+	) {
+		return 3.402823466e38;
+	}
+	return sqrt(waveSpeedSquared);
+}
+
 fn decompose2x2(matrix: vec4<f32>) -> Decomposition2 {
 	let c00 = matrix.x * matrix.x + matrix.z * matrix.z;
 	let c01 = matrix.x * matrix.y + matrix.z * matrix.w;
 	let c11 = matrix.y * matrix.y + matrix.w * matrix.w;
 	let radius = sqrt((c00 - c11) * (c00 - c11) + 4.0 * c01 * c01);
 	let sigma0 = sqrt(max(0.0, 0.5 * (c00 + c11 + radius)));
-	let determinant = matrix.x * matrix.w - matrix.y * matrix.z;
+	let determinant = determinant2x2(matrix);
 	let sigma1 = determinant / max(sigma0, 1.0e-30);
 	let angle = 0.5 * atan2(2.0 * c01, c00 - c11);
 	let cosine = cos(angle);
@@ -298,7 +398,7 @@ fn projectLiquidDeformation(matrix: vec4<f32>) -> vec4<f32> {
 	let normalizedRotation = rotationNumerator / rotationScale;
 	let rotationLength = length(normalizedRotation);
 	let rotation = normalizedRotation / rotationLength;
-	let volume = matrix.x * matrix.w - matrix.y * matrix.z;
+	let volume = determinant2x2(matrix);
 	let boundedVolume = clamp(
 		volume,
 		MIN_LIQUID_DETERMINANT,
@@ -462,6 +562,9 @@ fn buildBuckets(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	}
 
 	let particle = particlesIn[particleIndex];
+	if (particle.materialModel == MODEL_REMOVED) {
+		return;
+	}
 	let gridPosition = particle.position / params.physical.x;
 	if (!finiteVec2(gridPosition)) {
 		atomicOr(&stateError[0], ERROR_STENCIL);
@@ -557,7 +660,7 @@ fn gatherSurfaceOccupancy(@builtin(global_invocation_id) invocation: vec3<u32>) 
 				return;
 			}
 
-			let determinant = particle.f.x * particle.f.w - particle.f.y * particle.f.z;
+			let determinant = determinant2x2(particle.f);
 			let currentArea = particle.volume * determinant;
 			let normalizedArea = currentArea * weight /
 				(params.physical.x * params.physical.x);
@@ -605,8 +708,12 @@ fn prepareParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		return;
 	}
 	let particle = particlesIn[particleIndex];
+	if (particle.materialModel == MODEL_REMOVED) {
+		preparedAffines[particleIndex] = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+		return;
+	}
 
-		let determinant = particle.f.x * particle.f.w - particle.f.y * particle.f.z;
+		let determinant = determinant2x2(particle.f);
 		if (
 			!finiteFloat(determinant) ||
 			determinant <= 0.0 ||
@@ -618,6 +725,15 @@ fn prepareParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		}
 		var stressTimesFt = vec4<f32>(0.0, 0.0, 0.0, 0.0);
 		if (particle.materialModel == MODEL_NEO_HOOKEAN) {
+			if (
+				!finiteFloat(particle.frictionCoefficient) ||
+				particle.frictionCoefficient < 0.0 ||
+				particle.frictionCoefficient > 1.0
+			) {
+				atomicMin(&stateError[1], particleIndex);
+				atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_INVALID_MATERIAL);
+				return;
+			}
 			let inverseTranspose =
 				vec4<f32>(particle.f.w, -particle.f.z, -particle.f.y, particle.f.x) /
 				determinant;
@@ -631,6 +747,8 @@ fn prepareParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 				firstPiola.z * particle.f.x + firstPiola.w * particle.f.y,
 				firstPiola.z * particle.f.z + firstPiola.w * particle.f.w,
 			);
+			stressTimesFt =
+				stressTimesFt * (1.0 - clamp(particle.frictionCoefficient, 0.0, 1.0));
 		} else if (particle.materialModel == MODEL_SNOW) {
 			if (
 				!finiteFloat(particle.plasticVolume) ||
@@ -821,12 +939,12 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		let weightedMass = weight * particleMass;
 		let weightedMomentum = weight * particleMomentum;
 		if (particle.materialModel == MODEL_WATER) {
-			let determinant = particle.f.x * particle.f.w - particle.f.y * particle.f.z;
+			let determinant = determinant2x2(particle.f);
 			waterMass = waterMass + weightedMass;
 			waterMomentum = waterMomentum + weightedMomentum;
 			waterVolume = waterVolume + weight * particle.volume * determinant;
 		} else if (particle.materialModel == MODEL_OIL) {
-			let determinant = particle.f.x * particle.f.w - particle.f.y * particle.f.z;
+			let determinant = determinant2x2(particle.f);
 			oilMass = oilMass + weightedMass;
 			oilMomentum = oilMomentum + weightedMomentum;
 			oilVolume = oilVolume + weight * particle.volume * determinant;
@@ -938,11 +1056,12 @@ fn integrateDeformation(
 	);
 	var result = deformation;
 	for (var step = 0u; step < substeps; step += 1u) {
+		// Preserve low-order terms in each matrix dot product near singularity.
 		result = vec4<f32>(
-			update.x * result.x + update.y * result.z,
-			update.x * result.y + update.y * result.w,
-			update.z * result.x + update.w * result.z,
-			update.z * result.y + update.w * result.w,
+			fma(update.x, result.x, update.y * result.z),
+			fma(update.x, result.y, update.y * result.w),
+			fma(update.z, result.x, update.w * result.z),
+			fma(update.z, result.y, update.w * result.w),
 		);
 	}
 	return result;
@@ -1143,10 +1262,6 @@ fn finishGridVelocity(
 				displacement * interactionParams.targetAndRadius.w -
 				velocity * interactionParams.force.x;
 			velocity = velocity + params.physical.w * falloff * acceleration;
-			let speed = length(velocity);
-			if (speed > 1200.0) {
-				velocity = velocity * (1200.0 / speed);
-			}
 		}
 	}
 	return velocity;
@@ -1335,6 +1450,10 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		return;
 	}
 	let particle = particlesIn[particleIndex];
+	if (particle.materialModel == MODEL_REMOVED) {
+		particlesOut[particleIndex] = particle;
+		return;
+	}
 	if (atomicLoad(&stateError[0]) != 0u) {
 		particlesOut[particleIndex] = particle;
 		return;
@@ -1416,7 +1535,7 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	}
 
 	if (isLiquidParticle) {
-		let particleDeterminant = particle.f.x * particle.f.w - particle.f.y * particle.f.z;
+		let particleDeterminant = determinant2x2(particle.f);
 		if (
 			!finiteFloat(phaseMass) ||
 			phaseMass <= 0.0 ||
@@ -1473,21 +1592,38 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		atomicOr(&stateError[0], ERROR_DEFORMATION_SUBSTEP_LIMIT);
 		return;
 	}
-	let substeps = max(1u, u32(requiredSubsteps));
-	let trialF = integrateDeformation(particle.f, updatedC, dt, substeps);
-	var updatedF = trialF;
-	var updatedPlasticVolume = particle.plasticVolume;
-	let trialDeterminant = trialF.x * trialF.w - trialF.y * trialF.z;
+	var substeps = max(1u, u32(requiredSubsteps));
+	let maximumSubsteps = u32(MAX_DEFORMATION_SUBSTEPS);
+	var trialF = integrateDeformation(particle.f, updatedC, dt, substeps);
 	if (!finiteVec4(trialF)) {
 		atomicOr(&stateError[0], ERROR_G2P);
 		return;
 	}
+	var trialDeterminant = determinant2x2(trialF);
+	// A near-singular F can lose its orientation to float32 rounding even
+	// though each bounded update has positive determinant. Retry only that
+	// update with finer substeps, and never accept a non-positive trial.
+	while (
+		finiteFloat(trialDeterminant) &&
+		trialDeterminant <= 0.0 &&
+		substeps < maximumSubsteps
+	) {
+		substeps = min(substeps * 2u, maximumSubsteps);
+		trialF = integrateDeformation(particle.f, updatedC, dt, substeps);
+		if (!finiteVec4(trialF)) {
+			atomicOr(&stateError[0], ERROR_G2P);
+			return;
+		}
+		trialDeterminant = determinant2x2(trialF);
+	}
+	var updatedF = trialF;
+	var updatedPlasticVolume = particle.plasticVolume;
 	if (!finiteFloat(trialDeterminant) || trialDeterminant <= 0.0) {
 		recordDeformationFailure(
 			particleIndex,
 			trialDeterminant,
 			deformationIncrement,
-			particle.f.x * particle.f.w - particle.f.y * particle.f.z,
+			determinant2x2(particle.f),
 		);
 		atomicOr(&stateError[0], ERROR_DEFORMATION);
 		return;
@@ -1545,7 +1681,7 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		atomicOr(&stateError[0], ERROR_G2P);
 		return;
 	}
-	let updatedDeterminant = updatedF.x * updatedF.w - updatedF.y * updatedF.z;
+	let updatedDeterminant = determinant2x2(updatedF);
 	if (
 		!finiteVec4(updatedF) ||
 		!finiteFloat(updatedPlasticVolume) ||
@@ -1598,6 +1734,107 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	updatedParticle.f = updatedF;
 	updatedParticle.plasticVolume = updatedPlasticVolume;
 	particlesOut[particleIndex] = updatedParticle;
+}
+
+@compute @workgroup_size(64)
+fn validateCflParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let particleIndex = invocation.x;
+	if (
+		particleIndex >= params.counts.x ||
+		params.cflBounds.z < 0.5 ||
+		atomicLoad(&stateError[0]) != 0u
+	) {
+		return;
+	}
+
+	let particle = particlesIn[particleIndex];
+	if (particle.materialModel == MODEL_REMOVED) {
+		return;
+	}
+	let speed = length(particle.velocity);
+	let waveSpeed = particleWaveSpeedBound(particle);
+	if (
+		!finiteVec2(particle.velocity) ||
+		!finiteFloat(speed) ||
+		!finiteFloat(waveSpeed) ||
+		speed > params.cflBounds.y ||
+		waveSpeed > params.cflBounds.x
+	) {
+		atomicMin(&stateError[1], particleIndex);
+		atomicOr(&stateError[0], ERROR_CFL_BOUND);
+	}
+}
+
+@compute @workgroup_size(64)
+fn measureParticleSpeedPartials(
+	@builtin(workgroup_id) workgroup: vec3<u32>,
+	@builtin(local_invocation_id) local: vec3<u32>,
+) {
+	let particleIndex = workgroup.x * 64u + local.x;
+	var maximumSpeed = 0.0;
+	if (particleIndex < params.counts.x) {
+		let particle = particlesIn[particleIndex];
+		if (particle.materialModel != MODEL_REMOVED) {
+			let speed = length(particle.velocity);
+			maximumSpeed = select(3.402823466e38, speed, finiteFloat(speed));
+		}
+	}
+	cflSpeedReduction[local.x] = maximumSpeed;
+	workgroupBarrier();
+
+	var stride = 32u;
+	loop {
+		if (stride == 0u) {
+			break;
+		}
+		if (local.x < stride) {
+			cflSpeedReduction[local.x] = max(
+				cflSpeedReduction[local.x],
+				cflSpeedReduction[local.x + stride],
+			);
+		}
+		workgroupBarrier();
+		stride = stride / 2u;
+	}
+	if (local.x == 0u) {
+		cflSpeedPartials[workgroup.x] = cflSpeedReduction[0];
+	}
+}
+
+@compute @workgroup_size(64)
+fn reduceParticleSpeedPartials(
+	@builtin(local_invocation_id) local: vec3<u32>,
+) {
+	let partialCount = (params.counts.x + 63u) / 64u;
+	var maximumSpeed = 0.0;
+	var partialIndex = local.x;
+	loop {
+		if (partialIndex >= partialCount) {
+			break;
+		}
+		maximumSpeed = max(maximumSpeed, cflSpeedPartials[partialIndex]);
+		partialIndex = partialIndex + 64u;
+	}
+	cflSpeedReduction[local.x] = maximumSpeed;
+	workgroupBarrier();
+
+	var stride = 32u;
+	loop {
+		if (stride == 0u) {
+			break;
+		}
+		if (local.x < stride) {
+			cflSpeedReduction[local.x] = max(
+				cflSpeedReduction[local.x],
+				cflSpeedReduction[local.x + stride],
+			);
+		}
+		workgroupBarrier();
+		stride = stride / 2u;
+	}
+	if (local.x == 0u) {
+		cflMaximumSpeed[0] = cflSpeedReduction[0];
+	}
 }
 
 @compute @workgroup_size(64)
@@ -1690,17 +1927,22 @@ fn solveBondedTriangles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	let originalFirst = first.position;
 	let originalSecond = second.position;
 	let originalThird = third.position;
-	var firstPosition = originalFirst;
-	var secondPosition = originalSecond;
-	var thirdPosition = originalThird;
+	let originalOffsets = array<vec2<f32>, 3>(
+		vec2<f32>(0.0, 0.0),
+		originalSecond - originalFirst,
+		originalThird - originalFirst,
+	);
+	var firstOffset = originalOffsets[0];
+	var secondOffset = originalOffsets[1];
+	var thirdOffset = originalOffsets[2];
 	for (
 		var iteration = 0u;
 		iteration < BONDED_TRIANGLE_SOLVER_ITERATIONS;
 		iteration += 1u
 	) {
 		let firstEdge = bondEdgeCorrection(
-			firstPosition,
-			secondPosition,
+			firstOffset,
+			secondOffset,
 			params.bonding.x,
 			params.bonding.y,
 		);
@@ -1709,12 +1951,12 @@ fn solveBondedTriangles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
 			return;
 		}
-		firstPosition += firstEdge.xy;
-		secondPosition -= firstEdge.xy;
+		firstOffset += firstEdge.xy;
+		secondOffset -= firstEdge.xy;
 
 		let secondEdge = bondEdgeCorrection(
-			secondPosition,
-			thirdPosition,
+			secondOffset,
+			thirdOffset,
 			params.bonding.x,
 			params.bonding.y,
 		);
@@ -1723,12 +1965,12 @@ fn solveBondedTriangles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
 			return;
 		}
-		secondPosition += secondEdge.xy;
-		thirdPosition -= secondEdge.xy;
+		secondOffset += secondEdge.xy;
+		thirdOffset -= secondEdge.xy;
 
 		let thirdEdge = bondEdgeCorrection(
-			thirdPosition,
-			firstPosition,
+			thirdOffset,
+			firstOffset,
 			params.bonding.x,
 			params.bonding.y,
 		);
@@ -1737,15 +1979,15 @@ fn solveBondedTriangles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
 			return;
 		}
-		thirdPosition += thirdEdge.xy;
-		firstPosition -= thirdEdge.xy;
+		thirdOffset += thirdEdge.xy;
+		firstOffset -= thirdEdge.xy;
 	}
 
 	let inverseDt = 1.0 / params.physical.w;
-	let bondedPositions = array<vec2<f32>, 3>(
-		firstPosition,
-		secondPosition,
-		thirdPosition,
+	let bondedOffsets = array<vec2<f32>, 3>(
+		firstOffset,
+		secondOffset,
+		thirdOffset,
 	);
 	let originalPositions = array<vec2<f32>, 3>(
 		originalFirst,
@@ -1754,10 +1996,11 @@ fn solveBondedTriangles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	);
 	var particles = array<Particle, 3>(first, second, third);
 	for (var vertex = 0u; vertex < 3u; vertex += 1u) {
-		let position = bondedPositions[vertex];
+		let displacement = bondedOffsets[vertex] - originalOffsets[vertex];
+		let position = originalPositions[vertex] + displacement;
 		let velocity =
 			particles[vertex].velocity +
-			(position - originalPositions[vertex]) * inverseDt;
+			displacement * inverseDt;
 		let boundedX = confineAxis(
 			position.x,
 			velocity.x,
@@ -1871,6 +2114,116 @@ fn solveBondedTriangles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 }
 
 @compute @workgroup_size(64)
+fn updateFractureBonds(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let bondIndex = invocation.x;
+	if (
+		bondIndex >= params.fracture.y ||
+		atomicLoad(&stateError[0]) != 0u
+	) {
+		return;
+	}
+	var bond = fractureBonds[bondIndex];
+	let firstParticle = bond.endpoints.x;
+	let secondParticle = bond.endpoints.y;
+	if (
+		firstParticle >= params.fracture.x ||
+		secondParticle >= params.fracture.x ||
+		firstParticle >= params.counts.x ||
+		secondParticle >= params.counts.x ||
+		!finiteFloat(bond.restLength) ||
+		bond.restLength <= 0.0 ||
+		!finiteFloat(bond.failureStrain) ||
+		bond.failureStrain <= 0.0
+	) {
+		atomicMin(&stateError[1], min(firstParticle, secondParticle));
+		atomicOr(&stateError[0], ERROR_FRACTURE_BOND);
+		return;
+	}
+	if (bond.broken != 0u) {
+		bond.damage = 1.0;
+		fractureBonds[bondIndex] = bond;
+		return;
+	}
+	let separation =
+		particlesOut[secondParticle].position - particlesOut[firstParticle].position;
+	let distance = length(separation);
+	if (!finiteFloat(distance)) {
+		atomicMin(&stateError[1], firstParticle);
+		atomicOr(&stateError[0], ERROR_FRACTURE_BOND);
+		return;
+	}
+	let tensileStrain = max(0.0, (distance - bond.restLength) / bond.restLength);
+	bond.damage = max(bond.damage, min(1.0, tensileStrain / bond.failureStrain));
+	if (tensileStrain >= bond.failureStrain) {
+		bond.damage = 1.0;
+		bond.broken = 1u;
+	}
+	fractureBonds[bondIndex] = bond;
+}
+
+@compute @workgroup_size(64)
+fn applyFractureParticleDamage(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let particleIndex = invocation.x;
+	if (
+		particleIndex >= params.fracture.x ||
+		particleIndex >= params.counts.x ||
+		atomicLoad(&stateError[0]) != 0u
+	) {
+		return;
+	}
+	let firstOffset = fractureBondTopology[particleIndex];
+	let nextOffset = fractureBondTopology[particleIndex + 1u];
+	if (nextOffset < firstOffset || nextOffset > params.fracture.z) {
+		atomicMin(&stateError[1], particleIndex);
+		atomicOr(&stateError[0], ERROR_FRACTURE_BOND);
+		return;
+	}
+	var particle = particlesOut[particleIndex];
+	if (particle.materialModel != MODEL_NEO_HOOKEAN) {
+		return;
+	}
+	var damage = clamp(particle.frictionCoefficient, 0.0, 1.0);
+	let incidenceBase = params.fracture.x + 1u;
+	for (var incidence = firstOffset; incidence < nextOffset; incidence = incidence + 1u) {
+		let bondIndex = fractureBondTopology[incidenceBase + incidence];
+		if (bondIndex >= params.fracture.y) {
+			atomicMin(&stateError[1], particleIndex);
+			atomicOr(&stateError[0], ERROR_FRACTURE_BOND);
+			return;
+		}
+		damage = max(damage, fractureBonds[bondIndex].damage);
+	}
+	particle.frictionCoefficient = damage;
+	particlesOut[particleIndex] = particle;
+}
+
+@compute @workgroup_size(64)
+fn removeParticlesInOutlet(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let particleIndex = invocation.x;
+	if (particleIndex >= params.counts.x) {
+		return;
+	}
+	var particle = particlesIn[particleIndex];
+	if (particle.materialModel == MODEL_REMOVED) {
+		particlesOut[particleIndex] = particle;
+		return;
+	}
+	let position = particle.position;
+	let bounds = outletParams.bounds;
+	if (
+		(particle.materialModel == MODEL_WATER || particle.materialModel == MODEL_OIL) &&
+		position.x >= bounds.x &&
+		position.y >= bounds.y &&
+		position.x <= bounds.z &&
+		position.y <= bounds.w
+	) {
+		particle.materialModel = MODEL_REMOVED;
+		atomicAdd(&outletRemovalCounter[0], 1u);
+	}
+	particlesOut[particleIndex] = particle;
+}
+
+@compute @workgroup_size(64)
 fn commitParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	let particleIndex = invocation.x;
 	if (particleIndex >= params.counts.x) {
@@ -1890,6 +2243,9 @@ fn pickParticle() {
 	var closestDistance = radiusSquared;
 
 	for (var index = 0u; index < pickParams.countAndPadding.x; index = index + 1u) {
+		if (particlesIn[index].materialModel == MODEL_REMOVED) {
+			continue;
+		}
 		let position = particlesIn[index].position;
 		let offset = position - point;
 		let distanceSquared = dot(offset, offset);
@@ -1966,6 +2322,7 @@ const MODEL_SNOW: u32 = 1u;
 const MODEL_WATER: u32 = 2u;
 const MODEL_OIL: u32 = 3u;
 const MODEL_POWDER: u32 = 4u;
+const MODEL_REMOVED: u32 = 0xffffffffu;
 
 struct RenderParams {
 	domainAndRadius: vec4<f32>,
@@ -2002,6 +2359,13 @@ fn vertexMain(
 	);
 	let local = corners[vertexIndex];
 	let particle = particles[instanceIndex];
+	if (particle.materialModel == MODEL_REMOVED) {
+		var hidden: VertexOutput;
+		hidden.position = vec4<f32>(2.0, 2.0, 0.0, 1.0);
+		hidden.localPosition = local;
+		hidden.materialColor = vec3<f32>(0.0, 0.0, 0.0);
+		return hidden;
+	}
 	let isLiquid =
 		particle.materialModel == MODEL_WATER ||
 		particle.materialModel == MODEL_OIL;
@@ -2030,6 +2394,13 @@ fn vertexMain(
 		materialColor = vec3<f32>(0.95, 0.75, 0.22);
 	} else if (particle.materialModel == MODEL_POWDER) {
 		materialColor = vec3<f32>(0.72, 0.48, 0.3);
+	}
+	if (particle.materialModel == MODEL_NEO_HOOKEAN) {
+		materialColor = mix(
+			materialColor,
+			vec3<f32>(0.94, 0.16, 0.13),
+			clamp(particle.frictionCoefficient, 0.0, 1.0),
+		);
 	}
 	output.materialColor = materialColor;
 	return output;

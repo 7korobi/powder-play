@@ -14,6 +14,13 @@ import {
 	GATE4_PEBBLE_COLUMNS,
 	GATE4_PEBBLE_ROWS,
 	GATE4_PEBBLE_SPACING,
+	GATE4_FRACTURE_BOND_COUNT,
+	GATE4_FRACTURE_COLUMNS,
+	GATE4_FRACTURE_FAILURE_STRAIN,
+	GATE4_FRACTURE_OBJECT_ID,
+	GATE4_FRACTURE_PARTICLE_COUNT,
+	GATE4_FRACTURE_ROWS,
+	GATE4_FRACTURE_SPACING,
 	GATE4_PARTICLE_COUNT
 } from './gate4.js';
 import { stepMpm } from '../reference/solver.js';
@@ -22,8 +29,8 @@ describe('Gate 4 mixed-material sample scene', () => {
 	const sceneSeed = 0x4d504d34;
 	const scene = createMpmGate4Scene(sceneSeed);
 
-	it('creates two liquid regions and 200 contiguous three-particle elastic pebbles', () => {
-		expect(scene.particles).toHaveLength(14_600);
+	it('creates two liquid regions, 200 elastic pebbles, and one connected fracture solid', () => {
+		expect(scene.particles).toHaveLength(14_696);
 		expect(scene.particles).toHaveLength(GATE4_PARTICLE_COUNT);
 		expect(GATE4_PARTICLE_CAPACITY).toBe(1_000_000);
 		expect(GATE4_GRID).toEqual({ cellsX: 220, cellsY: 150, cellSize: 10 });
@@ -41,8 +48,26 @@ describe('Gate 4 mixed-material sample scene', () => {
 		expect(
 			scene.particles.slice(8_000, 14_000).every((particle) => particle.objectId === 2)
 		).toBe(true);
-		const pebbleParticles = scene.particles.slice(14_000);
+		const pebbleParticles = scene.particles.slice(14_000, 14_600);
 		expect(pebbleParticles).toHaveLength(GATE4_PEBBLE_PARTICLE_COUNT);
+		const fractureParticles = scene.particles.slice(14_600);
+		expect(fractureParticles).toHaveLength(GATE4_FRACTURE_PARTICLE_COUNT);
+		expect(fractureParticles.every((particle) => particle.objectId === GATE4_FRACTURE_OBJECT_ID)).toBe(true);
+		expect(fractureParticles.every((particle) => particle.bondedTriangleVertex === undefined)).toBe(true);
+		expect(GATE4_FRACTURE_BOND_COUNT).toBe(
+			GATE4_FRACTURE_ROWS * (GATE4_FRACTURE_COLUMNS - 1) +
+				(GATE4_FRACTURE_ROWS - 1) * GATE4_FRACTURE_COLUMNS +
+				(GATE4_FRACTURE_ROWS - 1) * (GATE4_FRACTURE_COLUMNS - 1)
+		);
+		expect(scene.fractureBonds).toHaveLength(GATE4_FRACTURE_BOND_COUNT);
+		expect(scene.fractureBonds.every((bond) => bond.failureStrain === GATE4_FRACTURE_FAILURE_STRAIN)).toBe(true);
+		expect(scene.fractureBonds.every((bond) =>
+			bond.firstParticle >= 14_600 &&
+			bond.secondParticle < GATE4_PARTICLE_COUNT
+		)).toBe(true);
+		expect(scene.fractureBonds.some((bond) =>
+			Math.abs(bond.restLength - GATE4_FRACTURE_SPACING * Math.SQRT2) < 1e-12
+		)).toBe(true);
 
 		const particlesPerObject = new Map<number, number>();
 		for (const particle of pebbleParticles) {
@@ -66,13 +91,22 @@ describe('Gate 4 mixed-material sample scene', () => {
 				if (model === 'water' || model === 'oil') {
 					counts[model] += 1;
 				} else if (model === 'neo-hookean') {
-					counts.elasticPebble += 1;
+					counts[
+						particle.objectId === GATE4_FRACTURE_OBJECT_ID
+							? 'fractureSolid'
+							: 'elasticPebble'
+					] += 1;
 				}
 				return counts;
 			},
-			{ water: 0, oil: 0, elasticPebble: 0 }
+			{ water: 0, oil: 0, elasticPebble: 0, fractureSolid: 0 }
 		);
-		expect(materialCounts).toEqual({ water: 8_000, oil: 6_000, elasticPebble: 600 });
+		expect(materialCounts).toEqual({
+			water: 8_000,
+			oil: 6_000,
+			elasticPebble: 600,
+			fractureSolid: GATE4_FRACTURE_PARTICLE_COUNT
+		});
 	});
 
 	it('spaces the initial particles farther apart without changing the particle count', () => {
@@ -109,7 +143,7 @@ describe('Gate 4 mixed-material sample scene', () => {
 				.some(({ velocity }) => velocity.x !== 0 || velocity.y !== 0)
 		).toBe(true);
 
-		const pebbleParticles = scene.particles.slice(14_000);
+		const pebbleParticles = scene.particles.slice(14_000, 14_600);
 		expect(
 			pebbleParticles.every(
 				({ velocity }) =>
@@ -143,6 +177,8 @@ describe('Gate 4 mixed-material sample scene', () => {
 			0
 		);
 		expect(Math.abs(angularMomentum)).toBeGreaterThan(1);
+		const fractureParticles = scene.particles.slice(14_600);
+		expect(new Set(fractureParticles.map(({ velocity }) => `${velocity.x},${velocity.y}`)).size).toBe(1);
 	});
 
 	it('rejects scene seeds outside the unsigned 32-bit range', () => {
@@ -176,7 +212,7 @@ describe('Gate 4 mixed-material sample scene', () => {
 		);
 		expect(GATE4_PEBBLE_SPACING).toBeGreaterThan(GATE4_PEBBLE_EDGE_LENGTH);
 
-		const pebbleParticles = scene.particles.slice(14_000);
+		const pebbleParticles = scene.particles.slice(14_000, 14_600);
 		const pebbleCenters = [];
 		for (let pebbleIndex = 0; pebbleIndex < GATE4_PEBBLE_COUNT; pebbleIndex += 1) {
 			const start = pebbleIndex * GATE4_PEBBLE_PARTICLES_PER_OBJECT;
@@ -272,8 +308,9 @@ describe('Gate 4 mixed-material sample scene', () => {
 						GATE4_GRID.cellsY * GATE4_GRID.cellSize - wallCushion
 			)
 		).toBe(true);
-		expect(sample.particles).toHaveLength(110);
-		expect(sample.sourceIndices).toHaveLength(110);
+		expect(sample.particles.length).toBeGreaterThan(110);
+		expect(sample.particles.length).toBeLessThan(scene.particles.length);
+		expect(sample.sourceIndices).toHaveLength(sample.particles.length);
 		expect(sample.probeSampleIndices).toHaveLength(3);
 		for (const sourceIndex of sample.sourceIndices) {
 			const vertex = scene.particles[sourceIndex].bondedTriangleVertex;
@@ -307,6 +344,54 @@ describe('Gate 4 mixed-material sample scene', () => {
 			expect(sampleStep[sample.probeSampleIndices[index]]).toEqual(
 				fullStep[scene.parityProbeIndices[index]]
 			);
+		}
+	});
+
+	it('preserves parity probes across three CFL microsteps', () => {
+		const config = {
+			dt: 1 / 720,
+			grid: GATE4_GRID,
+			particleMass: 1,
+			particleVolume: 25,
+			bondRestLength: GATE4_PEBBLE_EDGE_LENGTH,
+			material: { lambda: 20, mu: 10, model: 'neo-hookean' as const },
+			gravity: { x: 0, y: 90 }
+		};
+		const sample = createMpmCpuParitySample(
+			scene.particles,
+			scene.parityProbeIndices,
+			GATE4_GRID.cellSize
+		);
+		let fullParticles = scene.particles;
+		let sampleParticles = sample.particles;
+		for (let microstep = 0; microstep < 3; microstep += 1) {
+			fullParticles = stepMpm(fullParticles, config).particles;
+			sampleParticles = stepMpm(sampleParticles, config).particles;
+		}
+
+		const numericValues = (particle: (typeof fullParticles)[number]) => [
+			particle.position.x,
+			particle.position.y,
+			particle.velocity.x,
+			particle.velocity.y,
+			particle.C.m00,
+			particle.C.m01,
+			particle.C.m10,
+			particle.C.m11,
+			particle.F.m00,
+			particle.F.m01,
+			particle.F.m10,
+			particle.F.m11
+		];
+		for (let index = 0; index < scene.parityProbeIndices.length; index += 1) {
+			const fullValues = numericValues(fullParticles[scene.parityProbeIndices[index]]);
+			const sampleValues = numericValues(sampleParticles[sample.probeSampleIndices[index]]);
+			const maximumDifference = Math.max(
+				...fullValues.map((value, valueIndex) =>
+					Math.abs(value - sampleValues[valueIndex])
+				)
+			);
+			expect(maximumDifference).toBeLessThanOrEqual(1e-4);
 		}
 	});
 });

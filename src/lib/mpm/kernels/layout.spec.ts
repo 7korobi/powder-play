@@ -277,6 +277,57 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(new Float32Array(parameters, 32, 16)[12]).toBe(Math.fround(0.6));
 	});
 
+	it('packs persistent fracture bonds, per-particle damage, and CSR endpoint adjacency', () => {
+		const particles = [
+			makeParticle({
+				position: { x: 7, y: 4 },
+				objectId: 12,
+				damage: 0.4
+			}),
+			makeParticle({
+				position: { x: 8, y: 4 },
+				objectId: 12
+			})
+		];
+		const state = validateMpmMlsGpuInput(
+			particles,
+			makeConfig({
+				capacity: 6,
+				fractureBonds: [
+					{
+						firstParticle: 0,
+						secondParticle: 1,
+						restLength: 1,
+						failureStrain: 0.2,
+						damage: 1,
+						broken: true
+					}
+				]
+			})
+		);
+		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
+		const parameters = packMpmMlsGpuStepParameters(
+			state,
+			layout,
+			0.001,
+			{ x: 0, y: 0 }
+		);
+		const bondWords = new Uint32Array(state.packedFractureBonds);
+		const bondFloats = new Float32Array(state.packedFractureBonds);
+
+		expect(state.fractureBondCount).toBe(1);
+		expect(state.fractureBondIncidenceCount).toBe(2);
+		expect(state.fractureBondCountsByObjectId.get(12)).toBe(1);
+		expect(layout.fractureBondBufferBytes).toBe(24);
+		expect(layout.fractureBondTopologyBufferBytes).toBe(20);
+		expect(Array.from(bondWords.slice(0, 2))).toEqual([0, 1]);
+		expect(Array.from(bondFloats.slice(2, 5))).toEqual([1, Math.fround(0.2), 1]);
+		expect(bondWords[5]).toBe(1);
+		expect(state.packedParticles[18]).toBe(Math.fround(0.4));
+		expect(Array.from(state.packedFractureBondTopology)).toEqual([0, 1, 2, 0, 0]);
+		expect(Array.from(new Uint32Array(parameters, 112, 4))).toEqual([2, 1, 2, 0]);
+	});
+
 	it('rejects invalid physical parameters and particle states rather than repairing them', () => {
 		expect(() =>
 			validateMpmMlsGpuInput([], makeConfig({ grid: { cellsX: 0, cellsY: 8, cellSize: 1 } }))

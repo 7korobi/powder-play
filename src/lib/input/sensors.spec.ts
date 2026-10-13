@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
 	blendVector,
+	projectDeviceOrientationGravity,
 	screenAccelerationForce,
 	screenGravityFromAcceleration,
 	STANDARD_GRAVITY
@@ -32,6 +33,20 @@ describe('device motion mapping', () => {
 	it('uses near-zero gravity when the device has no in-plane gravity', () => {
 		expect(screenGravityFromAcceleration(0, 0, 0)).toEqual({ x: 0, y: 0 });
 		expect(screenGravityFromAcceleration(null, null, 0)).toEqual({ x: 0, y: 0 });
+	});
+
+	it('projects device tilt into a bounded 2D gravity vector without requiring screen rotation', () => {
+		expect(projectDeviceOrientationGravity(0, 0)).toEqual({ x: 0, y: 0 });
+		expect(projectDeviceOrientationGravity(0, 30).x).toBeCloseTo(0.5, 12);
+		expect(projectDeviceOrientationGravity(30, 0).y).toBeCloseTo(0.5, 12);
+		const steepTilt = projectDeviceOrientationGravity(90, 90);
+		expect(Math.hypot(steepTilt.x, steepTilt.y)).toBeCloseTo(1, 12);
+	});
+
+	it('handles invalid tilt samples and maps the projected vector to the current screen axes', () => {
+		expect(projectDeviceOrientationGravity(null, 20)).toEqual({ x: 0, y: 0 });
+		expect(projectDeviceOrientationGravity(Number.NaN, 20)).toEqual({ x: 0, y: 0 });
+		expect(projectDeviceOrientationGravity(0, 30, 90).y).toBeCloseTo(-0.5, 12);
 	});
 
 	it('maps linear acceleration into a bounded inertial force', () => {
