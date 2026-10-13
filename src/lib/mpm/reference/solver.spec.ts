@@ -75,6 +75,9 @@ describe('CPU MLS-MPM reference', () => {
 
 	it('rejects invalid or omitted step parameters and particle state', () => {
 		expect(() => stepMpm([], makeConfig({ dt: 0 }))).toThrow(/dt/);
+		expect(() => stepMpm([], makeConfig({ bondReferenceDt: 0 }))).toThrow(
+			/bondReferenceDt/
+		);
 		expect(() =>
 			stepMpm([], { ...makeConfig(), dt: undefined } as unknown as MpmStepConfig)
 		).toThrow(/dt/);
@@ -586,6 +589,161 @@ describe('CPU MLS-MPM reference', () => {
 		expect(result.particles.map(({ bondedTriangleVertex }) => bondedTriangleVertex)).toEqual([
 			0, 1, 2
 		]);
+	});
+
+	it('bounds velocity impulses across simultaneous bonded-triangle contacts', () => {
+		const makeTriangle = (
+			centerX: number,
+			velocity: { readonly x: number; readonly y: number },
+			objectId: number
+		): MpmParticle[] => {
+			const centerY = 8;
+			const topY = centerY - Math.sqrt(3) / 6;
+			const bottomY = centerY + Math.sqrt(3) / 3;
+			return [
+				makeParticle({
+					position: { x: centerX - 0.5, y: topY },
+					velocity,
+					objectId,
+					bondedTriangleVertex: 0
+				}),
+				makeParticle({
+					position: { x: centerX + 0.5, y: topY },
+					velocity,
+					objectId,
+					bondedTriangleVertex: 1
+				}),
+				makeParticle({
+					position: { x: centerX, y: bottomY },
+					velocity,
+					objectId,
+					bondedTriangleVertex: 2
+				})
+			];
+		};
+		const particles = [
+			...makeTriangle(7, { x: 2, y: 0 }, 4),
+			...makeTriangle(7.75, { x: 0, y: 0 }, 5),
+			...makeTriangle(8.5, { x: -2, y: 0 }, 6)
+		];
+		const result = stepMpm(
+			particles,
+			makeConfig({
+				dt: 0.001,
+				bondRestLength: 1,
+				gravity: { x: 0, y: 0 }
+			})
+		);
+		const inputKineticEnergy = particles.reduce(
+			(energy, { velocity }) =>
+				energy + 0.5 * 0.1 * (velocity.x ** 2 + velocity.y ** 2),
+			0
+		);
+		const outputKineticEnergy = result.particles.reduce(
+			(energy, { velocity }) =>
+				energy + 0.5 * 0.1 * (velocity.x ** 2 + velocity.y ** 2),
+			0
+		);
+
+		expect(outputKineticEnergy).toBeLessThanOrEqual(inputKineticEnergy + 1e-6);
+		expect(result.diagnostics.outputMomentum.x).toBeCloseTo(
+			result.diagnostics.inputMomentum.x,
+			8
+		);
+	});
+
+	it('does not translate stationary bonded triangles during pair contacts', () => {
+		const makeTriangle = (centerX: number, objectId: number): MpmParticle[] => {
+			const centerY = 8;
+			const topY = centerY - Math.sqrt(3) / 6;
+			const bottomY = centerY + Math.sqrt(3) / 3;
+			return [
+				makeParticle({
+					position: { x: centerX - 0.5, y: topY },
+					objectId,
+					bondedTriangleVertex: 0
+				}),
+				makeParticle({
+					position: { x: centerX + 0.5, y: topY },
+					objectId,
+					bondedTriangleVertex: 1
+				}),
+				makeParticle({
+					position: { x: centerX, y: bottomY },
+					objectId,
+					bondedTriangleVertex: 2
+				})
+			];
+		};
+		const particles = [...makeTriangle(7, 4), ...makeTriangle(7.75, 5)];
+		const result = stepMpm(
+			particles,
+			makeConfig({
+				dt: 0.001,
+				bondRestLength: 1,
+				gravity: { x: 0, y: 0 }
+			})
+		);
+
+		expect(result.particles.map(({ position }) => position)).toEqual(
+			particles.map(({ position }) => position)
+		);
+	});
+
+	it('scales bonded-triangle velocity corrections with CFL microstep duration', () => {
+		const particles: MpmParticle[] = [
+			makeParticle({
+				position: { x: 8, y: 8 },
+				objectId: 4,
+				bondedTriangleVertex: 0
+			}),
+			makeParticle({
+				position: { x: 10, y: 8 },
+				objectId: 4,
+				bondedTriangleVertex: 1
+			}),
+			makeParticle({
+				position: { x: 9, y: 9.5 },
+				objectId: 4,
+				bondedTriangleVertex: 2
+			})
+		];
+		const referenceDt = 0.001;
+		const config = {
+			bondRestLength: 1,
+			bondStiffness: 0.35,
+			bondReferenceDt: referenceDt,
+			gravity: { x: 0, y: 0 }
+		} as const;
+		const fullStep = stepMpm(
+			particles,
+			makeConfig({ ...config, dt: referenceDt })
+		);
+		const halfStep = stepMpm(
+			particles,
+			makeConfig({ ...config, dt: referenceDt / 2 })
+		);
+		const twoHalfSteps = stepMpm(
+			halfStep.particles,
+			makeConfig({ ...config, dt: referenceDt / 2 })
+		);
+
+		const fullStepSpeed = Math.hypot(
+			fullStep.particles[0].velocity.x,
+			fullStep.particles[0].velocity.y
+		);
+		const halfStepSpeed = Math.hypot(
+			halfStep.particles[0].velocity.x,
+			halfStep.particles[0].velocity.y
+		);
+		const twoHalfStepSpeed = Math.hypot(
+			twoHalfSteps.particles[0].velocity.x,
+			twoHalfSteps.particles[0].velocity.y
+		);
+
+		expect(fullStepSpeed).toBeGreaterThan(0);
+		expect(halfStepSpeed).toBeLessThan(fullStepSpeed * 0.75);
+		expect(twoHalfStepSpeed).toBeLessThan(fullStepSpeed * 1.3);
 	});
 
 	it('applies liquid bulk pressure only to compression', () => {

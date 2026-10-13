@@ -85,6 +85,7 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			gridStateBytes: 16_720,
 			triangleFieldBytes: 6_688,
 			bondedBodyStartBytes: 4,
+			triangleContactStateBytes: 16,
 			bondedBodyCapacity: 1,
 			surfaceFieldBytes: 1672,
 			readbackBytes: 116
@@ -104,6 +105,7 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(layout.gridStateBytes).toBe(16_720);
 		expect(layout.triangleFieldBytes).toBe(6_688);
 		expect(layout.bondedBodyStartBytes).toBe(4);
+		expect(layout.triangleContactStateBytes).toBe(16);
 		expect(layout.bondedBodyCapacity).toBe(1);
 		expect(layout.surfaceFieldBytes).toBe(1672);
 		expect(layout.readbackBytes).toBe(36);
@@ -149,6 +151,7 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(layout.gridStateBytes).toBe(2_729_520);
 		expect(layout.triangleFieldBytes).toBe(1_091_808);
 		expect(layout.bondedBodyStartBytes).toBe(1_333_332);
+		expect(layout.triangleContactStateBytes).toBe(5_333_328);
 		expect(layout.bondedBodyCapacity).toBe(333_333);
 		expect(layout.surfaceFieldBytes).toBe(272_952);
 		expect(layout.readbackBytes).toBe(84_000_032);
@@ -492,12 +495,35 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			1,
 			Math.fround(Math.sqrt(0.01 / Math.PI) + 0.375)
 		]);
+		expect(new Float32Array(parameters, 32, 20)[19]).toBe(Math.fround(0.001));
 
 		expect(() => packMpmMlsGpuStepParameters(state, layout, 0, { x: 0, y: 0 }))
 			.toThrow(/dt/);
 		expect(() =>
 			packMpmMlsGpuStepParameters(state, layout, 0.001, { x: 0, y: Number.NaN })
 		).toThrow(/gravity.y/);
+	});
+
+	it('packs and validates the bonded-triangle reference timestep', () => {
+		const state = validateMpmMlsGpuInput(
+			[makeParticle()],
+			makeConfig({ bondReferenceDt: 1 / 240 })
+		);
+		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
+		const parameters = packMpmMlsGpuStepParameters(
+			state,
+			layout,
+			0.001,
+			{ x: 0, y: 0 }
+		);
+
+		expect(new Float32Array(parameters, 32, 20)[19]).toBe(Math.fround(1 / 240));
+		expect(() =>
+			validateMpmMlsGpuInput(
+				[makeParticle()],
+				makeConfig({ bondReferenceDt: 0 })
+			)
+		).toThrow(/bondReferenceDt/);
 	});
 
 	it('packs the live particle count and stencil count without using reserved capacity', () => {

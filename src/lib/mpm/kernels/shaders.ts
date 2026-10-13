@@ -36,6 +36,12 @@ struct TriangleFieldNode {
 	impulse: vec2<f32>,
 }
 
+struct TriangleContactState {
+	velocity: vec2<f32>,
+	contactCount: u32,
+	padding: u32,
+}
+
 struct TriangleDistanceSample {
 	signedDistance: f32,
 	normal: vec2<f32>,
@@ -109,6 +115,7 @@ const WALL_CUSHION_CELLS: f32 = 8.0;
 @group(0) @binding(22) var<uniform> outletParams: OutletParams;
 @group(0) @binding(23) var<storage, read_write> outletRemovalCounter: array<atomic<u32>>;
 @group(0) @binding(24) var<storage, read_write> cflStepProgress: array<atomic<u32>>;
+@group(0) @binding(25) var<storage, read_write> triangleContactStates: array<TriangleContactState>;
 
 var<workgroup> cflSpeedReduction: array<f32, 64>;
 
@@ -129,6 +136,7 @@ const ERROR_CFL_BOUND: u32 = 16384u;
 const ERROR_FRACTURE_BOND: u32 = 32768u;
 const BONDED_TRIANGLE_SOLVER_ITERATIONS: u32 = 2u;
 const TRIANGLE_CONTACT_SKIN_CELLS: f32 = 0.1;
+const TRIANGLE_CONTACT_IMPULSE_RELAXATION: f32 = 0.25;
 const SURFACE_ERROR_BUCKET: u32 = 1u;
 const SURFACE_ERROR_PARTICLE_AREA: u32 = 2u;
 const SURFACE_ERROR_ACCUMULATION: u32 = 4u;
@@ -1458,6 +1466,100 @@ fn trianglePairContact(
 	return vec3<f32>(contactAxis, penetration);
 }
 
+fn triangleBodyContact(bodyIndex: u32, otherIndex: u32) -> vec3<f32> {
+	let bodyStart = bondedBodyStarts[bodyIndex];
+	let otherStart = bondedBodyStarts[otherIndex];
+	let isFirst = bodyIndex < otherIndex;
+	let firstStart = select(otherStart, bodyStart, isFirst);
+	let secondStart = select(bodyStart, otherStart, isFirst);
+	let firstMinimum = min(
+		particlesIn[firstStart].position,
+		min(particlesIn[firstStart + 1u].position, particlesIn[firstStart + 2u].position),
+	);
+	let firstMaximum = max(
+		particlesIn[firstStart].position,
+		max(particlesIn[firstStart + 1u].position, particlesIn[firstStart + 2u].position),
+	);
+	let secondMinimum = min(
+		particlesIn[secondStart].position,
+		min(particlesIn[secondStart + 1u].position, particlesIn[secondStart + 2u].position),
+	);
+	let secondMaximum = max(
+		particlesIn[secondStart].position,
+		max(particlesIn[secondStart + 1u].position, particlesIn[secondStart + 2u].position),
+	);
+	let aabbGap = max(secondMinimum - firstMaximum, firstMinimum - secondMaximum);
+	let skin = params.physical.x * TRIANGLE_CONTACT_SKIN_CELLS;
+	if (max(aabbGap.x, aabbGap.y) > skin) {
+		return vec3<f32>(0.0, 0.0, 0.0);
+	}
+	let contact = trianglePairContact(
+		particlesIn[firstStart].position,
+		particlesIn[firstStart + 1u].position,
+		particlesIn[firstStart + 2u].position,
+		particlesIn[secondStart].position,
+		particlesIn[secondStart + 1u].position,
+		particlesIn[secondStart + 2u].position,
+		skin,
+	);
+	return vec3<f32>(select(-contact.xy, contact.xy, isFirst), contact.z);
+}
+
+@compute @workgroup_size(64)
+fn gatherTriangleContactStates(
+	@builtin(global_invocation_id) invocation: vec3<u32>,
+) {
+	let bodyIndex = invocation.x;
+	if (bodyIndex >= params.counts.w || atomicLoad(&stateError[0]) != 0u) {
+		return;
+	}
+	let bodyStart = bondedBodyStarts[bodyIndex];
+	if (
+		bodyStart + 2u >= params.counts.x ||
+		particlesIn[bodyStart].bondedTriangleVertex != 1u ||
+		particlesIn[bodyStart + 1u].bondedTriangleVertex != 2u ||
+		particlesIn[bodyStart + 2u].bondedTriangleVertex != 3u
+	) {
+		atomicMin(&stateError[1], bodyStart);
+		atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
+		return;
+	}
+	let objectId = particleObjectIds[bodyStart];
+	var contactCount = 0u;
+	for (var otherIndex = 0u; otherIndex < params.counts.w; otherIndex += 1u) {
+		if (otherIndex == bodyIndex) {
+			continue;
+		}
+		let otherStart = bondedBodyStarts[otherIndex];
+		if (
+			otherStart + 2u >= params.counts.x ||
+			particlesIn[otherStart].bondedTriangleVertex != 1u ||
+			particlesIn[otherStart + 1u].bondedTriangleVertex != 2u ||
+			particlesIn[otherStart + 2u].bondedTriangleVertex != 3u
+		) {
+			atomicMin(&stateError[1], otherStart);
+			atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
+			return;
+		}
+		if (particleObjectIds[otherStart] == objectId) {
+			continue;
+		}
+		let contact = triangleBodyContact(bodyIndex, otherIndex);
+		if (contact.z > 0.0) {
+			contactCount += 1u;
+		}
+	}
+	let velocity =
+		(particlesOut[bodyStart].velocity +
+			particlesOut[bodyStart + 1u].velocity +
+			particlesOut[bodyStart + 2u].velocity) / 3.0;
+	triangleContactStates[bodyIndex] = TriangleContactState(
+		velocity,
+		contactCount,
+		0u,
+	);
+}
+
 @compute @workgroup_size(64)
 fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	let particleIndex = invocation.x;
@@ -1970,6 +2072,11 @@ fn solveBondedTriangles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	var firstOffset = originalOffsets[0];
 	var secondOffset = originalOffsets[1];
 	var thirdOffset = originalOffsets[2];
+	let dt = params.physical.w;
+	let inverseDt = 1.0 / dt;
+	let stepRatio = dt / params.cflBounds.w;
+	let bondStiffness =
+		min(params.bonding.y * stepRatio * stepRatio, 1.0);
 	for (
 		var iteration = 0u;
 		iteration < BONDED_TRIANGLE_SOLVER_ITERATIONS;
@@ -1979,7 +2086,7 @@ fn solveBondedTriangles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			firstOffset,
 			secondOffset,
 			params.bonding.x,
-			params.bonding.y,
+			bondStiffness,
 		);
 		if (firstEdge.z == 0.0) {
 			atomicMin(&stateError[1], bodyStart);
@@ -1993,7 +2100,7 @@ fn solveBondedTriangles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			secondOffset,
 			thirdOffset,
 			params.bonding.x,
-			params.bonding.y,
+			bondStiffness,
 		);
 		if (secondEdge.z == 0.0) {
 			atomicMin(&stateError[1], bodyStart);
@@ -2007,7 +2114,7 @@ fn solveBondedTriangles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			thirdOffset,
 			firstOffset,
 			params.bonding.x,
-			params.bonding.y,
+			bondStiffness,
 		);
 		if (thirdEdge.z == 0.0) {
 			atomicMin(&stateError[1], bodyStart);
@@ -2018,7 +2125,6 @@ fn solveBondedTriangles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		firstOffset -= thirdEdge.xy;
 	}
 
-	let inverseDt = 1.0 / params.physical.w;
 	let bondedOffsets = array<vec2<f32>, 3>(
 		firstOffset,
 		secondOffset,
@@ -2048,32 +2154,52 @@ fn solveBondedTriangles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		);
 		particles[vertex].position = vec2<f32>(boundedX.x, boundedY.x);
 		particles[vertex].velocity = vec2<f32>(boundedX.y, boundedY.y);
+		if (
+			!finiteVec2(particles[vertex].position) ||
+			!finiteVec2(particles[vertex].velocity)
+		) {
+			atomicMin(&stateError[1], bodyStart);
+			atomicOr(&stateError[0], ERROR_TRIANGLE_CONTACT);
+			return;
+		}
 	}
+	particlesOut[bodyStart] = particles[0];
+	particlesOut[bodyStart + 1u] = particles[1];
+	particlesOut[bodyStart + 2u] = particles[2];
+}
 
-	var collisionCorrection = vec2<f32>(0.0, 0.0);
-	var collisionVelocityDelta = vec2<f32>(0.0, 0.0);
+@compute @workgroup_size(64)
+fn applyTrianglePairContacts(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let bodyIndex = invocation.x;
+	if (bodyIndex >= params.counts.w || atomicLoad(&stateError[0]) != 0u) {
+		return;
+	}
+	let bodyStart = bondedBodyStarts[bodyIndex];
+	if (
+		bodyStart + 2u >= params.counts.x ||
+		particlesOut[bodyStart].bondedTriangleVertex != 1u ||
+		particlesOut[bodyStart + 1u].bondedTriangleVertex != 2u ||
+		particlesOut[bodyStart + 2u].bondedTriangleVertex != 3u
+	) {
+		atomicMin(&stateError[1], bodyStart);
+		atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
+		return;
+	}
+	let bodyState = triangleContactStates[bodyIndex];
 	let objectId = particleObjectIds[bodyStart];
-	let minimum = min(
-		particlesIn[bodyStart].position,
-		min(particlesIn[bodyStart + 1u].position, particlesIn[bodyStart + 2u].position),
-	);
-	let maximum = max(
-		particlesIn[bodyStart].position,
-		max(particlesIn[bodyStart + 1u].position, particlesIn[bodyStart + 2u].position),
-	);
-	let currentVelocity =
-		(particlesIn[bodyStart].velocity +
-			particlesIn[bodyStart + 1u].velocity +
-			particlesIn[bodyStart + 2u].velocity) /
-		3.0;
 	let bodyMass = 3.0 * params.physical.y;
-	let contactSkin = params.physical.x * TRIANGLE_CONTACT_SKIN_CELLS;
+	var collisionVelocityDelta = vec2<f32>(0.0, 0.0);
 	for (var otherIndex = 0u; otherIndex < params.counts.w; otherIndex += 1u) {
 		if (otherIndex == bodyIndex) {
 			continue;
 		}
 		let otherStart = bondedBodyStarts[otherIndex];
-		if (otherStart + 2u >= params.counts.x) {
+		if (
+			otherStart + 2u >= params.counts.x ||
+			particlesOut[otherStart].bondedTriangleVertex != 1u ||
+			particlesOut[otherStart + 1u].bondedTriangleVertex != 2u ||
+			particlesOut[otherStart + 2u].bondedTriangleVertex != 3u
+		) {
 			atomicMin(&stateError[1], otherStart);
 			atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
 			return;
@@ -2081,46 +2207,37 @@ fn solveBondedTriangles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		if (particleObjectIds[otherStart] == objectId) {
 			continue;
 		}
-		let otherMinimum = min(
-			particlesIn[otherStart].position,
-			min(particlesIn[otherStart + 1u].position, particlesIn[otherStart + 2u].position),
-		);
-		let otherMaximum = max(
-			particlesIn[otherStart].position,
-			max(particlesIn[otherStart + 1u].position, particlesIn[otherStart + 2u].position),
-		);
-		let aabbGap = max(otherMinimum - maximum, minimum - otherMaximum);
-		if (max(aabbGap.x, aabbGap.y) > contactSkin) {
-			continue;
-		}
-		let contact = trianglePairContact(
-			particlesIn[bodyStart].position,
-			particlesIn[bodyStart + 1u].position,
-			particlesIn[bodyStart + 2u].position,
-			particlesIn[otherStart].position,
-			particlesIn[otherStart + 1u].position,
-			particlesIn[otherStart + 2u].position,
-			contactSkin,
-		);
+		let contact = triangleBodyContact(bodyIndex, otherIndex);
 		if (contact.z <= 0.0) {
 			continue;
 		}
-		let otherVelocity =
-			(particlesIn[otherStart].velocity +
-				particlesIn[otherStart + 1u].velocity +
-				particlesIn[otherStart + 2u].velocity) /
-			3.0;
-		let relativeNormalVelocity = dot(currentVelocity - otherVelocity, contact.xy);
-		if (relativeNormalVelocity < 0.0) {
-			let impulseMagnitude = -relativeNormalVelocity / (2.0 / bodyMass);
-			collisionVelocityDelta +=
-				(impulseMagnitude / bodyMass) * contact.xy;
+		let otherState = triangleContactStates[otherIndex];
+		let contactDegree = max(bodyState.contactCount, otherState.contactCount);
+		if (contactDegree == 0u) {
+			atomicMin(&stateError[1], bodyStart);
+			atomicOr(&stateError[0], ERROR_TRIANGLE_CONTACT);
+			return;
 		}
-		collisionCorrection += 0.5 * contact.z * contact.xy;
+		let contactWeight = 1.0 / f32(contactDegree);
+		let relativeNormalVelocity =
+			dot(bodyState.velocity - otherState.velocity, contact.xy);
+		if (relativeNormalVelocity < 0.0) {
+			let impulseMagnitude =
+				-relativeNormalVelocity / (2.0 / bodyMass);
+			let impulseWeight =
+				TRIANGLE_CONTACT_IMPULSE_RELAXATION * contactWeight;
+			collisionVelocityDelta +=
+				impulseWeight * impulseMagnitude * contact.xy / bodyMass;
+		}
 	}
 
+	var particles = array<Particle, 3>(
+		particlesOut[bodyStart],
+		particlesOut[bodyStart + 1u],
+		particlesOut[bodyStart + 2u],
+	);
 	for (var vertex = 0u; vertex < 3u; vertex += 1u) {
-		let position = particles[vertex].position + collisionCorrection;
+		let position = particles[vertex].position;
 		let velocity = particles[vertex].velocity + collisionVelocityDelta;
 		let boundedX = confineAxis(
 			position.x,

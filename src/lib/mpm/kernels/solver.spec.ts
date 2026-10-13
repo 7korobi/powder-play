@@ -360,6 +360,8 @@ describe('GPU MLS-MPM batch encoding', () => {
 				'g2p',
 				'applyTriangleContactImpulses',
 				'solveBondedTriangles',
+				'gatherTriangleContactStates',
+				'applyTrianglePairContacts',
 				'validateCflParticles',
 				'commitParticles',
 				'measureParticleSpeedPartials',
@@ -755,6 +757,8 @@ describe('GPU MLS-MPM batch encoding', () => {
 			'MLS-MPM g2p pipeline',
 			'MLS-MPM applyTriangleContactImpulses pipeline',
 			'MLS-MPM solveBondedTriangles pipeline',
+			'MLS-MPM gatherTriangleContactStates pipeline',
+			'MLS-MPM applyTrianglePairContacts pipeline',
 			'MLS-MPM commitParticles pipeline'
 		]);
 		expect(gpu.buffers.find(({ label }) => label.includes('triangle contact field'))?.size).toBe(
@@ -762,6 +766,9 @@ describe('GPU MLS-MPM batch encoding', () => {
 		);
 		expect(gpu.buffers.find(({ label }) => label.includes('bonded triangle body indices'))?.size).toBe(
 			2 * Uint32Array.BYTES_PER_ELEMENT
+		);
+		expect(gpu.buffers.find(({ label }) => label.includes('triangle-pair contact states'))?.size).toBe(
+			2 * 4 * Float32Array.BYTES_PER_ELEMENT
 		);
 		solver.dispose();
 	});

@@ -119,12 +119,21 @@ its own `objectId`. Each pebble uses lambda 20 and mu 10; its three edges also
 use position constraints. The GPU solves these constraints in triangle-local
 offsets and derives velocity corrections from those small displacements before
 reconstructing world positions, avoiding precision loss from subtracting
-near-equal large coordinates. Water and oil have separate grid velocity/volume
-channels and receive normal contact impulses from their phase-volume gradients.
+near-equal large coordinates. Constraint stiffness scales with the square of
+the microstep/reference-step ratio (1/240 second in Gate 4), because positional
+corrections are converted into velocity changes. CFL subdivision therefore
+does not accumulate an oversized correction impulse. Water and oil have
+separate grid velocity/volume channels and receive normal contact impulses from
+their phase-volume gradients.
 The triangle signed-distance field projects liquid particles out of the
 pebbles and gathers the opposing normal impulse back to the three vertices.
-Pebble pairs use triangle SAT contact with a normal impulse and positional
-correction. These are discrete, approximate contacts, not a continuous
+Pebble pairs use triangle SAT contact to reduce approaching normal velocity;
+the pair pass does not translate triangle vertices. Repeated post-G2P position
+corrections destabilized the triangle contact field during CFL microsteps. The
+GPU snapshots body velocities and contact degrees before the pair pass, then
+symmetrically relaxes each impulse by 0.25 divided by the larger contact degree
+of its endpoints. This prevents simultaneous contacts from over-accumulating
+Jacobi impulses. These are discrete, approximate contacts, not a continuous
 collider or continuum deformable mesh.
 At scene initialization, water and oil velocity components are sampled
 independently from ±60 world units/s and each pebble vertex from ±120 world

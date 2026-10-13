@@ -40,6 +40,7 @@ export interface MpmMlsGpuBufferLayout {
 	readonly gridStateBytes: number;
 	readonly triangleFieldBytes: number;
 	readonly bondedBodyStartBytes: number;
+	readonly triangleContactStateBytes: number;
 	readonly bondedBodyCapacity: number;
 	readonly fractureBondBufferBytes: number;
 	readonly fractureBondTopologyBufferBytes: number;
@@ -76,6 +77,7 @@ export interface ValidatedMpmMlsGpuInput {
 	readonly particleVolumeF32: number;
 	readonly bondRestLengthF32: number;
 	readonly bondStiffnessF32: number;
+	readonly bondReferenceDtF32: number | null;
 	readonly lambdaF32: number;
 	readonly muF32: number;
 	readonly gradientScale: number;
@@ -121,6 +123,10 @@ export function validateMpmMlsGpuInput(
 		rawConfig.bondStiffness === undefined
 			? DEFAULT_BONDED_TRIANGLE_STIFFNESS
 			: finiteNumber(rawConfig.bondStiffness, 'bondStiffness');
+	const bondReferenceDt =
+		rawConfig.bondReferenceDt === undefined
+			? null
+			: finiteNumber(rawConfig.bondReferenceDt, 'bondReferenceDt');
 	const lambda = material.lambda;
 	const mu = material.mu;
 
@@ -138,6 +144,9 @@ export function validateMpmMlsGpuInput(
 	}
 	if (bondStiffness <= 0 || bondStiffness > 1) {
 		throw new RangeError('bondStiffness must be greater than zero and at most one');
+	}
+	if (bondReferenceDt !== null && bondReferenceDt <= 0) {
+		throw new RangeError('bondReferenceDt must be greater than zero');
 	}
 	if (lambda < 0) throw new RangeError('material.lambda must be non-negative');
 	if (mu <= 0) throw new RangeError('material.mu must be greater than zero');
@@ -182,6 +191,10 @@ export function validateMpmMlsGpuInput(
 		'bondStiffness',
 		true
 	);
+	const bondReferenceDtF32 =
+		bondReferenceDt === null
+			? null
+			: finiteFloat32(bondReferenceDt, 'bondReferenceDt', true);
 	const lambdaF32 = finiteFloat32(lambda, 'material.lambda');
 	const muF32 = finiteFloat32(
 		mu,
@@ -526,6 +539,7 @@ export function validateMpmMlsGpuInput(
 			particleVolume,
 			...(bondRestLength === undefined ? {} : { bondRestLength }),
 			bondStiffness,
+			...(bondReferenceDt === null ? {} : { bondReferenceDt }),
 			...(config.fractureBonds === undefined ? {} : { fractureBonds }),
 			material,
 			capacity: particleCapacity
@@ -551,6 +565,7 @@ export function validateMpmMlsGpuInput(
 		particleVolumeF32,
 		bondRestLengthF32,
 		bondStiffnessF32,
+		bondReferenceDtF32,
 		lambdaF32,
 		muF32,
 		gradientScale,
@@ -625,6 +640,11 @@ export function calculateMpmMlsGpuBufferLayout(
 		Uint32Array.BYTES_PER_ELEMENT,
 		'bonded triangle body index buffer size'
 	);
+	const triangleContactStateBytes = safeProduct(
+		bondedBodyCapacity,
+		4 * Float32Array.BYTES_PER_ELEMENT,
+		'triangle-pair contact state buffer size'
+	);
 	const fractureBondBufferBytes = Math.max(
 		24,
 		safeProduct(state.fractureBondCount, 24, 'fracture bond state buffer size')
@@ -683,6 +703,7 @@ export function calculateMpmMlsGpuBufferLayout(
 		['grid state', gridStateBytes],
 		['triangle contact field', triangleFieldBytes],
 		['bonded triangle body indices', bondedBodyStartBytes],
+		['triangle-pair contact states', triangleContactStateBytes],
 		['fracture bond state', fractureBondBufferBytes],
 		['fracture bond topology', fractureBondTopologyBufferBytes],
 		['water/oil surface field', surfaceFieldBytes],
@@ -707,6 +728,7 @@ export function calculateMpmMlsGpuBufferLayout(
 		['grid state', gridStateBytes],
 		['triangle contact field', triangleFieldBytes],
 		['bonded triangle body indices', bondedBodyStartBytes],
+		['triangle-pair contact states', triangleContactStateBytes],
 		['fracture bond state', fractureBondBufferBytes],
 		['fracture bond topology', fractureBondTopologyBufferBytes],
 		['water/oil surface field', surfaceFieldBytes],
@@ -746,6 +768,7 @@ export function calculateMpmMlsGpuBufferLayout(
 		gridStateBytes,
 		triangleFieldBytes,
 		bondedBodyStartBytes,
+		triangleContactStateBytes,
 		bondedBodyCapacity,
 		fractureBondBufferBytes,
 		fractureBondTopologyBufferBytes,
@@ -766,7 +789,8 @@ export function packMpmMlsGpuStepParameters(
 				readonly waveSpeedBound: number;
 				readonly velocityBound: number;
 		  }
-		| null = null
+		| null = null,
+	bondReferenceDt?: number
 ): ArrayBuffer {
 	if (!Number.isSafeInteger(particleCount) || particleCount < 0 || particleCount > layout.particleCapacity) {
 		throw new RangeError('particleCount must be an integer within the allocated GPU capacity');
@@ -796,6 +820,11 @@ export function packMpmMlsGpuStepParameters(
 		cflGuard === null
 			? 0
 			: finiteFloat32(cflGuard.velocityBound, 'cflGuard.velocityBound');
+	const bondReferenceDtF32 = finiteFloat32(
+		bondReferenceDt ?? state.bondReferenceDtF32 ?? stepDtF32,
+		'bondReferenceDt',
+		true
+	);
 	const stressScale = -stepDt * state.config.particleVolume * state.gradientScale;
 	if (!Number.isFinite(stressScale)) {
 		throw new RangeError('dt, particleVolume, and grid.cellSize produce a non-finite stress scale');
@@ -836,7 +865,7 @@ export function packMpmMlsGpuStepParameters(
 		cflWaveSpeedBound,
 		cflVelocityBound,
 		cflGuard === null ? 0 : 1,
-		0
+		bondReferenceDtF32
 	]);
 	new Uint32Array(result, 112, 4).set([
 		state.fractureBondCount === 0 ? 0 : state.particleCount,

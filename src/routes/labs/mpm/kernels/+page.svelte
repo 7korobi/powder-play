@@ -132,6 +132,7 @@
 	): MpmStepConfig {
 		return {
 			dt,
+			bondReferenceDt: FIXED_STEP_SECONDS,
 			grid: GRID,
 			particleMass: PARTICLE_MASS,
 			particleVolume: PARTICLE_VOLUME,

@@ -78,6 +78,7 @@ export interface MpmStepConfig {
 	readonly particleVolume: number;
 	readonly bondRestLength?: number;
 	readonly bondStiffness?: number;
+	readonly bondReferenceDt?: number;
 	readonly fractureBonds?: readonly MpmSolidBond[];
 	readonly material: MpmMaterialParameters;
 	readonly gravity: MpmVector2;
@@ -105,6 +106,7 @@ interface ValidatedConfig {
 	readonly particleVolume: number;
 	readonly bondRestLength: number | undefined;
 	readonly bondStiffness: number;
+	readonly bondReferenceDt: number;
 	readonly fractureBonds: readonly MpmSolidBond[] | undefined;
 	readonly material: MpmMaterialParameters;
 	readonly gravity: MpmVector2;
@@ -189,6 +191,7 @@ const MAX_DEFORMATION_SUBSTEPS = 64;
 export const DEFAULT_BONDED_TRIANGLE_STIFFNESS = 0.35;
 const BONDED_TRIANGLE_SOLVER_ITERATIONS = 2;
 const TRIANGLE_CONTACT_SKIN_CELLS = 0.1;
+const TRIANGLE_CONTACT_IMPULSE_RELAXATION = 0.25;
 const TRIANGLE_FIELD_BAND_CELLS = 2;
 const GRID_CONTACT_REACH_CELLS = 0.75;
 
@@ -614,6 +617,8 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 		raw.bondStiffness === undefined
 			? DEFAULT_BONDED_TRIANGLE_STIFFNESS
 			: raw.bondStiffness;
+	const bondReferenceDt =
+		raw.bondReferenceDt === undefined ? dt : raw.bondReferenceDt;
 	const fractureBonds =
 		raw.fractureBonds === undefined
 			? undefined
@@ -629,11 +634,15 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 	assertFiniteNumber(particleMass, 'particleMass');
 	assertFiniteNumber(particleVolume, 'particleVolume');
 	assertFiniteNumber(bondStiffness, 'bondStiffness');
+	assertFiniteNumber(bondReferenceDt, 'bondReferenceDt');
 	assertFiniteNumber(lambda, 'material.lambda');
 	assertFiniteNumber(mu, 'material.mu');
 	assertVector(gravity, 'gravity');
 
 	if (dt <= 0) throw new RangeError('dt must be greater than zero');
+	if (bondReferenceDt <= 0) {
+		throw new RangeError('bondReferenceDt must be greater than zero');
+	}
 	if (!Number.isSafeInteger(cellsX) || cellsX < 1 || cellsX >= Number.MAX_SAFE_INTEGER) {
 		throw new RangeError('grid.cellsX must be a positive safe integer');
 	}
@@ -685,6 +694,7 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 		particleVolume,
 		bondRestLength,
 		bondStiffness,
+		bondReferenceDt,
 		fractureBonds,
 		material,
 		gravity: { x: gravity.x, y: gravity.y },
@@ -1172,7 +1182,11 @@ function enforceBondedTriangleConstraints(
 	if (restLength === undefined) {
 		throw new RangeError('bondRestLength is required for bonded triangle particles');
 	}
-	const stiffness = config.bondStiffness;
+	const stiffness = calculateSubstepBondStiffness(
+		config.bondStiffness,
+		config.dt,
+		config.bondReferenceDt
+	);
 	for (const bodyStart of bodyStarts) {
 		const original = getTriangleVertices(outputParticles, bodyStart);
 		const positions: MpmVector2[] = original.map(({ x, y }) => ({ x, y }));
@@ -1223,6 +1237,19 @@ function enforceBondedTriangleConstraints(
 	}
 }
 
+function calculateSubstepBondStiffness(
+	stiffness: number,
+	dt: number,
+	referenceDt: number
+): number {
+	const stepRatio = dt / referenceDt;
+	const substepStiffness = Math.min(stiffness * stepRatio * stepRatio, 1);
+	if (!Number.isFinite(substepStiffness)) {
+		throw new RangeError('bonded triangle substep stiffness is outside the supported range');
+	}
+	return Math.max(0, Math.min(1, substepStiffness));
+}
+
 function resolveBondedTriangleContacts(
 	inputParticles: readonly MpmParticle[],
 	outputParticles: MpmParticle[],
@@ -1231,53 +1258,88 @@ function resolveBondedTriangleContacts(
 ): void {
 	if (bodyStarts.length < 2) return;
 	const skin = config.grid.cellSize * TRIANGLE_CONTACT_SKIN_CELLS;
-	for (const bodyStart of bodyStarts) {
-		const bodyId = inputParticles[bodyStart].objectId;
-		const currentTriangle = getTriangleVertices(inputParticles, bodyStart);
-		const currentVelocity = triangleMeanVelocity(inputParticles, bodyStart);
-		let correctionX = 0;
-		let correctionY = 0;
-		let impulseX = 0;
-		let impulseY = 0;
-		const bodyMass = 3 * config.particleMass;
-
-		for (const otherStart of bodyStarts) {
+	const contactsByBody: {
+		otherIndex: number;
+		normal: MpmVector2;
+		penetration: number;
+	}[][] = bodyStarts.map(() => []);
+	const triangles = bodyStarts.map((bodyStart) =>
+		getTriangleVertices(inputParticles, bodyStart)
+	);
+	const velocities = bodyStarts.map((bodyStart) =>
+		triangleMeanVelocity(outputParticles, bodyStart)
+	);
+	for (let firstIndex = 0; firstIndex < bodyStarts.length; firstIndex += 1) {
+		const firstStart = bodyStarts[firstIndex];
+		for (
+			let secondIndex = firstIndex + 1;
+			secondIndex < bodyStarts.length;
+			secondIndex += 1
+		) {
+			const secondStart = bodyStarts[secondIndex];
 			if (
-				otherStart === bodyStart ||
-				inputParticles[otherStart].objectId === bodyId
+				inputParticles[firstStart].objectId ===
+				inputParticles[secondStart].objectId
 			) {
 				continue;
 			}
 			const contact = trianglePairContact(
-				currentTriangle,
-				getTriangleVertices(inputParticles, otherStart),
+				triangles[firstIndex],
+				triangles[secondIndex],
 				skin
 			);
 			if (!contact) continue;
-			const otherVelocity = triangleMeanVelocity(inputParticles, otherStart);
+			contactsByBody[firstIndex].push({
+				otherIndex: secondIndex,
+				normal: contact.normal,
+				penetration: contact.penetration
+			});
+			contactsByBody[secondIndex].push({
+				otherIndex: firstIndex,
+				normal: scaleVector(contact.normal, -1),
+				penetration: contact.penetration
+			});
+		}
+	}
+
+	const bodyMass = 3 * config.particleMass;
+	for (let bodyIndex = 0; bodyIndex < bodyStarts.length; bodyIndex += 1) {
+		const bodyStart = bodyStarts[bodyIndex];
+		let impulseX = 0;
+		let impulseY = 0;
+		for (const contact of contactsByBody[bodyIndex]) {
+			const contactWeight =
+				1 /
+				Math.max(
+					contactsByBody[bodyIndex].length,
+					contactsByBody[contact.otherIndex].length
+				);
+			const otherVelocity = velocities[contact.otherIndex];
 			const relativeNormalVelocity =
-				(currentVelocity.x - otherVelocity.x) * contact.normal.x +
-				(currentVelocity.y - otherVelocity.y) * contact.normal.y;
+				(velocities[bodyIndex].x - otherVelocity.x) * contact.normal.x +
+				(velocities[bodyIndex].y - otherVelocity.y) * contact.normal.y;
 			if (relativeNormalVelocity < 0) {
 				const impulse =
 					-relativeNormalVelocity / (2 / bodyMass);
-				impulseX += (impulse / bodyMass) * contact.normal.x;
-				impulseY += (impulse / bodyMass) * contact.normal.y;
+				const impulseWeight =
+					contactWeight * TRIANGLE_CONTACT_IMPULSE_RELAXATION;
+				impulseX +=
+					(impulseWeight * impulse * contact.normal.x) / bodyMass;
+				impulseY +=
+					(impulseWeight * impulse * contact.normal.y) / bodyMass;
 			}
-			correctionX += contact.penetration * 0.5 * contact.normal.x;
-			correctionY += contact.penetration * 0.5 * contact.normal.y;
 		}
 
 		for (let vertex = 0; vertex < 3; vertex += 1) {
 			const index = bodyStart + vertex;
 			const particle = outputParticles[index];
 			const boundedX = confineAxis(
-				particle.position.x + correctionX,
+				particle.position.x,
 				particle.velocity.x + impulseX,
 				config.domainWidth
 			);
 			const boundedY = confineAxis(
-				particle.position.y + correctionY,
+				particle.position.y,
 				particle.velocity.y + impulseY,
 				config.domainHeight
 			);

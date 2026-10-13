@@ -326,6 +326,8 @@ interface MpmMlsGpuPipelines {
 	readonly reduceParticleSpeedPartials: GPUComputePipeline;
 	readonly applyTriangleContactImpulses: GPUComputePipeline;
 	readonly solveBondedTriangles: GPUComputePipeline;
+	readonly gatherTriangleContactStates: GPUComputePipeline;
+	readonly applyTrianglePairContacts: GPUComputePipeline;
 	readonly updateFractureBonds: GPUComputePipeline;
 	readonly applyFractureParticleDamage: GPUComputePipeline;
 	readonly removeParticlesInOutlet: GPUComputePipeline;
@@ -348,6 +350,8 @@ interface MpmMlsGpuStepBindings {
 	readonly measureParticleSpeedPartials: GPUBindGroup;
 	readonly applyTriangleContactImpulses: GPUBindGroup;
 	readonly solveBondedTriangles: GPUBindGroup;
+	readonly gatherTriangleContactStates: GPUBindGroup;
+	readonly applyTrianglePairContacts: GPUBindGroup;
 	readonly updateFractureBonds: GPUBindGroup;
 	readonly applyFractureParticleDamage: GPUBindGroup;
 	readonly removeParticlesInOutlet: GPUBindGroup;
@@ -509,6 +513,7 @@ interface MpmMlsGpuRuntime {
 		readonly surfaceFields: GPUBuffer;
 		readonly triangleFieldNodes: GPUBuffer;
 		readonly bondedBodyStarts: GPUBuffer;
+		readonly triangleContactStates: GPUBuffer;
 		readonly fractureBonds: GPUBuffer;
 		readonly fractureBondTopology: GPUBuffer;
 		readonly preparedAffines: GPUBuffer;
@@ -596,6 +601,16 @@ async function createRuntime(
 			device,
 			computeModule,
 			'solveBondedTriangles'
+		),
+		gatherTriangleContactStates: await createComputePipeline(
+			device,
+			computeModule,
+			'gatherTriangleContactStates'
+		),
+		applyTrianglePairContacts: await createComputePipeline(
+			device,
+			computeModule,
+			'applyTrianglePairContacts'
 		),
 		updateFractureBonds: await createComputePipeline(
 			device,
@@ -690,6 +705,11 @@ async function createRuntime(
 			'MLS-MPM bonded triangle body indices',
 			layout.bondedBodyStartBytes,
 			BUFFER_USAGE.STORAGE | BUFFER_USAGE.COPY_DST
+		),
+		triangleContactStates: createBuffer(
+			'MLS-MPM triangle-pair contact states',
+			layout.triangleContactStateBytes,
+			BUFFER_USAGE.STORAGE
 		),
 		fractureBonds: createBuffer(
 			'MLS-MPM persistent fracture bond state',
@@ -936,8 +956,33 @@ async function createRuntime(
 				bufferEntry(1, input),
 				bufferEntry(2, output),
 				bufferEntry(6, buffers.stateError),
-				bufferEntry(8, buffers.particleObjectIds),
 				bufferEntry(17, buffers.bondedBodyStarts)
+			]
+		);
+		const gatherTriangleContactStates = createBindGroup(
+			device,
+			pipelines.gatherTriangleContactStates,
+			[
+				bufferEntry(0, buffers.simulationParams),
+				bufferEntry(1, input),
+				bufferEntry(2, output),
+				bufferEntry(6, buffers.stateError),
+				bufferEntry(8, buffers.particleObjectIds),
+				bufferEntry(17, buffers.bondedBodyStarts),
+				bufferEntry(25, buffers.triangleContactStates)
+			]
+		);
+		const applyTrianglePairContacts = createBindGroup(
+			device,
+			pipelines.applyTrianglePairContacts,
+			[
+				bufferEntry(0, buffers.simulationParams),
+				bufferEntry(1, input),
+				bufferEntry(2, output),
+				bufferEntry(6, buffers.stateError),
+				bufferEntry(8, buffers.particleObjectIds),
+				bufferEntry(17, buffers.bondedBodyStarts),
+				bufferEntry(25, buffers.triangleContactStates)
 			]
 		);
 		const updateFractureBonds = createBindGroup(
@@ -1001,6 +1046,8 @@ async function createRuntime(
 			measureParticleSpeedPartials,
 			applyTriangleContactImpulses,
 			solveBondedTriangles,
+			gatherTriangleContactStates,
+			applyTrianglePairContacts,
 			updateFractureBonds,
 			applyFractureParticleDamage,
 			removeParticlesInOutlet,
@@ -1144,7 +1191,8 @@ function createSolver(
 		stepCount: number,
 		dt: number,
 		gravity: MpmVector2,
-		cflVelocityBound?: number
+		cflVelocityBound?: number,
+		bondReferenceDt?: number
 	): void {
 		assertActive();
 		if (!Number.isSafeInteger(stepCount) || stepCount < 1) {
@@ -1171,7 +1219,8 @@ function createSolver(
 			gravity,
 			particleSlotCount,
 			bondedBodyCount,
-			cflGuard
+			cflGuard,
+			bondReferenceDt
 		);
 		let inputIndex = currentBuffer;
 		try {
@@ -1244,6 +1293,18 @@ function createSolver(
 						groups.solveBondedTriangles,
 						bondedBodyCount
 					);
+					dispatchCompute(
+						pass,
+						runtime.pipelines.gatherTriangleContactStates,
+						groups.gatherTriangleContactStates,
+						bondedBodyCount
+					);
+					dispatchCompute(
+						pass,
+						runtime.pipelines.applyTrianglePairContacts,
+						groups.applyTrianglePairContacts,
+						bondedBodyCount
+					);
 				}
 				if (cflGuard !== null) {
 					dispatchCompute(
@@ -1311,7 +1372,8 @@ function createSolver(
 		microstepPlan: MpmCflMicrostepPlan,
 		velocityBound: number,
 		maxMicrosteps: number,
-		gravity: MpmVector2
+		gravity: MpmVector2,
+		bondReferenceDt?: number
 	): void {
 		assertActive();
 		if (cflBounds === null) {
@@ -1415,7 +1477,13 @@ function createSolver(
 		}
 
 		// stepBatch encodes every full P2G -> grid update -> G2P sequence using microDt.
-		stepBatch(microStepCount, certifiedPlan.microDt, gravity, runtimeVelocityLimit);
+		stepBatch(
+			microStepCount,
+			certifiedPlan.microDt,
+			gravity,
+			runtimeVelocityLimit,
+			bondReferenceDt ?? state.bondReferenceDtF32 ?? macroDt
+		);
 		latestCflBatchSequence += 1;
 		latestCflBatchMicrostepCount = microStepCount;
 		lastScheduledVelocityBound = velocityBound;
@@ -1445,6 +1513,7 @@ function createSolver(
 		if (!Number.isFinite(totalDuration)) {
 			throw new RangeError('CFL batch duration is outside the supported range.');
 		}
+		const bondReferenceDt = state.bondReferenceDtF32 ?? macroDt;
 
 		let remainingDuration = totalDuration;
 		let attemptMacroStepCount = macroStepCount;
@@ -1496,7 +1565,8 @@ function createSolver(
 				attemptPlan,
 				attemptVelocityBound,
 				remainingMicrostepBudget,
-				attemptGravity
+				attemptGravity,
+				bondReferenceDt
 			);
 			if (adaptiveSubmissionCount > 0) {
 				retrySubmissionMilliseconds += performance.now() - submissionStartedAt;
