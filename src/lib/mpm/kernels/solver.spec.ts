@@ -16,7 +16,7 @@ beforeEach(() => {
 function setupDevice() {
 	const dispatches: { pipeline: string; input?: string; workgroups: number }[] = [];
 	const buffers: { label: string; size: number; destroy: ReturnType<typeof vi.fn> }[] = [];
-	let mappedBytes: ArrayBuffer | null = null;
+	let mappedBytes: ArrayBuffer | (() => ArrayBuffer) | null = null;
 	const pass = {
 		setPipeline: vi.fn(),
 		setBindGroup: vi.fn(),
@@ -74,7 +74,11 @@ function setupDevice() {
 				size,
 				destroy: vi.fn(),
 				mapAsync: vi.fn(async () => {}),
-				getMappedRange: vi.fn(() => mappedBytes?.slice(0, size) ?? new ArrayBuffer(size)),
+				getMappedRange: vi.fn(() => {
+					const bytes =
+						typeof mappedBytes === 'function' ? mappedBytes() : mappedBytes;
+					return bytes?.slice(0, size) ?? new ArrayBuffer(size);
+				}),
 				unmap: vi.fn()
 			};
 			buffers.push(buffer);
@@ -102,7 +106,7 @@ function setupDevice() {
 		buffers,
 		dispose,
 		getCompilationInfo,
-		setMappedBytes(bytes: ArrayBuffer) {
+		setMappedBytes(bytes: ArrayBuffer | (() => ArrayBuffer)) {
 			mappedBytes = bytes;
 		}
 	};
@@ -233,6 +237,16 @@ describe('float32 deformation integration', () => {
 		);
 		expect(MLS_MPM_COMPUTE_WGSL).toContain(
 			'substeps = min(substeps * 2u, maximumSubsteps);'
+		);
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			'const MIN_NEO_HOOKEAN_STRETCH: f32 = 0.05;'
+		);
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			'const MAX_NEO_HOOKEAN_STRETCH: f32 = 20.0;'
+		);
+		expect(MLS_MPM_COMPUTE_WGSL).toContain('-u0.y');
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			'updatedF = projectNeoHookeanDeformation(trialF);'
 		);
 		expect(MLS_MPM_COMPUTE_WGSL).toContain('substeps < maximumSubsteps');
 		expect(MLS_MPM_COMPUTE_WGSL).toContain('atomicOr(&stateError[0], ERROR_DEFORMATION);');
@@ -513,7 +527,7 @@ describe('GPU MLS-MPM batch encoding', () => {
 			sequence: 1
 		});
 
-		expect(gpu.encoder.copyBufferToBuffer).toHaveBeenCalledTimes(2);
+		expect(gpu.encoder.copyBufferToBuffer).toHaveBeenCalledTimes(3);
 		expect(gpu.encoder.copyBufferToBuffer).toHaveBeenNthCalledWith(
 			1,
 			expect.objectContaining({ label: 'MLS-MPM CFL maximum-speed scalar' }),
@@ -524,10 +538,18 @@ describe('GPU MLS-MPM batch encoding', () => {
 		);
 		expect(gpu.encoder.copyBufferToBuffer).toHaveBeenNthCalledWith(
 			2,
-			expect.objectContaining({ label: 'MLS-MPM numerical status' }),
+			expect.objectContaining({ label: 'MLS-MPM CFL committed microstep count' }),
 			0,
 			expect.objectContaining({ label: 'MLS-MPM compact CFL speed/status readback' }),
 			4,
+			4
+		);
+		expect(gpu.encoder.copyBufferToBuffer).toHaveBeenNthCalledWith(
+			3,
+			expect.objectContaining({ label: 'MLS-MPM numerical status' }),
+			0,
+			expect.objectContaining({ label: 'MLS-MPM compact CFL speed/status readback' }),
+			8,
 			32
 		);
 		expect(
@@ -552,9 +574,17 @@ describe('GPU MLS-MPM batch encoding', () => {
 		});
 		solver.stepCflBatch(1, 0.001, plan, velocityBound, 1, { x: 0, y: 0 });
 
-		const status = new ArrayBuffer(4 + 32);
-		new DataView(status).setUint32(4, 16384, true);
-		new DataView(status).setUint32(8, 0, true);
+		const status = new ArrayBuffer(4 + 4 + 32);
+		const view = new DataView(status);
+		view.setFloat32(0, 50, true);
+		view.setUint32(4, 0, true);
+		view.setUint32(8, 16_384, true);
+		view.setUint32(12, 0, true);
+		view.setUint32(32, 3, true);
+		view.setFloat32(16, 50, true);
+		view.setFloat32(20, bounds.waveSpeedBound, true);
+		view.setFloat32(24, 40, true);
+		view.setFloat32(28, bounds.waveSpeedBound, true);
 		gpu.setMappedBytes(status);
 		await expect(solver.measureMaximumParticleSpeed()).rejects.toThrow(
 			/particle exceeded the enforced CFL wave-speed or velocity bound at particle 0/
@@ -562,6 +592,147 @@ describe('GPU MLS-MPM batch encoding', () => {
 		expect(() =>
 			solver.stepCflBatch(1, 0.001, plan, velocityBound, 1, { x: 0, y: 0 })
 		).toThrow(/failed CFL measurement invalidated the tracked velocity bound/);
+		solver.dispose();
+	});
+
+	it('recovers a rejected CFL microstep by retrying the remaining duration at finer resolution', async () => {
+		const gpu = setupDevice();
+		const bounds = { waveSpeedBound: 25, velocityBound: 1 };
+		const solver = await createMpmMlsGpuSolver(CANVAS, [PARTICLE], CONFIG, bounds);
+		const plan = calculateMpmCflMicrosteps({
+			macroDt: 0.001,
+			cellSize: CONFIG.grid.cellSize,
+			...bounds,
+			maxMicrosteps: 8
+		});
+		let readbackCount = 0;
+		gpu.setMappedBytes(() => {
+			const snapshot = new ArrayBuffer(4 + 4 + 32);
+			const view = new DataView(snapshot);
+			view.setFloat32(0, 50, true);
+			const currentReadback = readbackCount++;
+			if (currentReadback === 0) {
+				view.setUint32(4, 1, true);
+				view.setUint32(8, 16_384, true);
+				view.setUint32(12, 0, true);
+				view.setUint32(32, 3, true);
+				view.setFloat32(16, 50, true);
+				view.setFloat32(20, bounds.waveSpeedBound, true);
+				view.setFloat32(24, 40, true);
+				view.setFloat32(28, bounds.waveSpeedBound, true);
+			} else if (currentReadback === 1) {
+				view.setUint32(4, 2, true);
+			} else {
+				view.setUint32(4, 1, true);
+			}
+			return snapshot;
+		});
+
+		const measurement = await solver.stepCflBatchAdaptive(
+			3,
+			0.001,
+			plan,
+			bounds.velocityBound,
+			8,
+			{ x: 0, y: 0 }
+		);
+
+		expect(measurement).toMatchObject({
+			maximumSpeed: 50,
+			sequence: 3,
+			attemptedMicroStepCount: 7,
+			retryCount: 1
+		});
+		expect(gpu.dispatches.filter(({ pipeline }) => pipeline.includes('commitParticles'))).toHaveLength(
+			7
+		);
+		expect(
+			gpu.buffers.find(({ label }) => label === 'MLS-MPM CFL committed microstep count')?.size
+		).toBe(Uint32Array.BYTES_PER_ELEMENT);
+		expect(gpu.queue.writeBuffer).toHaveBeenCalledWith(
+			expect.objectContaining({ label: 'MLS-MPM numerical status' }),
+			0,
+			expect.any(Uint32Array)
+		);
+		solver.dispose();
+	});
+
+	it('returns valid partial progress when the retry budget cannot fit, then resumes the remainder', async () => {
+		const gpu = setupDevice();
+		const bounds = { waveSpeedBound: 25, velocityBound: 1 };
+		const solver = await createMpmMlsGpuSolver(CANVAS, [PARTICLE], CONFIG, bounds);
+		const plan = calculateMpmCflMicrosteps({
+			macroDt: 0.001,
+			cellSize: CONFIG.grid.cellSize,
+			...bounds,
+			maxMicrosteps: 4
+		});
+		let readbackCount = 0;
+		gpu.setMappedBytes(() => {
+			const snapshot = new ArrayBuffer(4 + 4 + 32);
+			const view = new DataView(snapshot);
+			const currentReadback = readbackCount++;
+			if (currentReadback === 0) {
+				view.setFloat32(0, 50, true);
+				view.setUint32(4, 1, true);
+				view.setUint32(8, 16_384, true);
+				view.setUint32(12, 0, true);
+				view.setUint32(32, 3, true);
+				view.setFloat32(16, 50, true);
+				view.setFloat32(20, bounds.waveSpeedBound, true);
+				view.setFloat32(24, 40, true);
+				view.setFloat32(28, bounds.waveSpeedBound, true);
+			} else {
+				view.setFloat32(0, 0.5, true);
+				view.setUint32(4, 2, true);
+			}
+			return snapshot;
+		});
+
+		const partial = await solver.stepCflBatchAdaptive(
+			3,
+			0.001,
+			plan,
+			bounds.velocityBound,
+			4,
+			{ x: 0, y: 0 }
+		);
+		expect(partial).toMatchObject({
+			maximumSpeed: 50,
+			sequence: 1,
+			recommendedVelocityBound: 62.5,
+			attemptedMicroStepCount: 3,
+			retryCount: 0,
+			simulatedDuration: 0.001,
+			remainingDuration: 0.002
+		});
+
+		const continuationVelocityBound = partial.recommendedVelocityBound;
+		const continuationPlan = calculateMpmCflMicrosteps({
+			macroDt: 0.001,
+			cellSize: CONFIG.grid.cellSize,
+			waveSpeedBound: solver.cflBounds!.waveSpeedBound,
+			velocityBound: continuationVelocityBound,
+			courantLimit: solver.cflBounds!.courantLimit,
+			maxMicrosteps: 8
+		});
+		const continuation = await solver.stepCflBatchAdaptive(
+			2,
+			0.001,
+			continuationPlan,
+			continuationVelocityBound,
+			8,
+			{ x: 0, y: 0 }
+		);
+
+		expect(continuation).toMatchObject({
+			attemptedMicroStepCount: 2,
+			simulatedDuration: 0.002,
+			remainingDuration: 0
+		});
+		expect(gpu.dispatches.filter(({ pipeline }) => pipeline.includes('commitParticles'))).toHaveLength(
+			5
+		);
 		solver.dispose();
 	});
 

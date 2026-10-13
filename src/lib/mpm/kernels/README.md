@@ -10,7 +10,11 @@ Snow and powder have no derived acoustic bound and are rejected for CFL
 stepping rather than assigned a guessed value. Every CFL microstep checks the
 GPU-resident velocities and current constitutive wave-speed bound before
 commit; exceeding either records a numerical error and rolls back that
-microstep. `config` contains the CPU reference's `grid`,
+microstep. When a Neo-Hookean deformation approaches a collapsed or extreme
+stretch, its principal stretches are projected into `[0.05, 20]` before
+commit, preventing valid-but-ill-conditioned states from destabilizing later
+float32 updates; the CPU reference uses the same projection. `config` contains
+the CPU reference's `grid`,
 `particleMass`, `particleVolume`, and default `material`; particles may override
 their material and reference volume individually. Water and oil particle mass
 is their reference density multiplied by reference volume. Time step and gravity are supplied to
@@ -23,16 +27,18 @@ status buffer and rejects if a GPU step was rolled back. The lab calls it about
 once per second after queue completion; it does not read particle state.
 `measureQueueCompletionMs()` measures how long the submitted GPU queue takes
 to complete; it is not a GPU-only execution-time measurement.
-`measureMaximumParticleSpeed()` asynchronously reads one GPU-reduced float
-and the small numerical status (36 bytes total), not the particle array.
+`measureMaximumParticleSpeed()` asynchronously reads one GPU-reduced float, the
+completed-microstep counter, and the small numerical status (40 bytes total),
+not the particle array.
 Positions, grid spacing, time, gravity, mass, volume, and material parameters use
 the same units and conventions as `reference/README.md`.
 The solver owns the canvas context and device obtained from the shared WebGPU
 session; call `dispose()` when the lab is finished. `step(dt, gravity)` queues
 one direct step. `stepBatch(stepCount, dt, gravity)` encodes sequential fixed
 steps into one command buffer and submits them together. `stepCflBatch()`
-recomputes the plan with `calculateMpmCflMicrosteps()`, rejects a mismatched
-plan or a total microstep count above the caller's cap, and submits
+recomputes the plan with `calculateMpmCflMicrosteps()`, accepts only a matching
+plan or a CFL-certified finer refinement, rejects a total microstep count
+above the caller's cap, and submits
 `macroStepCount * plan.stepCount` full steps at `plan.microDt`. It accepts the
 velocity envelope for the whole batch to choose the microstep count. The
 runtime guard checks each particle's actual speed against the maximum speed
@@ -44,16 +50,37 @@ particle buckets, P2G, build the triangle contact field, update grid, G2P,
 gather triangle reactions, solve bonded triangles, validate CFL bounds, update
 fracture bond damage, apply incident damage to particles, and commit. A batch
 still uses one compute pass. A final GPU reduction finds maximum particle
-speed; only its scalar and the compact status buffer are asynchronously mapped
-on the CPU.
+speed; only its scalar, the completed-microstep counter, and the compact status
+buffer are asynchronously mapped on the CPU.
+
+`stepCflBatchAdaptive()` additionally reads how many microsteps committed
+before a numerical failure. For CFL violations and recoverable deformation
+failures with finite diagnostics, it retries only the failed interval using at
+least twice as many microsteps and updates velocity and wave-speed envelopes
+from the failed trial. Retries are limited to four and share the caller's total
+microstep budget, including work from rejected attempts. The result reports
+`simulatedDuration`, `remainingDuration`, and a `recommendedVelocityBound`.
+When a safe retry or continuation does not fit the remaining budget, the solver
+preserves committed progress and returns the unprocessed duration for the
+caller to schedule later; it never advances through an unvalidated step or
+discards elapsed simulation time. The Gate 4 page restores that duration to its
+time accumulator and resumes it in a later bounded batch. Unsupported
+numerical errors, repeated instability, and a batch that cannot make valid
+progress remain explicit failures. The page permits only one adaptive batch at
+a time so periodic status checks cannot mistake a recoverable trial failure
+for a final solver error.
 
 The Gate 4 lab uses a `1 / 240`-second macrostep and starts at a 2×
 simulation-time multiplier. The UI offers 0.5×–32×; each macrostep is split
 into the complete CFL-planned numerical microsteps. Macrostep rate determines
 simulated time and sinusoidal acceleration, while microstep and particle
-microstep rates are reported separately. A 512-microstep per-frame cap bounds
-work, including after long stalls; if the requested time exceeds that cap, the
-lab reports the error and stops instead of clamping or discarding the time.
+microstep rates are reported separately. The scheduler caps an initial
+per-frame batch at 512 microsteps and defers excess requested work to later
+batches; adaptive recovery counts failed work and retries against a separate
+1,024-microstep batch budget. Unprocessed simulation time remains in the
+accumulator rather than being clamped or discarded. If even one positive,
+representable CFL-safe slice cannot fit the cap, or a batch makes no valid
+progress, the lab reports an explicit error and stops.
 
 Gate 4 derives the liquid acoustic bounds from its tension-free EOS
 (`c² = lambda / referenceDensity`) and the Neo-Hookean bound from the material
@@ -66,14 +93,14 @@ the scheduler and solver reject drag-enabled plans that violate this condition.
 Constitutive and contact accelerations are not assumed away: the GPU guard
 checks the resulting speed against the selected microstep's remaining CFL
 velocity allowance and checks the updated acoustic bound after every
-microstep. It rolls back a violating microstep and surfaces the numerical
-error in the lab status.
+microstep. A violating microstep rolls back to the last valid state; the lab
+then retries the remaining interval with the adaptive policy above.
 This is a guarded, evolving bound, not a claim that the initial speeds are a
 lifetime guarantee. The default 1× macro-time scheduling path is exercised by
-tests; the lab's existing 2× default remains unchanged. At most two compact
-speed/status readbacks may be pending; later frame time remains in the
-accumulator until capacity is available, and any resulting work-cap overflow
-stops explicitly instead of dropping simulated time.
+tests; the lab's existing 2× default remains unchanged. At most one adaptive
+CFL batch and its compact readback may be pending; later frame time remains in
+the accumulator until it completes, and any resulting work-cap overflow stops
+explicitly instead of dropping simulated time.
 
 The Gate 4 sample starts with 8,000 water, 6,000 oil, 200 Neo-Hookean
 elastic pebbles built from three particles each, and a 96-particle connected
@@ -232,8 +259,9 @@ to 64 substeps; P2G and grid-velocity update remain explicit.
   velocity envelopes and checks actual GPU particle velocities/current wave
   speed before commit. Direct `step()` and `stepBatch()` do not select CFL
   steps automatically. A trial that remains non-positive after deformation
-  substepping is rejected and triggers whole-step rollback; this does not make
-  an arbitrarily large step stable.
+  substepping is rejected and triggers microstep rollback; the adaptive API may
+  retry the remaining duration with finer CFL-certified steps, but does not
+  make an arbitrarily large step stable.
 - Buffer sizes and 1D dispatch counts are checked against the acquired device's
   WebGPU limits. Devices that cannot hold the requested state fail setup with
   an explicit error.

@@ -147,7 +147,7 @@ particle/grid/readback buffer を含み、particle buffer 1本の byte 数だけ
 **確認済み（powder-play）**: `stepBatch` は 1 回の `writeBuffer` と 1 つの
 `beginComputePass` の中で、複数 step の dispatch を順番に encode する。
 各 step は `clearGrid → prepareParticles → buildBuckets → p2g → updateGrid → g2p → commitParticles`
-の順で、粒子バッファを ping-pong して入出力を入れ替える。
+の順で、粒子バッファを ping-pong して入出力を入れ替える。接触・bond・CFL・fracture の pass は、対応する機能があるときだけ同じ step に挿入される（格子場の `buildTriangleField` は `p2g` と `updateGrid` の間、三角形接触と bond の solver は `g2p` の後）。
 性能文書の A/B では、8 step の通常 compute pass が 48 から 1 に減った
 （[性能文書 §5](./PERFORMANCE-MLS-MPM.md)）。
 
@@ -168,8 +168,13 @@ powder-play はこの依存を、dispatch の順序と ping-pong で保ってい
 `calculateMpmCflMicrosteps` が 1 マクロ step を複数の microstep に分割する。
 実行時は `validateCflParticles` が GPU 上で各粒子の速度と波速の条件を確認し、
 違反した microstep を rollback する。最大速度は `measureParticleSpeedPartials`
-と `reduceParticleSpeedPartials` が GPU で reduction し、わずか 36 byte 程度の
-readback で CPU に返す（[GPU kernel README](../src/lib/mpm/kernels/README.md)）。
+と `reduceParticleSpeedPartials` が GPU で reduction し、速度 scalar・成功済み
+microstep 数・数値 status の計 40 byte を readback する。CFL 違反や診断可能な
+変形失敗なら、適応 retry が最後に commit した状態から残り時間をより細かい
+CFL step で再試行する。バッチ予算内に安全な継続分を収められない場合は、
+commit 済みの進捗と未処理時間を返し、Gate 4 の accumulator が後続バッチへ繰り越す。
+時刻を飛ばさず、CFL 判定を緩めず、1 step も進められない状態は明示的に停止する
+（[GPU kernel README](../src/lib/mpm/kernels/README.md)）。
 
 **導出**: LiquidFun の制限は粒子径と時間刻みだけで決まる。
 powder-play は材料の波速と実際の速度を見るため、材料パラメータを変えても安全側に働く。
@@ -201,9 +206,10 @@ readback の回数と量は、性能に直接影響する。
 | 固定容量の事前確保 | 再確保と移動を避ける | `layout.ts`、kernel README |
 | 最大速度の GPU reduction と小さな readback | 全粒子の CPU readback を避ける | kernel README（36 byte 程度） |
 | 壁際の速度の減衰（cushion）と halo | 境界条件を格子上で処理する。cushion の幅はドメインに応じて縮む（最大 8 cell） | `WALL_CUSHION_CELLS`、`shaders.ts` |
-| 三角形 contact field の全走査 | 小石数が少ない間の実装の簡潔さ（ただし計算量は大きい） | 性能文書 §3 の未計測項目 |
+| 三角形 contact field の全走査 | 少数の三角形collider向けprototype。全node×bodyの `O(G·B)` 走査で、AABB rejectionは詳細判定だけを省く | `buildTriangleField`。候補絞り込み案と規模ゲートは[性能チューニングロードマップ](./ROADMAP-MLS-MPM-PERFORMANCE.md) |
+| 小石同士のSAT候補探索 | 実際の接触がない物体も全組を調べる `O(B²)` prototype。AABB rejectionはSAT判定だけを省く | `solveBondedTriangles`。広域候補生成は未実装 |
 | 水・油の相別 grid fields | phase ID を保ち、各 node で mass / momentum / volume を別に gather する | `GridNode`、`p2g`、`updateGrid` |
-| node-owned water/oil contact | 混在 node で法線方向の impulse を計算し、相 field に等量・逆向きに適用する | `solveLiquidContact` と controlled reference test |
+| node-owned water/oil contact | 混在 node で法線方向の impulse を計算し、相 field に等量・逆向きに適用する | `solveLiquidGridContact` と controlled reference test |
 | surface occupancy | render-only の水/油 field。色・輪郭を物理 contact や surface tension に流用しない | `gatherSurfaceOccupancy`、`occupancy.ts` |
 | 固体 fracture topology | 初期 bond graph を CSR adjacency と bond state に pack し、GPU で damage / broken を更新する。追加 particle は bond graph に入れない | `layout.ts`、`updateFractureBonds`、`applyFractureParticleDamage` |
 | source / outlet | deterministic emitter を両 ping-pong particle buffer に append し、容量を超える分を数えて報告する。water/oil のみ outlet で sentinel 化し、slot は再利用しない | `scenes/emitter.ts`、`appendParticles`、`removeParticlesInOutlet` |
@@ -259,7 +265,7 @@ LiquidFun 側の性能は、この計算機・ビルドでは測っていない�
 
 | boundary | 所有する責務 | 所有しない責務 |
 |---|---|---|
-| `+page.svelte` | 2D gravity UI、DeviceOrientation permission、source の入力/停止、outlet 操作、状態と件数の報告 | particle state の CPU mirror、画面回転、材料物理の実装 |
+| `src/routes/labs/mpm/kernels/+page.svelte` | 2D gravity UI、DeviceOrientation permission、source の入力/停止、outlet 操作、状態と件数の報告 | particle state の CPU mirror、画面回転、材料物理の実装 |
 | `scenes/gate4.ts` / `scenes/emitter.ts` | 決定論的な初期 particle batch、seed/shape/material/velocity/domain の検証 | GPU 実行状態、source が容量を超えたときの暗黙の成功 |
 | `kernels/solver.ts` と WGSL | upload 後の authoritative particle state、CFL、相 field/contact、bond damage、append/outlet、描画 | CPU 側の粒子状態を毎 frame 同期すること |
 | `reference/solver.ts`、`reference/occupancy.ts`、tests | 小さな deterministic case の oracle と保存則/境界の検査 | 14k 粒子以上の runtime solver、GPU 結果の fidelity を証明すること |
@@ -307,7 +313,7 @@ fracture bonds は初期 solid object の global particle index を参照する�
 GPU buffer に endpoint、rest length、failure strain、damage、broken を保持する。particle ごとの
 CSR incidence が incident bond damage の最大値を particle へ伝える。破断 edge は topology から
 消さず、`broken` を永続させる。append 粒子はこの初期 CSR 範囲外として明示的に扱い、新しい
-bond topology を作らない。bond を持つ object の clone は false を返す。
+bond topology を作らない。fracture bond を持つ object の clone は false を返す（bonded 三角形だけの object は容量内で clone できる）。
 
 この vertical slice は 10 world-unit grid cell に対して 9 world-unit node spacing の2D discrete
 body である。failure strain `0.12`、damage による stress fade、粒子色は研究・検証用の制御値で
@@ -326,12 +332,22 @@ gravity/source/outlet/fracture controls が返ることを確認した。
 14,760への更新を確認した。これはsolverの実機実行とemitter appendのsmoke testであり、
 全機能のbrowser/E2E受け入れではない。
 
+2026-10-13に専用benchmark tabを用いたApple Metal 3 / Headless Chrome 154の実GPU計測を追加した。
+現行の14,696粒子sceneでshader compile・dispatch・数値statusが通過し、batch profileを5回計測した。
+GPU step medianの中央値は0.40109 ms、p95中央値は0.43035 ms（描画なし）。
+別途45粒子・5材料・8 stepのCPU/GPU parityも最大絶対差1.3955e-5で通過した。
+同じ第5回benchmarkの制御GPU fixtureでは、水・油2粒子/8 stepでCPU/GPU最大差3.8653e-5、
+相別mass各0.25、最大運動量残差1.1921e-7、全step非交差を確認した。4粒子・3 bondの破断fixtureでは、
+閾値下/上/無負荷strainを比較しbond index 1だけが破断、damage差は7.63e-6以下。
+rest lengthの初期broken bondも2 step保持した。これらは小規模fixtureの確認であり、
+現行scene全粒子のreadbackやscene-scaleの相別mass/momentum、界面貫入、破断pattern、
+長時間形状保持を確認したものではない。
+この性能値・fixture結果は後から作業treeに加わったadaptive CFL microstep/recovery変更前の
+source snapshotに対する記録である。変更後sourceの検証結果ではないため、M2確認後に再計測する。
 DeviceOrientation の実機許可・拒否、画面向きごとのsensor axes、iOS/Android実機動作、
-outletのGPU除去、連続追加停止、固体emitter、GPU上でのdamage/bond破断は未確認である。
+outletのGPU除去、連続追加停止、固体emitterは未確認である。
 fake GPU tests はcommand order・buffer bounds・容量報告を検査するが、すべてのGPU実行の
-OOB safetyやinterface/fractureの数値挙動を証明しない。Stage 3 のphase contactと
-mass/momentumはcontrolled CPU reference case、Stage 4のfractureはdeterministic CPU
-referenceとfake-GPU pipeline/layout testsに限る。したがって、Stage 1–4は実装prototypeと
+OOB safetyやinterface/fractureの数値挙動を証明しない。したがって、Stage 1–4は実装prototypeと
 一部smoke testがあるが、実機acceptance gate全体を通過したとは扱わない。
 
 Stage 5–6 はこの文書の設計と acceptance gate のみで、runtime solver/API/UI は

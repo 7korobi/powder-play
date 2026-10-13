@@ -6,6 +6,7 @@ export type MpmCflMicrostepInput = {
 	readonly waveSpeedBound: number;
 	readonly velocityBound: number;
 	readonly maxMicrosteps: number;
+	readonly minimumStepCount?: number;
 	readonly courantLimit?: number;
 };
 
@@ -112,6 +113,41 @@ function calculateSafeDt(
 	return scaleByPowerOfTwo(mantissa, exponent);
 }
 
+export type MpmCflSafeDtInput = Pick<
+	MpmCflMicrostepInput,
+	'cellSize' | 'waveSpeedBound' | 'velocityBound' | 'courantLimit'
+>;
+
+export function calculateMpmCflSafeDt(input: MpmCflSafeDtInput): number {
+	if (typeof input !== 'object' || input === null) {
+		throw new RangeError('input must be an object.');
+	}
+	const {
+		cellSize,
+		waveSpeedBound,
+		velocityBound,
+		courantLimit = DEFAULT_MPM_COURANT_LIMIT
+	} = input;
+	if (!Number.isFinite(cellSize) || cellSize <= 0) {
+		throw new RangeError('cellSize must be positive and finite.');
+	}
+	if (!Number.isFinite(waveSpeedBound) || waveSpeedBound < 0) {
+		throw new RangeError('waveSpeedBound must be finite and non-negative.');
+	}
+	if (!Number.isFinite(velocityBound) || velocityBound < 0) {
+		throw new RangeError('velocityBound must be finite and non-negative.');
+	}
+	if (!Number.isFinite(courantLimit) || courantLimit <= 0) {
+		throw new RangeError('courantLimit must be positive and finite.');
+	}
+
+	const safeDt = calculateSafeDt(courantLimit, cellSize, waveSpeedBound, velocityBound);
+	if (Number.isNaN(safeDt) || safeDt <= 0) {
+		throw new RangeError('safeDt is outside the positive representable numeric range.');
+	}
+	return safeDt;
+}
+
 export function calculateMpmCflMicrosteps(
 	input: MpmCflMicrostepInput
 ): MpmCflMicrostepPlan {
@@ -125,34 +161,28 @@ export function calculateMpmCflMicrosteps(
 		waveSpeedBound,
 		velocityBound,
 		maxMicrosteps,
+		minimumStepCount = 1,
 		courantLimit = DEFAULT_MPM_COURANT_LIMIT
 	} = input;
 
 	if (!Number.isFinite(macroDt) || macroDt <= 0) {
 		throw new RangeError('macroDt must be positive and finite.');
 	}
-	if (!Number.isFinite(cellSize) || cellSize <= 0) {
-		throw new RangeError('cellSize must be positive and finite.');
-	}
-	if (!Number.isFinite(waveSpeedBound) || waveSpeedBound < 0) {
-		throw new RangeError('waveSpeedBound must be finite and non-negative.');
-	}
-	if (!Number.isFinite(velocityBound) || velocityBound < 0) {
-		throw new RangeError('velocityBound must be finite and non-negative.');
-	}
-	if (!Number.isFinite(courantLimit) || courantLimit <= 0) {
-		throw new RangeError('courantLimit must be positive and finite.');
-	}
 	if (!Number.isSafeInteger(maxMicrosteps) || maxMicrosteps < 1) {
 		throw new RangeError('maxMicrosteps must be a positive safe integer.');
 	}
-
-	const safeDt = calculateSafeDt(courantLimit, cellSize, waveSpeedBound, velocityBound);
-	if (Number.isNaN(safeDt) || safeDt <= 0) {
-		throw new RangeError('safeDt is outside the positive representable numeric range.');
+	if (!Number.isSafeInteger(minimumStepCount) || minimumStepCount < 1) {
+		throw new RangeError('minimumStepCount must be a positive safe integer.');
 	}
 
-	let stepCount = Math.max(1, Math.ceil(macroDt / safeDt));
+	const safeDt = calculateMpmCflSafeDt({
+		cellSize,
+		waveSpeedBound,
+		velocityBound,
+		courantLimit
+	});
+
+	let stepCount = Math.max(minimumStepCount, Math.ceil(macroDt / safeDt));
 	if (stepCount > maxMicrosteps) {
 		throw new RangeError(
 			`required microstep count (${stepCount}) exceeds maxMicrosteps (${maxMicrosteps}).`

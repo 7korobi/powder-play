@@ -7,6 +7,7 @@ import type {
 import { decodeMpmConstitutiveModel } from '../materials.js';
 import { createMpmWebGpuSession } from '../platform/webgpu.js';
 import {
+	calculateMpmCflSafeDt,
 	calculateMpmCflVelocityLimit,
 	calculateMpmCflMicrosteps,
 	type MpmCflMicrostepInput,
@@ -49,6 +50,36 @@ export interface MpmMlsGpuSpeedMeasurement {
 	readonly sequence: number;
 }
 
+export interface MpmMlsGpuCflFailureDetails {
+	readonly particleSpeed: number;
+	readonly waveSpeed: number;
+	readonly velocityLimit: number;
+	readonly waveSpeedLimit: number;
+}
+
+export interface MpmMlsGpuCflBatchMeasurement extends MpmMlsGpuSpeedMeasurement {
+	readonly recommendedVelocityBound: number;
+	readonly attemptedMicroStepCount: number;
+	readonly retryCount: number;
+	readonly retrySubmissionMilliseconds: number;
+	readonly readbackMilliseconds: number;
+	readonly simulatedDuration: number;
+	readonly remainingDuration: number;
+}
+
+const ERROR_DEFORMATION = 2;
+const ERROR_DEFORMATION_SUBSTEP_LIMIT = 32;
+const ERROR_CFL_BOUND = 16_384;
+const MAX_CFL_STEP_RETRIES = 4;
+const CFL_RECOVERY_BOUND_SAFETY_FACTOR = 1.25;
+
+function isCflMicrostepCapacityError(error: unknown): boolean {
+	return (
+		error instanceof RangeError &&
+		(/exceeds maxMicrosteps|microDt is too small to represent/.test(error.message))
+	);
+}
+
 export interface MpmMlsGpuAppendResult {
 	readonly requested: number;
 	readonly accepted: number;
@@ -89,6 +120,15 @@ export interface MpmMlsGpuSolver {
 		maxMicrosteps: number,
 		gravity: MpmVector2
 	): void;
+	stepCflBatchAdaptive(
+		macroStepCount: number,
+		macroDt: number,
+		microstepPlan: MpmCflMicrostepPlan,
+		velocityBound: number,
+		maxMicrosteps: number,
+		gravity: MpmVector2,
+		gravityForDuration?: (offsetSeconds: number, durationSeconds: number) => MpmVector2
+	): Promise<MpmMlsGpuCflBatchMeasurement>;
 	render(mode?: MpmMlsGpuRenderMode): void;
 	readParticles(particleIndices?: readonly number[]): Promise<readonly MpmParticle[]>;
 	measureMaximumParticleSpeed(): Promise<MpmMlsGpuSpeedMeasurement>;
@@ -114,7 +154,10 @@ export class MpmMlsGpuNumericalError extends Error {
 			readonly precedingDeterminant: number;
 		},
 		readonly particleState?: MpmParticle,
-		readonly projectedDeformation?: MpmMatrix2
+		readonly projectedDeformation?: MpmMatrix2,
+		readonly cflDetails?: MpmMlsGpuCflFailureDetails,
+		readonly completedMicrosteps?: number,
+		readonly measuredMaximumSpeed?: number
 	) {
 		const details = [
 			[1, 'invalid particle stencil or linked-list state'],
@@ -150,8 +193,12 @@ export class MpmMlsGpuNumericalError extends Error {
 			projectedDeformation === undefined
 				? ''
 				: ` (projected F=(${projectedDeformation.m00},${projectedDeformation.m01},${projectedDeformation.m10},${projectedDeformation.m11}))`;
+		const cflContext =
+			cflDetails === undefined
+				? ''
+				: ` (particle speed=${cflDetails.particleSpeed}, wave speed=${cflDetails.waveSpeed}, limits=(${cflDetails.velocityLimit}, ${cflDetails.waveSpeedLimit}))`;
 		super(
-			`GPU MLS-MPM rejected a step (${message || `status 0x${flags.toString(16)}`}${particleContext}${diagnosticContext}${stateContext}${projectionContext}); ` +
+			`GPU MLS-MPM rejected a step (${message || `status 0x${flags.toString(16)}`}${particleContext}${diagnosticContext}${stateContext}${projectionContext}${cflContext}); ` +
 				'all particles were rolled back to the last valid state.'
 		);
 		this.name = 'MpmMlsGpuNumericalError';
@@ -177,10 +224,16 @@ class MpmMlsGpuSurfaceError extends Error {
 	}
 }
 
+interface MpmMlsGpuCflReadbackDiagnostics {
+	readonly completedMicrosteps: number;
+	readonly measuredMaximumSpeed: number;
+}
+
 function decodeNumericalError(
 	snapshot: ArrayBuffer,
 	offset: number,
-	particleAt?: (particleIndex: number) => MpmParticle | undefined
+	particleAt?: (particleIndex: number) => MpmParticle | undefined,
+	cflReadback?: MpmMlsGpuCflReadbackDiagnostics
 ): MpmMlsGpuNumericalError | null {
 	const status = new Uint32Array(snapshot, offset, NUMERICAL_STATUS_WORDS);
 	if (status[0] === 0) return null;
@@ -208,13 +261,25 @@ function decodeNumericalError(
 					m10: values[2],
 					m11: values[3]
 				};
+	const cflDetails =
+		status[6] !== 3
+			? undefined
+			: {
+					particleSpeed: values[0],
+					waveSpeed: values[1],
+					velocityLimit: values[2],
+					waveSpeedLimit: values[3]
+				};
 
 	return new MpmMlsGpuNumericalError(
 		status[0],
 		particleIndex,
 		diagnostics,
 		particleIndex === undefined ? undefined : particleAt?.(particleIndex),
-		projectedDeformation
+		projectedDeformation,
+		cflDetails,
+		cflReadback?.completedMicrosteps,
+		cflReadback?.measuredMaximumSpeed
 	);
 }
 
@@ -226,6 +291,24 @@ function decodeSurfaceError(
 		SURFACE_STATUS_WORD_INDEX
 	];
 	return surfaceFlags === 0 ? null : new MpmMlsGpuSurfaceError(surfaceFlags);
+}
+
+function isRecoverableCflError(error: MpmMlsGpuNumericalError): boolean {
+	if (error.flags === ERROR_CFL_BOUND) {
+		const details = error.cflDetails;
+		return (
+			details !== undefined &&
+			Number.isFinite(details.particleSpeed) &&
+			Number.isFinite(details.waveSpeed) &&
+			Number.isFinite(details.velocityLimit) &&
+			Number.isFinite(details.waveSpeedLimit)
+		);
+	}
+	return (
+		(error.flags === ERROR_DEFORMATION ||
+			error.flags === ERROR_DEFORMATION_SUBSTEP_LIMIT) &&
+		Number.isFinite(error.measuredMaximumSpeed)
+	);
 }
 
 interface MpmMlsGpuPipelines {
@@ -437,6 +520,7 @@ interface MpmMlsGpuRuntime {
 		readonly cloneParams: GPUBuffer;
 		readonly cflSpeedPartials: GPUBuffer;
 		readonly cflMaximumSpeed: GPUBuffer;
+		readonly cflStepProgress: GPUBuffer;
 		readonly particles: readonly [GPUBuffer, GPUBuffer];
 	};
 	readonly pipelines: MpmMlsGpuPipelines;
@@ -661,6 +745,11 @@ async function createRuntime(
 			'MLS-MPM CFL maximum-speed scalar',
 			Float32Array.BYTES_PER_ELEMENT,
 			BUFFER_USAGE.STORAGE | BUFFER_USAGE.COPY_SRC
+		),
+		cflStepProgress: createBuffer(
+			'MLS-MPM CFL committed microstep count',
+			Uint32Array.BYTES_PER_ELEMENT,
+			BUFFER_USAGE.STORAGE | BUFFER_USAGE.COPY_SRC | BUFFER_USAGE.COPY_DST
 		),
 		particles: [
 			createBuffer(
@@ -887,7 +976,8 @@ async function createRuntime(
 			bufferEntry(0, buffers.simulationParams),
 			bufferEntry(1, input),
 			bufferEntry(2, output),
-			bufferEntry(6, buffers.stateError)
+			bufferEntry(6, buffers.stateError),
+			bufferEntry(24, buffers.cflStepProgress)
 		]);
 		const render = createBindGroup(device, pipelines.render, [
 			bufferEntry(0, input),
@@ -978,6 +1068,7 @@ function createSolver(
 	let cflStateCflUsable = cflBounds !== null;
 	let lastScheduledVelocityBound = cflBounds?.velocityBound ?? null;
 	let latestCflBatchSequence = 0;
+	let latestCflBatchMicrostepCount = 0;
 	let latestCompletedCflMeasurementSequence = 0;
 	let currentRenderMode: MpmMlsGpuRenderMode = 'particles';
 	let bondedBodyCount = state.bondedBodyStarts.length;
@@ -1084,6 +1175,13 @@ function createSolver(
 		);
 		let inputIndex = currentBuffer;
 		try {
+			if (cflGuard !== null) {
+				session.device.queue.writeBuffer(
+					runtime.buffers.cflStepProgress,
+					0,
+					new Uint32Array([0])
+				);
+			}
 			session.device.queue.writeBuffer(runtime.buffers.simulationParams, 0, parameters);
 			const encoder = session.device.createCommandEncoder({
 				label:
@@ -1254,31 +1352,45 @@ function createSolver(
 			courantLimit: cflBounds.courantLimit,
 			maxMicrosteps
 		});
+		const certifiedPlan =
+			typeof microstepPlan === 'object' &&
+			microstepPlan !== null &&
+			Number.isSafeInteger(microstepPlan.stepCount) &&
+			microstepPlan.stepCount >= expectedPlan.stepCount
+				? calculateMpmCflMicrosteps({
+						macroDt,
+						cellSize: state.config.grid.cellSize,
+						waveSpeedBound: cflBounds.waveSpeedBound,
+						velocityBound,
+						courantLimit: cflBounds.courantLimit,
+						maxMicrosteps,
+						minimumStepCount: microstepPlan.stepCount
+					})
+				: null;
 		if (
-			typeof microstepPlan !== 'object' ||
-			microstepPlan === null ||
-			microstepPlan.stepCount !== expectedPlan.stepCount ||
-			microstepPlan.microDt !== expectedPlan.microDt ||
-			microstepPlan.safeDt !== expectedPlan.safeDt
+			certifiedPlan === null ||
+			microstepPlan.stepCount !== certifiedPlan.stepCount ||
+			microstepPlan.microDt !== certifiedPlan.microDt ||
+			microstepPlan.safeDt !== certifiedPlan.safeDt
 		) {
 			throw new RangeError(
-				'microstepPlan does not match this solver configuration and certified CFL bounds.'
+				'microstepPlan does not match this solver configuration or is not a certified CFL refinement.'
 			);
 		}
 
-		const microStepCount = macroStepCount * expectedPlan.stepCount;
+		const microStepCount = macroStepCount * certifiedPlan.stepCount;
 		if (!Number.isSafeInteger(microStepCount) || microStepCount > maxMicrosteps) {
 			throw new RangeError(
 				`requested microstep count (${microStepCount}) exceeds maxMicrosteps (${maxMicrosteps}).`
 			);
 		}
-		const representedMacroDt = expectedPlan.microDt * expectedPlan.stepCount;
+		const representedMacroDt = certifiedPlan.microDt * certifiedPlan.stepCount;
 		const durationTolerance =
 			Math.max(macroDt, Number.MIN_VALUE) * Number.EPSILON * 4;
 		if (Math.abs(representedMacroDt - macroDt) > durationTolerance) {
 			throw new RangeError('microstepPlan does not preserve the requested macro dt.');
 		}
-		const gpuMicroDt = Math.fround(expectedPlan.microDt);
+		const gpuMicroDt = Math.fround(certifiedPlan.microDt);
 		if (
 			activeDrag !== null &&
 			(!Number.isFinite(gpuMicroDt) ||
@@ -1293,7 +1405,7 @@ function createSolver(
 		const runtimeVelocityLimit = calculateMpmCflVelocityLimit({
 			cellSize: state.config.grid.cellSize,
 			waveSpeedBound: cflBounds.waveSpeedBound,
-			microDt: expectedPlan.microDt,
+			microDt: certifiedPlan.microDt,
 			courantLimit: cflBounds.courantLimit
 		});
 		if (runtimeVelocityLimit < velocityBound) {
@@ -1303,9 +1415,310 @@ function createSolver(
 		}
 
 		// stepBatch encodes every full P2G -> grid update -> G2P sequence using microDt.
-		stepBatch(microStepCount, expectedPlan.microDt, gravity, runtimeVelocityLimit);
+		stepBatch(microStepCount, certifiedPlan.microDt, gravity, runtimeVelocityLimit);
 		latestCflBatchSequence += 1;
+		latestCflBatchMicrostepCount = microStepCount;
 		lastScheduledVelocityBound = velocityBound;
+	}
+
+	async function stepCflBatchAdaptive(
+		macroStepCount: number,
+		macroDt: number,
+		microstepPlan: MpmCflMicrostepPlan,
+		velocityBound: number,
+		maxMicrosteps: number,
+		gravity: MpmVector2,
+		gravityForDuration?: (offsetSeconds: number, durationSeconds: number) => MpmVector2
+	): Promise<MpmMlsGpuCflBatchMeasurement> {
+		if (cflBounds === null) {
+			throw new RangeError(
+				'CFL stepping requires a material-derived wave-speed bound; this solver configuration has no safely derived CFL bounds.'
+			);
+		}
+		if (!Number.isSafeInteger(macroStepCount) || macroStepCount < 1) {
+			throw new RangeError('macroStepCount must be a positive safe integer.');
+		}
+		if (!Number.isFinite(macroDt) || macroDt <= 0) {
+			throw new RangeError('macroDt must be positive and finite.');
+		}
+		const totalDuration = macroStepCount * macroDt;
+		if (!Number.isFinite(totalDuration)) {
+			throw new RangeError('CFL batch duration is outside the supported range.');
+		}
+
+		let remainingDuration = totalDuration;
+		let attemptMacroStepCount = macroStepCount;
+		let attemptMacroDt = macroDt;
+		let attemptPlan = microstepPlan;
+		let attemptVelocityBound = velocityBound;
+		let consumedMicrostepBudget = 0;
+		let retryCount = 0;
+		let adaptiveSubmissionCount = 0;
+		let retrySubmissionMilliseconds = 0;
+		let readbackMilliseconds = 0;
+		const durationTolerance = Math.max(totalDuration, Number.MIN_VALUE) * Number.EPSILON * 4;
+		const makeBatchMeasurement = (
+			measurement: MpmMlsGpuSpeedMeasurement,
+			recommendedVelocityBound = measurement.maximumSpeed
+		): MpmMlsGpuCflBatchMeasurement => ({
+			...measurement,
+			recommendedVelocityBound,
+			attemptedMicroStepCount: consumedMicrostepBudget,
+			retryCount,
+			retrySubmissionMilliseconds,
+			readbackMilliseconds,
+			simulatedDuration: Math.max(0, totalDuration - remainingDuration),
+			remainingDuration
+		});
+
+		while (true) {
+			const attemptMicroStepCount = attemptMacroStepCount * attemptPlan.stepCount;
+			const attemptDuration = attemptMacroStepCount * attemptMacroDt;
+			const remainingMicrostepBudget = maxMicrosteps - consumedMicrostepBudget;
+			if (
+				!Number.isSafeInteger(attemptMicroStepCount) ||
+				attemptMicroStepCount < 1 ||
+				!Number.isFinite(attemptDuration) ||
+				attemptDuration <= 0 ||
+				attemptMicroStepCount > remainingMicrostepBudget
+			) {
+				throw new RangeError(
+					`adaptive CFL retry requires ${attemptMicroStepCount} microsteps with ${remainingMicrostepBudget} remaining.`
+				);
+			}
+
+			const submissionStartedAt = performance.now();
+			const attemptGravity =
+				gravityForDuration?.(totalDuration - remainingDuration, attemptDuration) ?? gravity;
+			stepCflBatch(
+				attemptMacroStepCount,
+				attemptMacroDt,
+				attemptPlan,
+				attemptVelocityBound,
+				remainingMicrostepBudget,
+				attemptGravity
+			);
+			if (adaptiveSubmissionCount > 0) {
+				retrySubmissionMilliseconds += performance.now() - submissionStartedAt;
+			}
+			adaptiveSubmissionCount += 1;
+
+			const readbackStartedAt = performance.now();
+			let measurement: MpmMlsGpuSpeedMeasurement;
+			try {
+				measurement = await measureMaximumParticleSpeed();
+			} catch (error) {
+				readbackMilliseconds += performance.now() - readbackStartedAt;
+				if (!(error instanceof MpmMlsGpuNumericalError) || !isRecoverableCflError(error)) {
+					throw error;
+				}
+
+				const completedMicrosteps = error.completedMicrosteps;
+				if (
+					!Number.isSafeInteger(completedMicrosteps) ||
+					completedMicrosteps === undefined ||
+					completedMicrosteps < 0 ||
+					completedMicrosteps >= attemptMicroStepCount
+				) {
+					throw new Error(
+						`Adaptive CFL recovery could not determine completed microsteps: ${error.message}`,
+						{ cause: error }
+					);
+				}
+
+				const completedDuration = completedMicrosteps * attemptPlan.microDt;
+				if (!Number.isFinite(completedDuration) || completedDuration >= remainingDuration) {
+					throw new Error(
+						`Adaptive CFL recovery received invalid simulation progress: ${error.message}`,
+						{ cause: error }
+					);
+				}
+				remainingDuration -= completedDuration;
+				consumedMicrostepBudget += attemptMicroStepCount;
+
+				const stopRecovery = (reason: string): never => {
+					throw new Error(
+						`Adaptive CFL recovery stopped after ${retryCount} retry attempt(s) (${reason}); last GPU error: ${error.message}`,
+						{ cause: error }
+					);
+				};
+
+				const observedMaximumSpeed = Math.max(
+					error.measuredMaximumSpeed ?? 0,
+					error.cflDetails?.particleSpeed ?? 0
+				);
+				const retryVelocityBound = Math.max(
+					attemptVelocityBound,
+					lastScheduledVelocityBound ?? 0,
+					observedMaximumSpeed * CFL_RECOVERY_BOUND_SAFETY_FACTOR
+				);
+				if (!Number.isFinite(retryVelocityBound)) {
+					stopRecovery('non-finite velocity bound');
+				}
+				lastScheduledVelocityBound = retryVelocityBound;
+				if (error.cflDetails !== undefined) {
+					const retryWaveSpeedBound =
+						error.cflDetails.waveSpeed * CFL_RECOVERY_BOUND_SAFETY_FACTOR;
+					if (!Number.isFinite(retryWaveSpeedBound)) {
+						stopRecovery('non-finite wave-speed bound');
+					}
+					cflBounds = {
+						...cflBounds,
+						waveSpeedBound: Math.max(
+							cflBounds.waveSpeedBound,
+							retryWaveSpeedBound
+						)
+					};
+				}
+
+				const retryMicrostepBudget = maxMicrosteps - consumedMicrostepBudget;
+				if (retryCount >= MAX_CFL_STEP_RETRIES) {
+					stopRecovery('retry limit reached');
+				}
+				if (retryMicrostepBudget < 2) {
+					session.device.queue.writeBuffer(
+						runtime.buffers.stateError,
+						0,
+						new Uint32Array(NUMERICAL_STATUS_WORDS)
+					);
+					cflStateCflUsable = true;
+					return makeBatchMeasurement(
+						{
+							maximumSpeed: observedMaximumSpeed,
+							sequence: latestCflBatchSequence
+						},
+						retryVelocityBound
+					);
+				}
+
+				const failedIntervalDuration = Math.min(
+					remainingDuration,
+					attemptPlan.microDt
+				);
+				const minimumStepCount = 2;
+				try {
+					attemptPlan = calculateMpmCflMicrosteps({
+						macroDt: failedIntervalDuration,
+						cellSize: state.config.grid.cellSize,
+						waveSpeedBound: cflBounds.waveSpeedBound,
+						velocityBound: retryVelocityBound,
+						courantLimit: cflBounds.courantLimit,
+						maxMicrosteps: retryMicrostepBudget,
+						minimumStepCount
+					});
+				} catch (cause) {
+					if (!isCflMicrostepCapacityError(cause)) {
+						throw new Error(
+							`Adaptive CFL recovery could not schedule a finer step (${describeError(cause)}; ` +
+								`retry=${retryCount + 1}/${MAX_CFL_STEP_RETRIES}, failedIntervalDuration=${failedIntervalDuration}, ` +
+								`previousMicroDt=${attemptPlan.microDt}, minimumStepCount=${minimumStepCount}, ` +
+								`microstepBudget=${retryMicrostepBudget}): ${error.message}`,
+							{ cause }
+						);
+					}
+					session.device.queue.writeBuffer(
+						runtime.buffers.stateError,
+						0,
+						new Uint32Array(NUMERICAL_STATUS_WORDS)
+					);
+					cflStateCflUsable = true;
+					return makeBatchMeasurement(
+						{
+							maximumSpeed: observedMaximumSpeed,
+							sequence: latestCflBatchSequence
+						},
+						retryVelocityBound
+					);
+				}
+
+				session.device.queue.writeBuffer(
+					runtime.buffers.stateError,
+					0,
+					new Uint32Array(NUMERICAL_STATUS_WORDS)
+				);
+				cflStateCflUsable = true;
+				attemptMacroStepCount = 1;
+				attemptMacroDt = failedIntervalDuration;
+				attemptVelocityBound = retryVelocityBound;
+				retryCount += 1;
+				continue;
+			}
+
+			readbackMilliseconds += performance.now() - readbackStartedAt;
+			consumedMicrostepBudget += attemptMicroStepCount;
+			remainingDuration = Math.max(0, remainingDuration - attemptDuration);
+			if (remainingDuration <= durationTolerance) {
+				remainingDuration = 0;
+				return makeBatchMeasurement(
+					measurement,
+					retryCount > 0
+						? Math.max(attemptVelocityBound, measurement.maximumSpeed)
+						: measurement.maximumSpeed
+				);
+			}
+
+			const continuationBudget = maxMicrosteps - consumedMicrostepBudget;
+			if (continuationBudget < 2) {
+				return makeBatchMeasurement(
+					measurement,
+					Math.max(attemptVelocityBound, measurement.maximumSpeed)
+				);
+			}
+			attemptVelocityBound = Math.max(
+				attemptVelocityBound,
+				measurement.maximumSpeed
+			);
+			const safeDt = calculateMpmCflSafeDt({
+				cellSize: state.config.grid.cellSize,
+				waveSpeedBound: cflBounds.waveSpeedBound,
+				velocityBound: attemptVelocityBound,
+				courantLimit: cflBounds.courantLimit
+			});
+			const maximumStepDuration = Math.min(attemptPlan.microDt, safeDt);
+			if (!Number.isFinite(maximumStepDuration) || maximumStepDuration <= 0) {
+				throw new RangeError(
+					`Adaptive CFL recovery produced an invalid continuation timestep (${maximumStepDuration}).`
+				);
+			}
+			const requiredStepCount = Math.ceil(remainingDuration / maximumStepDuration);
+			let continuationDuration = remainingDuration;
+			let minimumContinuationStepCount = Math.max(1, requiredStepCount);
+			if (requiredStepCount >= continuationBudget) {
+				const reservedStepCount = continuationBudget - 1;
+				continuationDuration = Math.min(
+					remainingDuration,
+					maximumStepDuration * reservedStepCount * (1 - Number.EPSILON * 8)
+				);
+				minimumContinuationStepCount = Math.max(
+					1,
+					Math.ceil(continuationDuration / maximumStepDuration)
+				);
+			}
+			if (!Number.isFinite(continuationDuration) || continuationDuration <= 0) {
+				return makeBatchMeasurement(
+					measurement,
+					Math.max(attemptVelocityBound, measurement.maximumSpeed)
+				);
+			}
+			try {
+				attemptPlan = calculateMpmCflMicrosteps({
+					macroDt: continuationDuration,
+					cellSize: state.config.grid.cellSize,
+					waveSpeedBound: cflBounds.waveSpeedBound,
+					velocityBound: attemptVelocityBound,
+					courantLimit: cflBounds.courantLimit,
+					maxMicrosteps: continuationBudget,
+					minimumStepCount: minimumContinuationStepCount
+				});
+			} catch (cause) {
+				throw new Error(
+					`Adaptive CFL recovery could not schedule a safe continuation of ${continuationDuration} seconds: ${describeError(cause)}`,
+					{ cause }
+				);
+			}
+			attemptMacroStepCount = 1;
+			attemptMacroDt = continuationDuration;
+		}
 	}
 
 	function render(mode: MpmMlsGpuRenderMode = 'particles'): void {
@@ -1676,7 +2089,9 @@ function createSolver(
 		cflSpeedMeasurementSubmitted = false;
 		const measurementSequence = latestCflBatchSequence;
 
-		const readbackBytes = Float32Array.BYTES_PER_ELEMENT + NUMERICAL_STATUS_BYTES;
+		const progressOffset = Float32Array.BYTES_PER_ELEMENT;
+		const numericalStatusOffset = progressOffset + Uint32Array.BYTES_PER_ELEMENT;
+		const readbackBytes = numericalStatusOffset + NUMERICAL_STATUS_BYTES;
 		let readback: GPUBuffer;
 		try {
 			readback = session.device.createBuffer({
@@ -1707,10 +2122,17 @@ function createSolver(
 				Float32Array.BYTES_PER_ELEMENT
 			);
 			encoder.copyBufferToBuffer(
+				runtime.buffers.cflStepProgress,
+				0,
+				readback,
+				progressOffset,
+				Uint32Array.BYTES_PER_ELEMENT
+			);
+			encoder.copyBufferToBuffer(
 				runtime.buffers.stateError,
 				0,
 				readback,
-				Float32Array.BYTES_PER_ELEMENT,
+				numericalStatusOffset,
 				NUMERICAL_STATUS_BYTES
 			);
 			session.device.queue.submit([encoder.finish()]);
@@ -1721,17 +2143,30 @@ function createSolver(
 			readback.unmap();
 			mapped = false;
 
+			const completedMicrosteps = new Uint32Array(
+				snapshot,
+				progressOffset,
+				1
+			)[0];
+			if (completedMicrosteps > latestCflBatchMicrostepCount) {
+				throw new RangeError(
+					`GPU reported ${completedMicrosteps} completed microsteps for a batch of ${latestCflBatchMicrostepCount}.`
+				);
+			}
+			const measuredMaximumSpeed = new Float32Array(snapshot, 0, 1)[0];
 			const numericalError = decodeNumericalError(
 				snapshot,
-				Float32Array.BYTES_PER_ELEMENT
+				numericalStatusOffset,
+				undefined,
+				{ completedMicrosteps, measuredMaximumSpeed }
 			);
 			if (numericalError) throw numericalError;
 			const surfaceError = decodeSurfaceError(
 				snapshot,
-				Float32Array.BYTES_PER_ELEMENT
+				numericalStatusOffset
 			);
 			if (surfaceError) throw surfaceError;
-			const maximumSpeed = new Float32Array(snapshot, 0, 1)[0];
+			const maximumSpeed = measuredMaximumSpeed;
 			if (!Number.isFinite(maximumSpeed) || maximumSpeed < 0) {
 				throw new RangeError('GPU returned an invalid maximum-particle-speed scalar.');
 			}
@@ -2237,6 +2672,7 @@ function createSolver(
 		step,
 		stepBatch,
 		stepCflBatch,
+		stepCflBatchAdaptive,
 		render,
 		readParticles,
 		measureMaximumParticleSpeed,

@@ -93,6 +93,26 @@ describe('MPM macrostep and CFL microstep scheduling', () => {
 		).toThrow(/requested microstep count .* exceeds maxMicrosteps/);
 	});
 
+	it('defers excess simulation time when partial batches are explicitly enabled', () => {
+		const batch = calculateMpmStepBatch({
+			accumulatorSeconds: 0,
+			elapsedSeconds: FIXED_STEP_SECONDS * 4.5,
+			simulationSpeed: 1,
+			fixedStepSeconds: FIXED_STEP_SECONDS,
+			...CFL_BOUNDS,
+			maxMicrosteps: 6,
+			allowPartialBatch: true
+		});
+
+		expect(batch.macroStepCount).toBe(2);
+		expect(batch.microStepCount).toBe(6);
+		expect(batch.simulatedSeconds).toBe(FIXED_STEP_SECONDS * 2);
+		expect(batch.remainderSeconds).toBeCloseTo(FIXED_STEP_SECONDS * 2.5);
+		expect(batch.simulatedSeconds + batch.remainderSeconds).toBeCloseTo(
+			FIXED_STEP_SECONDS * 4.5
+		);
+	});
+
 	it('throws when one macrostep alone requires more than the frame cap', () => {
 		expect(() =>
 			calculateMpmStepBatch({
@@ -106,6 +126,28 @@ describe('MPM macrostep and CFL microstep scheduling', () => {
 				maxMicrosteps: 64
 			})
 		).toThrow(/required microstep count .* exceeds maxMicrosteps/);
+	});
+
+	it('splits a macrostep when its safe CFL plan exceeds the per-batch cap', () => {
+		const accumulatedSeconds = FIXED_STEP_SECONDS * 1.5;
+		const batch = calculateMpmStepBatch({
+			accumulatorSeconds: 0,
+			elapsedSeconds: accumulatedSeconds,
+			simulationSpeed: 1,
+			fixedStepSeconds: FIXED_STEP_SECONDS,
+			...CFL_BOUNDS,
+			maxMicrosteps: 2,
+			allowPartialBatch: true
+		});
+
+		expect(batch.macroStepCount).toBe(1);
+		expect(batch.macroDt).toBeLessThan(FIXED_STEP_SECONDS);
+		expect(batch.microStepCount).toBeLessThanOrEqual(2);
+		expect(batch.microstepPlan.microDt).toBeLessThanOrEqual(batch.microstepPlan.safeDt);
+		expect(batch.simulatedSeconds).toBe(batch.macroDt);
+		expect(batch.remainderSeconds).toBeCloseTo(
+			accumulatedSeconds - batch.simulatedSeconds
+		);
 	});
 
 	it('rejects invalid time, speed, and cap inputs', () => {

@@ -7,6 +7,7 @@
 		MPM_MLS_GPU_DRAG_DAMPING,
 		MPM_MLS_GPU_DRAG_STIFFNESS,
 		type MpmMlsGpuAppendResult,
+		type MpmMlsGpuCflBatchMeasurement,
 		type MpmMlsGpuOutletBounds,
 		type MpmMlsGpuRenderMode,
 		type MpmMlsGpuSelection,
@@ -68,10 +69,11 @@
 	const MAX_SIMULATION_SPEED = 32;
 	const SENSOR_GRAVITY_MAXIMUM = 180;
 	const CONTINUOUS_EMISSION_INTERVAL_MS = 250;
-	const MAX_IN_FLIGHT_CFL_BATCHES = 2;
+	const MAX_IN_FLIGHT_CFL_BATCHES = 1;
 	const MAX_MICROSTEPS_PER_FRAME = Math.ceil(
 		MAX_SIMULATION_SPEED / (MPM_RENDER_FPS_OPTIONS[0] * FIXED_STEP_SECONDS)
 	);
+	const MAX_ADAPTIVE_CFL_MICROSTEPS_PER_BATCH = MAX_MICROSTEPS_PER_FRAME * 2;
 	const DEFAULT_RENDER_FPS: MpmRenderFps = 60;
 	const DEFAULT_SIMULATION_SPEED = 2;
 	const SIMULATION_SPEED_OPTIONS = [0.5, 1, 2, 4, 8, 16, MAX_SIMULATION_SPEED] as const;
@@ -119,6 +121,7 @@
 		| 'unsupported';
 	type GpuSolver = Awaited<ReturnType<typeof createMpmMlsGpuSolver>>;
 	let simulatedTimeSeconds = 0;
+	let simulationAccumulatorSeconds = 0;
 	let latestSubmittedCflSequence = 0;
 	let latestPlannedParticleSpeedBound = 0;
 
@@ -140,12 +143,13 @@
 	}
 
 	let submittedMacroStepCount = 0;
+	let submittedMacroStepRemainderSeconds = 0;
 	let submittedMicroStepCount = 0;
 	let submittedParticleMicrosteps = 0;
 	let submittedBatchCount = 0;
 	let submittedBatchCpuMilliseconds = 0;
 
-	interface CflSpeedReadbackSample extends MpmMlsGpuSpeedMeasurement {
+	interface CflSpeedReadbackSample extends MpmMlsGpuCflBatchMeasurement {
 		readonly elapsedMilliseconds: number;
 	}
 
@@ -163,6 +167,7 @@
 		}
 		return calculateMpmCflStepBatch({
 			...input,
+			allowPartialBatch: true,
 			waveSpeedBound: cflBounds.waveSpeedBound,
 			currentVelocityBound: latestPlannedParticleSpeedBound,
 			gravityMagnitude: Math.hypot(gravity.x, gravity.y),
@@ -181,45 +186,68 @@
 		oscillationAmplitude: number,
 		velocityBound: number
 	): Promise<CflSpeedReadbackSample> {
-		const durationSeconds = batch.simulatedSeconds;
+		const startTimeSeconds = simulatedTimeSeconds;
 		const startedAt = performance.now();
-		currentSolver.stepCflBatch(
+		const measurement = currentSolver.stepCflBatchAdaptive(
 			batch.macroStepCount,
-			FIXED_STEP_SECONDS,
+			batch.macroDt,
 			batch.microstepPlan,
 			velocityBound,
-			MAX_MICROSTEPS_PER_FRAME,
-			{
+			MAX_ADAPTIVE_CFL_MICROSTEPS_PER_BATCH,
+			gravity,
+			(offsetSeconds, durationSeconds) => ({
 				x:
 					gravity.x +
 					meanSinusoidalAcceleration(
-						simulatedTimeSeconds,
+						startTimeSeconds + offsetSeconds,
 						durationSeconds,
 						oscillationAmplitude
 					),
 				y: gravity.y
-			}
+			})
 		);
+		const submitMilliseconds = performance.now() - startedAt;
 		const submittedSequence = latestSubmittedCflSequence + 1;
 		latestSubmittedCflSequence = submittedSequence;
 		latestPlannedParticleSpeedBound = velocityBound;
-		simulatedTimeSeconds += durationSeconds;
-		submittedBatchCount += 1;
-		submittedMacroStepCount += batch.macroStepCount;
-		submittedMicroStepCount += batch.microStepCount;
-		submittedParticleMicrosteps += currentSolver.particleCount * batch.microStepCount;
-		submittedBatchCpuMilliseconds += performance.now() - startedAt;
 		cflSpeedReadbackCount += 1;
-		const readbackStartedAt = performance.now();
-		return currentSolver
-			.measureMaximumParticleSpeed()
+		return measurement
 			.then((measurement) => {
-				if (measurement.sequence !== submittedSequence) {
-					throw new Error('GPU CFL speed-readback sequence did not match the submitted batch.');
+				simulatedTimeSeconds += measurement.simulatedDuration;
+				if (measurement.remainingDuration > 0) {
+					if (measurement.simulatedDuration <= 0) {
+						throw new Error(
+							`Adaptive CFL recovery made no valid progress; ${measurement.remainingDuration} seconds remain.`
+						);
+					}
+					simulationAccumulatorSeconds += measurement.remainingDuration;
+					if (!Number.isFinite(simulationAccumulatorSeconds)) {
+						throw new RangeError(
+							'deferred simulation time is outside the supported range.'
+						);
+					}
 				}
+				submittedBatchCount += 1;
+				const macroStepProgress =
+					submittedMacroStepRemainderSeconds + measurement.simulatedDuration;
+				const macroStepTolerance = FIXED_STEP_SECONDS * Number.EPSILON * 8;
+				const completedMacroSteps = Math.floor(
+					(macroStepProgress + macroStepTolerance) / FIXED_STEP_SECONDS
+				);
+				submittedMacroStepCount += completedMacroSteps;
+				submittedMacroStepRemainderSeconds = Math.max(
+					0,
+					macroStepProgress - completedMacroSteps * FIXED_STEP_SECONDS
+				);
+				submittedMicroStepCount += measurement.attemptedMicroStepCount;
+				submittedParticleMicrosteps +=
+					currentSolver.particleCount * measurement.attemptedMicroStepCount;
+				submittedBatchCpuMilliseconds +=
+					submitMilliseconds + measurement.retrySubmissionMilliseconds;
 				return {
 					...measurement,
-					elapsedMilliseconds: performance.now() - readbackStartedAt
+					sequence: submittedSequence,
+					elapsedMilliseconds: measurement.readbackMilliseconds
 				};
 			})
 			.finally(() => {
@@ -227,9 +255,14 @@
 			});
 	}
 
-	function applyCflSpeedSample(sample: CflSpeedReadbackSample): void {
+	function applyCflSpeedSample(
+		sample: MpmMlsGpuSpeedMeasurement & {
+			readonly recommendedVelocityBound?: number;
+		}
+	): void {
 		if (sample.sequence === latestSubmittedCflSequence) {
-			latestPlannedParticleSpeedBound = sample.maximumSpeed;
+			latestPlannedParticleSpeedBound =
+				sample.recommendedVelocityBound ?? sample.maximumSpeed;
 		}
 	}
 
@@ -944,7 +977,6 @@
 		let frameRequest: number | null = null;
 		const framePacer = new MpmFramePacer();
 		let lastFrameTimestamp: number | null = null;
-		let accumulator = 0;
 		let metricsStartTimestamp: number | null = null;
 		let performanceFrameCount = 0;
 		let queueWorkPending = false;
@@ -969,7 +1001,7 @@
 		};
 
 		function fail(error: unknown): void {
-			if (!mounted || phase === 'lost') return;
+			if (!mounted || phase === 'lost' || phase === 'error') return;
 			finishPointerInteraction();
 			phase = 'error';
 			phaseMessage = errorText(error);
@@ -1011,8 +1043,8 @@
 			if (!paused && document.visibilityState === 'visible') {
 				try {
 					if (cflSpeedReadbackCount >= MAX_IN_FLIGHT_CFL_BATCHES) {
-						accumulator += elapsed * simulationSpeed;
-						if (!Number.isFinite(accumulator)) {
+						simulationAccumulatorSeconds += elapsed * simulationSpeed;
+						if (!Number.isFinite(simulationAccumulatorSeconds)) {
 							throw new RangeError(
 								'accumulated simulation time is outside the supported range.'
 							);
@@ -1021,7 +1053,7 @@
 						const planned = calculateBoundedBatch(
 							activeSolver,
 							{
-								accumulatorSeconds: accumulator,
+								accumulatorSeconds: simulationAccumulatorSeconds,
 								elapsedSeconds: elapsed,
 								simulationSpeed,
 								fixedStepSeconds: FIXED_STEP_SECONDS,
@@ -1040,7 +1072,7 @@
 								planned.velocityBound
 							);
 						}
-						accumulator = planned.batch.remainderSeconds;
+						simulationAccumulatorSeconds = planned.batch.remainderSeconds;
 					}
 				} catch (error) {
 					finishPointerInteraction();
@@ -1090,6 +1122,7 @@
 				metricsStartTimestamp = timestamp;
 				performanceFrameCount = 0;
 				submittedMacroStepCount = 0;
+				submittedMacroStepRemainderSeconds = 0;
 				submittedMicroStepCount = 0;
 				submittedParticleMicrosteps = 0;
 				submittedBatchCount = 0;
@@ -1121,7 +1154,10 @@
 					if (!mounted || activeSolver !== submittedSolver) return;
 					queueSampleCount += 1;
 					queueSampleTotalMs += completionMs;
-					if (timestamp - lastNumericalStatusCheckTimestamp >= 1_000) {
+					if (
+						cflSpeedReadbackCount === 0 &&
+						timestamp - lastNumericalStatusCheckTimestamp >= 1_000
+					) {
 						lastNumericalStatusCheckTimestamp = timestamp;
 						await submittedSolver.checkNumericalStatus();
 					}
@@ -1248,10 +1284,7 @@
 				]);
 				if (!mounted || activeSolver !== candidate || phase === 'lost') return;
 				latestSubmittedCflSequence = maximumParticleSpeed.sequence;
-				applyCflSpeedSample({
-					...maximumParticleSpeed,
-					elapsedMilliseconds: 0
-				});
+				applyCflSpeedSample(maximumParticleSpeed);
 
 				const expected = paritySample.probeSampleIndices.map(
 					(index) => expectedSample[index]
@@ -1272,6 +1305,7 @@
 				queueSampleCount = 0;
 				queueSampleTotalMs = 0;
 				simulatedTimeSeconds = 0;
+				simulationAccumulatorSeconds = 0;
 				metricsStartTimestamp = null;
 				performanceFrameCount = 0;
 				measuredMacroStepsPerSecond = null;
@@ -1795,7 +1829,7 @@
 			<p>
 				描画目標は15・30・60・90・120 FPSから選択できます。実際の描画FPSはディスプレイの更新頻度と GPU 処理時間に制約されます。
 				物理 macrostep は 1/240 秒で、CFL 条件を満たす数の数値 microstep に分割し、各 microstep で全 solver pass を実行します。1 frame あたりの上限は macrostep 数ではなく合計512 microstepです。
-				必要量が上限を超えた場合は時間を破棄・clampせず、理由を表示してシミュレーションを停止します。Gate 4 の波速上限は液体 EOS と Neo-Hookean acoustic tensor から導出し、速度包絡は GPU 上の粒子最大速度と重力・左右揺れ・有限半径ドラッグの入力包絡から batch ごとに計算します。GPU guard は各 microstep の実速度を、選択した float32 microDt で波速と合わせて CFL 条件を満たす速度許容域内か検査します。許容域や更新後の波速を超えた microstep は commit 前にロールバックして数値エラーとして停止します。
+				必要量がbatch上限を超えた場合は、範囲内の仕事だけを実行して未処理時間を累積し、後続batchへ繰り越します。Gate 4 の波速上限は液体 EOS と Neo-Hookean acoustic tensor から導出し、速度包絡は GPU 上の粒子最大速度と重力・左右揺れ・有限半径ドラッグの入力包絡から batch ごとに計算します。GPU guard は各 microstep の実速度を、選択した float32 microDt で波速と合わせて CFL 条件を満たす速度許容域内か検査します。Neo-Hookean 変形行列の主伸長が安全域[0.05, 20]を外れる場合は範囲内に射影し、float32での特異化・極端な伸長を防ぎます。CFL 違反や診断可能な変形失敗では、違反 microstep を rollback して最後の有効状態から残り時間を少なくとも倍の刻みで最大4回まで再試行します。初回batchは512 microstepまで、適応再試行は失敗済みworkを含め合計1024 microstepまでです。正の安全なmicrostepを1つも確保できない場合、再試行不能な数値異常、または有効な進捗がない場合は、時間を破棄せず理由を表示して停止します。
 				左右揺れはシミュレーション時間に同期し、batch区間の平均加速度を適用します（0で停止）。queue 完了待ちは GPU 単体の実行時間ではなく、完了を待ってから次の frame を送信します。毎 physics batch の速度計測は GPU 最大値 reduction と非同期の小さな scalar/status readback で、全 particle state の readback は行いません。表示する readback 平均値にはこのコストを含みます。
 			</p>
 		</section>

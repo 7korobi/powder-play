@@ -180,6 +180,10 @@ const WALL_CUSHION_CELLS = 8;
 const MIN_LIQUID_DETERMINANT = 0.5;
 const MAX_LIQUID_DETERMINANT = 2;
 const MIN_POWDER_DETERMINANT = 0.5;
+const MIN_NEO_HOOKEAN_STRETCH = 0.05;
+const MAX_NEO_HOOKEAN_STRETCH = 20;
+const MAX_NEO_HOOKEAN_STRETCH_SQUARED =
+	MAX_NEO_HOOKEAN_STRETCH * MAX_NEO_HOOKEAN_STRETCH;
 const MAX_DEFORMATION_INCREMENT = 0.25;
 const MAX_DEFORMATION_SUBSTEPS = 64;
 export const DEFAULT_BONDED_TRIANGLE_STIFFNESS = 0.35;
@@ -481,6 +485,21 @@ export function stepMpm(
 			F = projectGranularDeformation(trialF, state.material);
 		} else if (state.material.model === 'water' || state.material.model === 'oil') {
 			F = projectLiquidDeformation(trialF);
+		} else if (state.material.model === 'neo-hookean') {
+			const stretchTrace =
+				trialF.m00 * trialF.m00 +
+				trialF.m01 * trialF.m01 +
+				trialF.m10 * trialF.m10 +
+				trialF.m11 * trialF.m11;
+			if (!Number.isFinite(stretchTrace)) {
+				throw new RangeError('Neo-Hookean deformation stretch is outside the supported range');
+			}
+			if (
+				jacobian < MIN_NEO_HOOKEAN_STRETCH * Math.sqrt(stretchTrace) ||
+				stretchTrace > MAX_NEO_HOOKEAN_STRETCH_SQUARED
+			) {
+				F = projectNeoHookeanDeformation(trialF);
+			}
 		}
 
 		const nextX = particle.position.x + validated.dt * velocityX;
@@ -1747,6 +1766,37 @@ function projectLiquidDeformation(deformation: MpmMatrix2): MpmMatrix2 {
 	return projected;
 }
 
+function projectNeoHookeanDeformation(deformation: MpmMatrix2): MpmMatrix2 {
+	const decomposition = decompose2x2(deformation);
+	const sigma1 = Math.max(
+		MIN_NEO_HOOKEAN_STRETCH,
+		Math.min(MAX_NEO_HOOKEAN_STRETCH, decomposition.sigma1)
+	);
+	const sigma2 = Math.max(
+		MIN_NEO_HOOKEAN_STRETCH,
+		Math.min(MAX_NEO_HOOKEAN_STRETCH, decomposition.sigma2)
+	);
+	const projected: MpmMatrix2 = {
+		m00:
+			sigma1 * decomposition.u1.x * decomposition.v1.x +
+			sigma2 * decomposition.u2.x * decomposition.v2.x,
+		m01:
+			sigma1 * decomposition.u1.x * decomposition.v1.y +
+			sigma2 * decomposition.u2.x * decomposition.v2.y,
+		m10:
+			sigma1 * decomposition.u1.y * decomposition.v1.x +
+			sigma2 * decomposition.u2.y * decomposition.v2.x,
+		m11:
+			sigma1 * decomposition.u1.y * decomposition.v1.y +
+			sigma2 * decomposition.u2.y * decomposition.v2.y
+	};
+	assertComputedMatrixFinite(projected, 'projected Neo-Hookean deformation');
+	if (determinant(projected) <= 0) {
+		throw new RangeError('Neo-Hookean projection produced a non-positive deformation determinant');
+	}
+	return projected;
+}
+
 function decompose2x2(F: MpmMatrix2): Decomposition2 {
 	const c00 = F.m00 * F.m00 + F.m10 * F.m10;
 	const c01 = F.m00 * F.m01 + F.m10 * F.m11;
@@ -1774,8 +1824,8 @@ function decompose2x2(F: MpmMatrix2): Decomposition2 {
 		y: (F.m10 * v1.x + F.m11 * v1.y) / sigma1
 	};
 	const u2 = {
-		x: (F.m00 * v2.x + F.m01 * v2.y) / sigma2,
-		y: (F.m10 * v2.x + F.m11 * v2.y) / sigma2
+		x: -u1.y,
+		y: u1.x
 	};
 	const rotation: MpmMatrix2 = {
 		m00: u1.x * v1.x + u2.x * v2.x,

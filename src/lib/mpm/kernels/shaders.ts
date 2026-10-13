@@ -108,6 +108,7 @@ const WALL_CUSHION_CELLS: f32 = 8.0;
 @group(0) @binding(21) var<storage, read> fractureBondTopology: array<u32>;
 @group(0) @binding(22) var<uniform> outletParams: OutletParams;
 @group(0) @binding(23) var<storage, read_write> outletRemovalCounter: array<atomic<u32>>;
+@group(0) @binding(24) var<storage, read_write> cflStepProgress: array<atomic<u32>>;
 
 var<workgroup> cflSpeedReduction: array<f32, 64>;
 
@@ -146,6 +147,10 @@ const SNOW_MAX_HARDENING_EXPONENT: f32 = 20.0;
 const MIN_LIQUID_DETERMINANT: f32 = 0.5;
 const MAX_LIQUID_DETERMINANT: f32 = 2.0;
 const MIN_POWDER_DETERMINANT: f32 = 0.5;
+const MIN_NEO_HOOKEAN_STRETCH: f32 = 0.05;
+const MAX_NEO_HOOKEAN_STRETCH: f32 = 20.0;
+const MAX_NEO_HOOKEAN_STRETCH_SQUARED: f32 =
+	MAX_NEO_HOOKEAN_STRETCH * MAX_NEO_HOOKEAN_STRETCH;
 const MAX_DEFORMATION_INCREMENT: f32 = 0.25;
 const MAX_DEFORMATION_SUBSTEPS: f32 = 64.0;
 
@@ -291,8 +296,8 @@ fn decompose2x2(matrix: vec4<f32>) -> Decomposition2 {
 		(matrix.z * v0.x + matrix.w * v0.y) / max(sigma0, 1.0e-30),
 	);
 	let u1 = vec2<f32>(
-		(matrix.x * v1.x + matrix.y * v1.y) / max(sigma1, 1.0e-30),
-		(matrix.z * v1.x + matrix.w * v1.y) / max(sigma1, 1.0e-30),
+		-u0.y,
+		u0.x,
 	);
 	return Decomposition2(vec2<f32>(sigma0, sigma1), u0, u1, v0, v1);
 }
@@ -406,6 +411,16 @@ fn projectLiquidDeformation(matrix: vec4<f32>) -> vec4<f32> {
 	);
 	let scale = sqrt(boundedVolume);
 	return scale * vec4<f32>(rotation.x, -rotation.y, rotation.y, rotation.x);
+}
+
+fn projectNeoHookeanDeformation(matrix: vec4<f32>) -> vec4<f32> {
+	let decomposition = decompose2x2(matrix);
+	let projectedSigma = clamp(
+		decomposition.sigma,
+		vec2<f32>(MIN_NEO_HOOKEAN_STRETCH),
+		vec2<f32>(MAX_NEO_HOOKEAN_STRETCH),
+	);
+	return reconstructDeformation(decomposition, projectedSigma);
 }
 
 fn quadraticWeights(fraction: f32) -> vec3<f32> {
@@ -1673,6 +1688,19 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		particle.materialModel == MODEL_OIL
 	) {
 		updatedF = projectLiquidDeformation(trialF);
+	} else if (particle.materialModel == MODEL_NEO_HOOKEAN) {
+		let stretchTrace = dot(trialF, trialF);
+		if (!finiteFloat(stretchTrace)) {
+			atomicOr(&stateError[0], ERROR_G2P);
+			return;
+		}
+		if (
+			trialDeterminant <
+				MIN_NEO_HOOKEAN_STRETCH * sqrt(stretchTrace) ||
+			stretchTrace > MAX_NEO_HOOKEAN_STRETCH_SQUARED
+		) {
+			updatedF = projectNeoHookeanDeformation(trialF);
+		}
 	} else if (
 		particle.materialModel != MODEL_NEO_HOOKEAN &&
 		particle.materialModel != MODEL_WATER &&
@@ -1760,7 +1788,14 @@ fn validateCflParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		speed > params.cflBounds.y ||
 		waveSpeed > params.cflBounds.x
 	) {
-		atomicMin(&stateError[1], particleIndex);
+		let previousClaim = atomicOr(&stateError[6], 3u);
+		if (previousClaim == 0u) {
+			atomicStore(&stateError[1], particleIndex);
+			atomicStore(&stateError[2], bitcast<u32>(speed));
+			atomicStore(&stateError[3], bitcast<u32>(waveSpeed));
+			atomicStore(&stateError[4], bitcast<u32>(params.cflBounds.y));
+			atomicStore(&stateError[5], bitcast<u32>(params.cflBounds.x));
+		}
 		atomicOr(&stateError[0], ERROR_CFL_BOUND);
 	}
 }
@@ -2231,6 +2266,10 @@ fn commitParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	}
 	if (atomicLoad(&stateError[0]) != 0u) {
 		particlesOut[particleIndex] = particlesIn[particleIndex];
+		return;
+	}
+	if (particleIndex == 0u && params.cflBounds.z >= 0.5) {
+		atomicAdd(&cflStepProgress[0], 1u);
 	}
 }
 

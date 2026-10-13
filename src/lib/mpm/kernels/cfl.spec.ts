@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+	calculateMpmCflSafeDt,
 	calculateMpmCflVelocityLimit,
 	calculateMpmCflMicrosteps,
 	DEFAULT_MPM_COURANT_LIMIT,
@@ -15,6 +16,13 @@ const baseInput: MpmCflMicrostepInput = {
 };
 
 describe('MPM CFL microstep policy', () => {
+	it('calculates the maximum safe duration for one CFL microstep', () => {
+		expect(calculateMpmCflSafeDt(baseInput)).toBeCloseTo(
+			(DEFAULT_MPM_COURANT_LIMIT * baseInput.cellSize) /
+				(baseInput.waveSpeedBound + baseInput.velocityBound)
+		);
+	});
+
 	it('uses the default Courant limit and returns a complete microstep plan', () => {
 		const plan = calculateMpmCflMicrosteps(baseInput);
 
@@ -23,6 +31,25 @@ describe('MPM CFL microstep policy', () => {
 		expect(plan.safeDt).toBeCloseTo((0.3 * baseInput.cellSize) / 3);
 		expect(plan.microDt).toBeCloseTo(baseInput.macroDt / plan.stepCount);
 		expect(plan.microDt).toBeLessThanOrEqual(plan.safeDt);
+	});
+
+	it('accepts a certified minimum count for a finer CFL plan', () => {
+		const plan = calculateMpmCflMicrosteps({
+			...baseInput,
+			maxMicrosteps: 6,
+			minimumStepCount: 5
+		});
+
+		expect(plan.stepCount).toBe(5);
+		expect(plan.microDt).toBeCloseTo(baseInput.macroDt / 5);
+		expect(plan.microDt).toBeLessThanOrEqual(plan.safeDt);
+		expect(() =>
+			calculateMpmCflMicrosteps({
+				...baseInput,
+				maxMicrosteps: 4,
+				minimumStepCount: 5
+			})
+		).toThrow(/required microstep count .* exceeds maxMicrosteps/);
 	});
 
 	it('accepts a custom positive Courant limit', () => {

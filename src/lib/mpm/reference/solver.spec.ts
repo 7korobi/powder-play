@@ -356,6 +356,38 @@ describe('CPU MLS-MPM reference', () => {
 		expect(plastic.plasticVolume).toBeCloseTo((0.9 * 0.9) / (0.975 * 0.975), 6);
 	});
 
+	it('bounds a collapsing Neo-Hookean principal stretch before it becomes singular', () => {
+		const material = { lambda: 20, mu: 10, model: 'neo-hookean' } as const;
+		const result = stepMpm(
+			[
+				makeParticle({
+					F: { m00: 1, m01: 0, m10: 0, m11: 1e-8 },
+					material
+				})
+			],
+			makeConfig({ dt: 1e-8, gravity: { x: 0, y: 0 } })
+		);
+		const deformation = result.particles[0].F;
+		const determinant =
+			deformation.m00 * deformation.m11 - deformation.m01 * deformation.m10;
+
+		expect(determinant).toBeGreaterThanOrEqual(0.05 * 0.05 - 1e-10);
+		expect(deformation.m11).toBeCloseTo(0.05, 6);
+
+		const extreme = stepMpm(
+			[
+				makeParticle({
+					F: { m00: 1_000, m01: 0, m10: 0, m11: 1e-8 },
+					material
+				})
+			],
+			makeConfig({ dt: 1e-12, gravity: { x: 0, y: 0 } })
+		).particles[0].F;
+		expect(extreme.m00).toBeCloseTo(20, 5);
+		expect(extreme.m11).toBeCloseTo(0.05, 5);
+		expect(extreme.m00 * extreme.m11).toBeGreaterThan(0);
+	});
+
 	it('uses per-particle water and oil density without introducing liquid shear stress', () => {
 		const shear = { m00: 1, m01: 0.4, m10: 0, m11: 1 };
 		const particles = [
