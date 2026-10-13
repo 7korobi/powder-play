@@ -276,6 +276,11 @@ accepted prefix だけを両 ping-pong buffer に書く。容量超過分は `dr
 
 ステージ 1–4 がこの vertical slice の実装範囲である。ステージ 5–6 は将来設計と
 acceptance gate のみであり、現時点で solver API、phase field、thermal state を追加しない。
+各ステージを別の実装単位として進めるため、実行タスクと完了状況は
+[ステージ1–4の実装ロードマップ](./ROADMAP-MLS-MPM-STAGES-1-4.md) と
+[ステージ5–6の将来ロードマップ](./ROADMAP-MLS-MPM-STAGES-5-6.md) に分ける。
+本書の表は全体の境界と受け入れ条件の要約であり、個別ロードマップでは実装済み部分と
+未通過ゲートを区別する。
 
 | stage | scope | gate |
 |---|---|---|
@@ -316,14 +321,18 @@ body である。failure strain `0.12`、damage による stress fade、粒子�
 `npm run build` は成功した。dev server の SSR smoke check では対象 route と
 gravity/source/outlet/fracture controls が返ることを確認した。
 
-ただし、この環境には browser/E2E runner と WebGPU 対応 browser がないため、
-DeviceOrientation の実機許可・拒否、画面向きごとの sensor axes、操作中の
-keyboard/visual/console/hydration、WGSL の実機 compile/dispatch は未検証である。
-fake GPU tests は command order・buffer bounds・容量報告を検査するが、実 GPU の
-OOB safety や interface/fracture の数値挙動を証明しない。Stage 3 の phase contact
-と mass/momentum は controlled CPU reference case、Stage 4 の fracture は
-deterministic CPU reference と fake-GPU pipeline/layout tests に限る。したがって、
-これらの stage は実装済みだが、実機 acceptance gate 全体を通過したとは扱わない。
+共有ブラウザーの WebGPU 対応環境では route の起動と初回CPU/GPU probeを確認した。
+さらに水64粒子の1回追加を操作し、受入64・拒否0・容量超過0、活動粒子数14,696から
+14,760への更新を確認した。これはsolverの実機実行とemitter appendのsmoke testであり、
+全機能のbrowser/E2E受け入れではない。
+
+DeviceOrientation の実機許可・拒否、画面向きごとのsensor axes、iOS/Android実機動作、
+outletのGPU除去、連続追加停止、固体emitter、GPU上でのdamage/bond破断は未確認である。
+fake GPU tests はcommand order・buffer bounds・容量報告を検査するが、すべてのGPU実行の
+OOB safetyやinterface/fractureの数値挙動を証明しない。Stage 3 のphase contactと
+mass/momentumはcontrolled CPU reference case、Stage 4のfractureはdeterministic CPU
+referenceとfake-GPU pipeline/layout testsに限る。したがって、Stage 1–4は実装prototypeと
+一部smoke testがあるが、実機acceptance gate全体を通過したとは扱わない。
 
 Stage 5–6 はこの文書の設計と acceptance gate のみで、runtime solver/API/UI は
 追加していない。GPU 実測値や物理 fidelity は主張しない。buffer memory の値は
