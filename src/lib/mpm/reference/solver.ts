@@ -4,6 +4,7 @@ import {
 	MPM_LIQUID_CONTACT_RELAXATION_SECONDS,
 	MPM_LIQUID_CONTACT_SEPARATION_FRACTION,
 	MPM_LIQUID_STABLE_ORDER_EPSILON,
+	MPM_TRIANGLE_FLUID_TANGENTIAL_DRAG_RATE,
 	SNOW_PLASTICITY
 } from '../materials.js';
 import {
@@ -1079,29 +1080,78 @@ function solveFluidTriangleGridContact(
 	if (inverseBodyMass <= 0) return;
 
 	if (node.waterMass > 0) {
-		const relative =
-			(node.waterVelocityX - surfaceVelocity.x) * field.normal.x +
-			(node.waterVelocityY - surfaceVelocity.y) * field.normal.y;
-		if (relative < 0) {
-			const impulse = -relative / (1 / node.waterMass + inverseBodyMass);
-			node.waterVelocityX += (impulse / node.waterMass) * field.normal.x;
-			node.waterVelocityY += (impulse / node.waterMass) * field.normal.y;
-			field.impulseX -= impulse * field.normal.x;
-			field.impulseY -= impulse * field.normal.y;
-		}
+		const response = resolveFluidTriangleContact(
+			node.waterMass,
+			{ x: node.waterVelocityX, y: node.waterVelocityY },
+			surfaceVelocity,
+			field.normal,
+			inverseBodyMass,
+			config.dt
+		);
+		node.waterVelocityX = response.fluidVelocity.x;
+		node.waterVelocityY = response.fluidVelocity.y;
+		field.impulseX += response.bodyImpulse.x;
+		field.impulseY += response.bodyImpulse.y;
 	}
 	if (node.oilMass > 0) {
-		const relative =
-			(node.oilVelocityX - surfaceVelocity.x) * field.normal.x +
-			(node.oilVelocityY - surfaceVelocity.y) * field.normal.y;
-		if (relative < 0) {
-			const impulse = -relative / (1 / node.oilMass + inverseBodyMass);
-			node.oilVelocityX += (impulse / node.oilMass) * field.normal.x;
-			node.oilVelocityY += (impulse / node.oilMass) * field.normal.y;
-			field.impulseX -= impulse * field.normal.x;
-			field.impulseY -= impulse * field.normal.y;
-		}
+		const response = resolveFluidTriangleContact(
+			node.oilMass,
+			{ x: node.oilVelocityX, y: node.oilVelocityY },
+			surfaceVelocity,
+			field.normal,
+			inverseBodyMass,
+			config.dt
+		);
+		node.oilVelocityX = response.fluidVelocity.x;
+		node.oilVelocityY = response.fluidVelocity.y;
+		field.impulseX += response.bodyImpulse.x;
+		field.impulseY += response.bodyImpulse.y;
 	}
+}
+
+function resolveFluidTriangleContact(
+	fluidMass: number,
+	fluidVelocity: MpmVector2,
+	surfaceVelocity: MpmVector2,
+	normal: MpmVector2,
+	inverseBodyMass: number,
+	dt: number
+): { readonly fluidVelocity: MpmVector2; readonly bodyImpulse: MpmVector2 } {
+	const inverseEffectiveMass = 1 / fluidMass + inverseBodyMass;
+	assertComputedFinite(inverseEffectiveMass, 'triangle contact inverse effective mass');
+	if (inverseEffectiveMass <= 0) {
+		throw new RangeError('triangle contact inverse effective mass must be positive');
+	}
+
+	const relativeVelocity = subtractVector(fluidVelocity, surfaceVelocity);
+	const relativeNormalVelocity = dot2(relativeVelocity, normal);
+	const normalImpulseMagnitude =
+		relativeNormalVelocity < 0
+			? -relativeNormalVelocity / inverseEffectiveMass
+			: 0;
+	const normalImpulse = scaleVector(normal, normalImpulseMagnitude);
+	const tangentialVelocity = subtractVector(
+		relativeVelocity,
+		scaleVector(normal, relativeNormalVelocity)
+	);
+	const tangentialDamping =
+		1 - Math.exp(-MPM_TRIANGLE_FLUID_TANGENTIAL_DRAG_RATE * dt);
+	const tangentialImpulse = scaleVector(
+		tangentialVelocity,
+		-tangentialDamping / inverseEffectiveMass
+	);
+	const impulseOnFluid = addVector(normalImpulse, tangentialImpulse);
+	const nextFluidVelocity = addVector(
+		fluidVelocity,
+		scaleVector(impulseOnFluid, 1 / fluidMass)
+	);
+	const bodyImpulse = scaleVector(impulseOnFluid, -1);
+	assertComputedFinite(nextFluidVelocity.x, 'triangle contact fluid velocity x');
+	assertComputedFinite(nextFluidVelocity.y, 'triangle contact fluid velocity y');
+	assertComputedFinite(bodyImpulse.x, 'triangle contact body impulse x');
+	assertComputedFinite(bodyImpulse.y, 'triangle contact body impulse y');
+
+	return { fluidVelocity: nextFluidVelocity, bodyImpulse };
 }
 
 function updateGridVelocity(

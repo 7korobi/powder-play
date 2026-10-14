@@ -33,6 +33,7 @@ describe('MpmCpuReferenceSimulation', () => {
 				.every((particle) => particle.volume === GATE4_LIQUID_PARTICLE_AREA)
 		).toBe(true);
 		const snapshot = simulation.createRenderSnapshot();
+		expect(snapshot.currentLiquidAreas[0]).toBe(GATE4_LIQUID_PARTICLE_AREA);
 		const renderCopy = new MpmCpuReferenceSimulation(scene);
 		renderCopy.applyRenderSnapshot(snapshot);
 		expect(renderCopy.particles.map(({ position }) => position)).toEqual(
@@ -42,6 +43,53 @@ describe('MpmCpuReferenceSimulation', () => {
 		simulation.dispose();
 		renderCopy.dispose();
 		expect(() => simulation.particles).toThrow(/disposed/);
+	});
+
+	it('renders current liquid area from the latest worker snapshot', () => {
+		const scene = createMpmGate4Scene(GATE4_SCENE_SEED);
+		const deformedScene = {
+			...scene,
+			particles: scene.particles.map((particle, index) =>
+				index === 0
+					? {
+							...particle,
+							F: { m00: 2, m01: 0, m10: 0, m11: 2 }
+						}
+					: particle
+			)
+		};
+		const workerSimulation = new MpmCpuReferenceSimulation(deformedScene);
+		const renderSimulation = new MpmCpuReferenceSimulation(scene);
+		const snapshot = workerSimulation.createRenderSnapshot();
+		const particleRadii: number[] = [];
+		const context = {
+			fillRect() {},
+			save() {},
+			beginPath() {},
+			rect() {},
+			clip() {},
+			fill() {},
+			strokeRect() {},
+			restore() {},
+			moveTo() {},
+			arc(_x: number, _y: number, radius: number) {
+				particleRadii.push(radius);
+			},
+			closePath() {},
+			lineTo() {},
+			stroke() {}
+		} as unknown as CanvasRenderingContext2D;
+
+		renderSimulation.applyRenderSnapshot(snapshot);
+		renderSimulation.draw(context, 2_200, 1_500, 'surface');
+		expect(particleRadii[0]).toBeCloseTo(Math.sqrt(GATE4_LIQUID_PARTICLE_AREA * 4) * 0.675);
+
+		particleRadii.length = 0;
+		renderSimulation.draw(context, 2_200, 1_500, 'particles');
+		expect(particleRadii[0]).toBeCloseTo(Math.sqrt(GATE4_LIQUID_PARTICLE_AREA * 4) * 0.24);
+
+		workerSimulation.dispose();
+		renderSimulation.dispose();
 	});
 
 	it('updates its particle and fracture state through the shared MPM stepper', () => {

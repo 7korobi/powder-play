@@ -2237,7 +2237,7 @@
 			<span><i class="oil-swatch"></i> 油 {GATE4_OIL_PARTICLE_COUNT.toLocaleString()}粒子（密度 0.016・圧縮係数 {(30_000 * GATE4_LIQUID_BULK_MODULUS_SCALE).toLocaleString()}）</span>
 			<span><i class="pebble-swatch"></i> 弾性小石{GATE4_PEBBLE_COUNT}個（各3粒子・Neo-Hookean・λ 20・μ 10）</span>
 			<span><i class="fracture-swatch"></i> GPU fracture body（{GATE4_FRACTURE_PARTICLE_COUNT} node・{GATE4_FRACTURE_BOND_COUNT} bond・赤は damage）</span>
-			固体粒子の参照面積は100 units²です。水・油の参照面積は共通直径の二乗（既定20 unitsなら400 units²）で、質量は各相の密度（水0.02・油0.016）から導出します。粒子数と配置間隔18 unitsは固定のため、直径変更に応じて液体の質量・参照体積が変わります。共有領域は2,200×1,500 world units（220×150 grid・cellSize 10）です。水・油の弱圧縮EOS係数160,000・120,000は変更せず、相別grid fieldでは重なりに応じた基礎分離速度と、接近速度を増幅しない等量・反対向きのimpulseを使います。これは近似的な接触応答であり、完全な非混和性や粒子貫入ゼロを保証しません。小石は一辺132 world units、中心間隔150の正三角形を塗りと輪郭線で描画します。液体の初速は各成分±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石頂点は±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX} world units/sです。左右揺れは既定で有効（±240 world units/s²・0.16 Hz）で、0にすると停止します。界面表示は物理場とは独立した描画近似です。controlled reference testは圧縮応答・接触impulse・質量・運動量を検査しますが、幅広い速度・解像度・長時間挙動を保証しません。表面張力、濡れ、接線摩擦、連続衝突検出、界面の微視的物理は未実装です。
+			固体粒子の参照面積は100 units²です。水・油の参照面積は共通直径の二乗（既定20 unitsなら400 units²）で、質量は各相の密度（水0.02・油0.016）から導出します。粒子数と配置間隔18 unitsは固定のため、直径変更に応じて液体の質量・参照体積が変わります。共有領域は2,200×1,500 world units（220×150 grid・cellSize 10）です。水・油の弱圧縮EOS係数160,000・120,000は変更せず、相別grid fieldでは重なりに応じた基礎分離速度と、接近速度を増幅しない等量・反対向きのimpulseを使います。これは近似的な接触応答であり、完全な非混和性や粒子貫入ゼロを保証しません。小石は一辺132 world units、中心間隔150の正三角形を塗りと輪郭線で描画します。小石と液体の接触では法線応答に加えて、4 s⁻¹の接線粘性dragを適用し、流れを小石の移動・回転へ伝えます。液体の初速は各成分±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石頂点は±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX} world units/sです。左右揺れは既定で有効（±240 world units/s²・0.16 Hz）で、0にすると停止します。界面表示は物理場とは独立した描画近似です。controlled reference testは圧縮応答・接触impulse・質量・運動量を検査しますが、幅広い速度・解像度・長時間挙動を保証しません。表面張力、濡れ、水・油相境界の接線摩擦、連続衝突検出、界面の微視的物理は未実装です。
 		</p>
 
 		<section class="performance" aria-labelledby="performance-title">
@@ -2404,8 +2404,8 @@
 	</section>
 
 	<aside class="note">
-		<strong>検証範囲と限界:</strong> 2D weakly-compressible MLS-MPM の P2G・grid update・G2P、水・油の別々の材料/速度場、node-owned normal contact、粒子 emitter、GPU outlet、GPU solid-bond damage を含みます。Controlled reference tests は相 identity、相ごとの mass と接触 momentum、fracture damage の閾値・保存・局所化・fragment motion・bounds を確認します。初回 CPU/GPU 比較は fluid と既存小石の局所 sample で、GPU fracture の定量精度比較ではありません。
-		水・油は field 分離と相別の法線接触によって制御ケースで非混合 interface を維持しますが、任意初期配置での完全分離は保証しません。relative buoyancy は近似、surface tension・wetting・接線摩擦・gas pressure・cavitation・bubble transport は未実装です。出口は water/oil のみを除去し、removed slot は圧縮・再利用しません。粒子数は容量を一度予約すると減りません。
+		<strong>検証範囲と限界:</strong> 2D weakly-compressible MLS-MPM の P2G・grid update・G2P、水・油の別々の材料/速度場、水・油相境界のnode-owned normal contact、小石と液体の法線接触・4 s⁻¹接線粘性drag、粒子 emitter、GPU outlet、GPU solid-bond damage を含みます。Controlled reference tests は相 identity、相ごとの mass と接触 momentum、fracture damage の閾値・保存・局所化・fragment motion・bounds を確認します。初回 CPU/GPU 比較は fluid と既存小石の局所 sample で、GPU fracture の定量精度比較ではありません。
+		水・油は field 分離と相別の法線接触によって制御ケースで非混和 interface を維持しますが、任意初期配置での完全分離は保証しません。relative buoyancy は近似、surface tension・wetting・水・油相境界の接線摩擦・gas pressure・cavitation・bubble transport は未実装です。出口は water/oil のみを除去し、removed slot は圧縮・再利用しません。粒子数は容量を一度予約すると減りません。
 		連結 fracture body は96個の node と局所 bond topology を GPU 上で更新し、damage を赤色化します。閾値はこの配置用の探索値で、破壊エネルギーや解像度非依存の material strength ではありません。mesh spacing 9 world units と grid cell 10 の解像度に依存し、fragment は bond failure 後も粒子/弾性 constitutive response で近似します。bonded body は clone を禁止し、broken topology を再生成しません。continuous solid fracture の一般性・負荷範囲・性能は未検証です。
 		一時停止中の状態確認以外に全 particle state を CPU に readback しません。GPU 数値 guard・CFL 上限と初回 CPU parity は異常検出/局所比較であり、実機での網羅性や数値 fidelity の証明ではありません。液体の det(F) は既存の0.5〜2制限です。
 	</aside>

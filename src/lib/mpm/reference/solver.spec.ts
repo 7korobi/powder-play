@@ -668,6 +668,64 @@ describe('CPU MLS-MPM reference', () => {
 		);
 	});
 
+	it('transfers tangential liquid motion to bonded triangles without gaining energy', () => {
+		const particles: MpmParticle[] = [
+			makeParticle({
+				position: { x: 7.5, y: 8 },
+				velocity: { x: 0, y: 4 },
+				objectId: 1,
+				volume: 0.25,
+				material: { lambda: 8, mu: 0, model: 'water', density: 1 }
+			}),
+			makeParticle({
+				position: { x: 8, y: 7.5 },
+				objectId: 2,
+				bondedTriangleVertex: 0
+			}),
+			makeParticle({
+				position: { x: 8, y: 8.5 },
+				objectId: 2,
+				bondedTriangleVertex: 1
+			}),
+			makeParticle({
+				position: { x: 8 + Math.sqrt(3) / 2, y: 8 },
+				objectId: 2,
+				bondedTriangleVertex: 2
+			})
+		];
+		const result = stepMpm(
+			particles,
+			makeConfig({
+				dt: 0.01,
+				particleVolume: 0.25,
+				bondRestLength: 1,
+				gravity: { x: 0, y: 0 }
+			})
+		);
+		const triangle = result.particles.slice(1);
+		const triangleMomentumY = triangle.reduce(
+			(momentum, particle) => momentum + 0.1 * particle.velocity.y,
+			0
+		);
+		const inputKineticEnergy = 0.5 * 0.25 * 4 ** 2;
+		const outputKineticEnergy = result.particles.reduce(
+			(energy, particle, index) =>
+				energy +
+				0.5 *
+					(index === 0 ? 0.25 : 0.1) *
+					(particle.velocity.x ** 2 + particle.velocity.y ** 2),
+			0
+		);
+
+		expect(result.particles[0].velocity.y).toBeLessThan(4);
+		expect(triangleMomentumY).toBeGreaterThan(0);
+		expect(outputKineticEnergy).toBeLessThanOrEqual(inputKineticEnergy + 1e-8);
+		expect(result.diagnostics.outputMomentum.y).toBeCloseTo(
+			result.diagnostics.inputMomentum.y,
+			8
+		);
+	});
+
 	it('restores a stretched bonded triangle toward its configured edge length', () => {
 		const particles: MpmParticle[] = [
 			makeParticle({

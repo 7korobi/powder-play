@@ -153,7 +153,11 @@ gravitationally stable density order, the solver reverses it so the denser
 phase is driven with gravity and the lighter phase against it. This promotes
 layer reordering but is not a continuum buoyancy or surface-tension solve.
 The triangle signed-distance field projects liquid particles out of the
-pebbles and gathers the opposing normal impulse back to the three vertices.
+pebbles and gathers equal-and-opposite normal and tangential impulses back to
+the three vertices. Tangential relative velocity is exponentially relaxed at
+a rate of 4 s⁻¹, with each CFL microstep applying `1 - exp(-4 × dt)`. This
+rate-based drag transfers some wave motion into pebble translation and rotation;
+it is not Coulomb friction.
 Pebble pairs use triangle SAT contact to reduce approaching normal velocity;
 the pair impulse pass does not translate triangle vertices. Repeated post-G2P
 position corrections destabilized the triangle contact field during CFL
@@ -186,20 +190,21 @@ tests and benchmarks; the lab chooses a fresh seed on initialization.
 The 16×16 tile candidate bitset reduces sparse field scans for up to 512 bodies.
 With 50 active pebble bodies, the full-scan upper bound is about 1.71 million
 node/body candidates per step and unordered SAT pairs fall from 19,900 to
-1,225. A current no-render `batch` profile on Apple Metal 3 / Headless Chrome
+1,225. A historical no-render `batch` profile on Apple Metal 3 / Headless Chrome
 154 used 3,674 particles and 12 samples of eight steps: GPU step median was
 0.217 ms and p95 was 0.256 ms before the liquid area increase from 100 to 400.
-The same fixed-step harness does not run the lab's adaptive CFL scheduler; with
-the larger liquid area, it now rejects a step after the deformation update
-exceeds its adaptive substep limit at particle 509. Treat the old timing as
-historical and the current performance as unmeasured. The interactive lab did
-remain active for a 15-second adaptive-CFL browser smoke. The diagnostic
+The fixed-step harness does not run the lab's adaptive CFL scheduler. This
+revision's 400-area batch run rejected a step after the deformation update
+exceeded its adaptive substep limit at particle 1170; this is not a profile of
+the interactive adaptive route. The old timing is historical and current
+performance is unmeasured. Both pages remained active during a 10-second
+foreground browser smoke with zero console errors. The diagnostic
 `stages` profile splits the batch into multiple passes and its times are not
 directly comparable. Node-level field candidate counts remain unmeasured. The
 GPU contact fixture also passed at
 opposed ±64 world-units/s with no particle crossing over eight 0.001-second
-steps, while preserving phase mass and momentum within the stated tolerance. Contact
-friction, surface tension, wetting, complete water/oil separation in arbitrary
+steps, while preserving phase mass and momentum within the stated tolerance.
+Coulomb friction, surface tension, wetting, complete water/oil separation in arbitrary
 flows, and swept collision detection are not implemented.
 
 The additional solid is a 6 × 4 node Neo-Hookean object with 53 initial
@@ -311,8 +316,8 @@ IDs; they do not prove complete immiscibility or general interface stability.
 GPU surface occupancy is render-only. The liquid polar projection bounds
 `det(F)` to `[0.5, 2]` to prevent unbounded volume drift in the tension-free
 equation of state.
-Surface tension, wetting, tangential interface friction, powder compaction,
-gas, and thermal behavior remain unimplemented. The deformation-gradient
+Surface tension, wetting, tangential water/oil interface friction, powder
+compaction, gas, and thermal behavior remain unimplemented. The deformation-gradient
 update uses fused 2×2 products and a compensated determinant. It adaptively
 substeps large increments and retries non-positive trials with finer steps, up
 to 64 substeps; P2G and grid-velocity update remain explicit.

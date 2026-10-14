@@ -20,6 +20,7 @@ export const MPM_CPU_MAX_CFL_MICROSTEPS_PER_MANUAL_STEP = 256;
 
 export interface MpmCpuRenderSnapshot {
 	readonly positions: Float64Array;
+	readonly currentLiquidAreas: Float32Array;
 	readonly brokenFractureBonds: Uint8Array;
 }
 
@@ -70,6 +71,7 @@ export type MpmCpuWorkerResponse =
 
 export class MpmCpuReferenceSimulation {
 	private currentParticles: readonly MpmParticle[];
+	private currentLiquidAreas: Float32Array;
 	private currentFractureBonds: readonly MpmSolidBond[];
 	private disposed = false;
 
@@ -85,6 +87,7 @@ export class MpmCpuReferenceSimulation {
 
 	constructor(scene: MpmGate4Scene) {
 		this.currentParticles = scene.particles;
+		this.currentLiquidAreas = this.calculateCurrentLiquidAreas(scene.particles);
 		this.currentFractureBonds = scene.fractureBonds;
 		this.particleCount = scene.particles.length;
 		this.waterParticleCount = scene.particles.filter(
@@ -133,6 +136,7 @@ export class MpmCpuReferenceSimulation {
 			fractureBonds: this.currentFractureBonds
 		});
 		this.currentParticles = result.particles;
+		this.currentLiquidAreas = this.calculateCurrentLiquidAreas(result.particles);
 		this.currentFractureBonds = result.fractureBonds ?? this.currentFractureBonds;
 		return result;
 	}
@@ -140,6 +144,7 @@ export class MpmCpuReferenceSimulation {
 	createRenderSnapshot(): MpmCpuRenderSnapshot {
 		this.assertActive();
 		const positions = new Float64Array(this.currentParticles.length * 2);
+		const currentLiquidAreas = new Float32Array(this.currentLiquidAreas);
 		for (let index = 0; index < this.currentParticles.length; index += 1) {
 			const particle = this.currentParticles[index];
 			if (!particle) {
@@ -156,16 +161,33 @@ export class MpmCpuReferenceSimulation {
 			}
 			brokenFractureBonds[index] = bond.broken ? 1 : 0;
 		}
-		return { positions, brokenFractureBonds };
+		return { positions, currentLiquidAreas, brokenFractureBonds };
 	}
 
 	applyRenderSnapshot(snapshot: MpmCpuRenderSnapshot): void {
 		this.assertActive();
 		if (
 			snapshot.positions.length !== this.particleCount * 2 ||
+			snapshot.currentLiquidAreas.length !== this.particleCount ||
 			snapshot.brokenFractureBonds.length !== this.fractureBondCount
 		) {
 			throw new RangeError('The CPU worker returned a render snapshot with invalid dimensions.');
+		}
+		for (let index = 0; index < this.particleCount; index += 1) {
+			const particle = this.currentParticles[index];
+			const area = snapshot.currentLiquidAreas[index];
+			if (!particle) {
+				throw new RangeError(`Particle ${index} is missing from the CPU simulation.`);
+			}
+			const isLiquid =
+				particle.material?.model === 'water' ||
+				particle.material?.model === 'oil';
+			if (
+				(isLiquid && (!Number.isFinite(area) || area <= 0)) ||
+				(!isLiquid && area !== 0)
+			) {
+				throw new RangeError(`Particle ${index} has an invalid current liquid area.`);
+			}
 		}
 		this.currentParticles = this.currentParticles.map((particle, index) => {
 			const x = snapshot.positions[index * 2];
@@ -175,6 +197,7 @@ export class MpmCpuReferenceSimulation {
 			}
 			return { ...particle, position: { x, y } };
 		});
+		this.currentLiquidAreas = new Float32Array(snapshot.currentLiquidAreas);
 		this.currentFractureBonds = this.currentFractureBonds.map((bond, index) => {
 			const broken = snapshot.brokenFractureBonds[index];
 			if (broken !== 0 && broken !== 1) {
@@ -251,6 +274,7 @@ export class MpmCpuReferenceSimulation {
 	dispose(): void {
 		this.disposed = true;
 		this.currentParticles = [];
+		this.currentLiquidAreas = new Float32Array();
 		this.currentFractureBonds = [];
 	}
 
@@ -264,11 +288,15 @@ export class MpmCpuReferenceSimulation {
 		renderMode: MpmCpuRenderMode
 	): void {
 		context.beginPath();
-		for (const particle of this.currentParticles) {
+		for (let index = 0; index < this.currentParticles.length; index += 1) {
+			const particle = this.currentParticles[index];
+			if (!particle) {
+				throw new RangeError(`Particle ${index} is missing from the CPU simulation.`);
+			}
 			if (particle.material?.model !== model) continue;
-			const area = particle.volume;
+			const area = this.currentLiquidAreas[index];
 			if (area === undefined || !Number.isFinite(area) || area <= 0) {
-				throw new RangeError(`A ${model} particle has an invalid reference area.`);
+				throw new RangeError(`A ${model} particle has an invalid current area.`);
 			}
 			const radius =
 				Math.sqrt(area) *
@@ -339,6 +367,46 @@ export class MpmCpuReferenceSimulation {
 			context.fill();
 			context.stroke();
 		}
+	}
+
+	private calculateCurrentLiquidAreas(
+		particles: readonly MpmParticle[]
+	): Float32Array {
+		const areas = new Float32Array(particles.length);
+		for (let index = 0; index < particles.length; index += 1) {
+			const particle = particles[index];
+			if (!particle) {
+				throw new RangeError(`Particle ${index} is missing from the CPU simulation.`);
+			}
+			if (
+				particle.material?.model !== 'water' &&
+				particle.material?.model !== 'oil'
+			) {
+				continue;
+			}
+			const referenceArea = particle.volume;
+			const deformation = particle.F;
+			const determinant =
+				deformation.m00 * deformation.m11 -
+				deformation.m01 * deformation.m10;
+			const area =
+				referenceArea === undefined
+					? Number.NaN
+					: Math.fround(referenceArea * determinant);
+			if (
+				referenceArea === undefined ||
+				!Number.isFinite(referenceArea) ||
+				referenceArea <= 0 ||
+				!Number.isFinite(determinant) ||
+				determinant <= 0 ||
+				!Number.isFinite(area) ||
+				area <= 0
+			) {
+				throw new RangeError(`Liquid particle ${index} has an invalid current area.`);
+			}
+			areas[index] = area;
+		}
+		return areas;
 	}
 
 	private drawFractureNetwork(

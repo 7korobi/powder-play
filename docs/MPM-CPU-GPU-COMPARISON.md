@@ -7,6 +7,12 @@ network, fixed timestep, and CFL limit. The CPU page is not a LiquidFun/Box2D
 simulation; the older standalone LiquidFun benchmark is documented in
 [LIQUIDFUN-BENCHMARK.md](./LIQUIDFUN-BENCHMARK.md).
 
+Liquid contact with bonded triangles uses the same normal response and
+rate-based tangential drag on both implementations. Tangential relative
+velocity is exponentially relaxed at 4 s⁻¹, with equal-and-opposite impulses
+so fluid flow can carry and rotate triangles without adding contact energy in
+the isolated two-body response.
+
 ## Shared scene and adjustable liquid size
 
 The shared scene is created by `createMpmGate4Scene` with seed `0x4d504d34`.
@@ -52,7 +58,9 @@ pages; normal simulation begins with the same oscillation phase afterward.
   scene.
 - Rendering is implementation-specific. The CPU route uses Canvas2D, while
   the GPU route uses WebGPU surface/particle render paths. Compare physical
-  state and step throughput separately from the visual renderer.
+  state and step throughput separately from the visual renderer. Both paths
+  now scale liquid display area using the current deformation, although their
+  surface extraction and rasterization remain different.
 
 Both pages provide matching baseline controls for pause/resume, one step,
 gravity and device tilt, simulation speed, liquid particle size, oscillation,

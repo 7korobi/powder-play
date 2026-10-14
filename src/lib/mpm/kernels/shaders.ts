@@ -2,7 +2,8 @@ import {
 	MPM_LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER,
 	MPM_LIQUID_CONTACT_RELAXATION_SECONDS,
 	MPM_LIQUID_CONTACT_SEPARATION_FRACTION,
-	MPM_LIQUID_STABLE_ORDER_EPSILON
+	MPM_LIQUID_STABLE_ORDER_EPSILON,
+	MPM_TRIANGLE_FLUID_TANGENTIAL_DRAG_RATE
 } from '../materials.js';
 
 export const MLS_MPM_COMPUTE_WGSL = /* wgsl */ `
@@ -162,6 +163,7 @@ const LIQUID_CONTACT_SEPARATION_FRACTION: f32 = ${MPM_LIQUID_CONTACT_SEPARATION_
 const LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER: f32 = ${MPM_LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER};
 const LIQUID_CONTACT_RELAXATION_SECONDS: f32 = ${MPM_LIQUID_CONTACT_RELAXATION_SECONDS};
 const LIQUID_STABLE_ORDER_EPSILON: f32 = ${MPM_LIQUID_STABLE_ORDER_EPSILON};
+const TRIANGLE_FLUID_TANGENTIAL_DRAG_RATE: f32 = ${MPM_TRIANGLE_FLUID_TANGENTIAL_DRAG_RATE};
 const TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT: u32 = 512u;
 const TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS: u32 = 32u;
 const TRIANGLE_FIELD_CANDIDATE_TILE_SIZE: u32 = 16u;
@@ -1440,24 +1442,40 @@ fn updateGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		}
 		let normal = field.normal / normalLength;
 		if (waterMass > 0.0 && waterVolume > 0.0) {
-			let relativeNormalVelocity = dot(waterVelocity - surfaceVelocity, normal);
+			let relativeVelocity = waterVelocity - surfaceVelocity;
+			let relativeNormalVelocity = dot(relativeVelocity, normal);
+			let inverseEffectiveMass = 1.0 / waterMass + inverseBodyMass;
+			var impulse = vec2<f32>(0.0, 0.0);
 			if (relativeNormalVelocity < 0.0) {
-				let impulseMagnitude =
-					-relativeNormalVelocity / (1.0 / waterMass + inverseBodyMass);
-				let impulse = impulseMagnitude * normal;
-				waterVelocity = waterVelocity + impulse / waterMass;
-				field.impulse = field.impulse - impulse;
+				impulse =
+					(-relativeNormalVelocity / inverseEffectiveMass) * normal;
 			}
+			let tangentialVelocity =
+				relativeVelocity - relativeNormalVelocity * normal;
+			let tangentialDamping =
+				1.0 - exp(-TRIANGLE_FLUID_TANGENTIAL_DRAG_RATE * params.physical.w);
+			impulse =
+				impulse - (tangentialDamping / inverseEffectiveMass) * tangentialVelocity;
+			waterVelocity = waterVelocity + impulse / waterMass;
+			field.impulse = field.impulse - impulse;
 		}
 		if (oilMass > 0.0 && oilVolume > 0.0) {
-			let relativeNormalVelocity = dot(oilVelocity - surfaceVelocity, normal);
+			let relativeVelocity = oilVelocity - surfaceVelocity;
+			let relativeNormalVelocity = dot(relativeVelocity, normal);
+			let inverseEffectiveMass = 1.0 / oilMass + inverseBodyMass;
+			var impulse = vec2<f32>(0.0, 0.0);
 			if (relativeNormalVelocity < 0.0) {
-				let impulseMagnitude =
-					-relativeNormalVelocity / (1.0 / oilMass + inverseBodyMass);
-				let impulse = impulseMagnitude * normal;
-				oilVelocity = oilVelocity + impulse / oilMass;
-				field.impulse = field.impulse - impulse;
+				impulse =
+					(-relativeNormalVelocity / inverseEffectiveMass) * normal;
 			}
+			let tangentialVelocity =
+				relativeVelocity - relativeNormalVelocity * normal;
+			let tangentialDamping =
+				1.0 - exp(-TRIANGLE_FLUID_TANGENTIAL_DRAG_RATE * params.physical.w);
+			impulse =
+				impulse - (tangentialDamping / inverseEffectiveMass) * tangentialVelocity;
+			oilVelocity = oilVelocity + impulse / oilMass;
+			field.impulse = field.impulse - impulse;
 		}
 	}
 

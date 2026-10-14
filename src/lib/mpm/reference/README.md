@@ -83,6 +83,12 @@ Near-equal density contrasts or near-tangential gravity do not trigger the
 reversal. This is a discrete sorting heuristic, not a full interface or
 buoyancy model.
 
+Near bonded triangles, grid contact removes closing normal velocity and
+applies equal-and-opposite tangential drag at a rate of 4 s⁻¹. The exponential
+relaxation scales with each timestep, so CFL microsteps do not linearly
+multiply the intended drag. This couples fluid motion into triangle translation
+and rotation; it is viscous drag, not Coulomb friction.
+
 The default constitutive law is compressible 2D Neo-Hookean elasticity:
 
 ```text
@@ -133,8 +139,10 @@ These models can coexist in one particle array and grid. Solids use the common
 grid velocity, while water and oil use separate phase velocity and volume
 fields. The density-aware grid contact is approximate: there is no
 particle-level interphase contact, surface tension, wetting, or full
-immiscibility, and phases can still interpenetrate or numerically mix. There
-is also no automatic CFL-based physical substepping in this CPU reference;
+immiscibility, and phases can still interpenetrate or numerically mix. The
+triangle drag is a grid-contact approximation, not a calibrated fluid-solid
+viscosity model. There is also no automatic CFL-based physical substepping in
+this CPU reference;
 large deformation-gradient increments alone are adaptively subdivided, up to
 64 increments.
 
