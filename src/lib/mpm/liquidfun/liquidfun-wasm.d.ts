@@ -73,7 +73,8 @@ declare module 'liquidfun-wasm' {
 	export interface B2ParticleSystem {
 		CreateParticle(definition: B2ParticleDef): number;
 		GetParticleCount(): number;
-		GetPositionBuffer(): unknown;
+		GetParticleFlags(index: number): number;
+		GetPositionBuffer(): B2Vec2;
 		delete?(): void;
 	}
 
@@ -102,6 +103,8 @@ declare module 'liquidfun-wasm' {
 		b2DistanceJointDef: new () => B2DistanceJointDef;
 		b2ParticleDef: new () => B2ParticleDef;
 		b2ParticleSystemDef: new () => B2ParticleSystemDef;
+		HEAPF32: Float32Array;
+		getPointer(value: B2Vec2): number;
 		b2_waterParticle: number;
 		b2_viscousParticle: number;
 	}

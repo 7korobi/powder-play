@@ -14,6 +14,7 @@ import type {
 	LiquidFunModule
 } from 'liquidfun-wasm';
 import type { MpmParticle, MpmVector2 } from '../reference/solver.js';
+import { readLiquidFunParticlePosition } from './particle-buffer.js';
 import {
 	createLiquidFunGate4Workload,
 	LIQUIDFUN_BOX2D_DOMAIN_METERS,
@@ -70,19 +71,6 @@ interface PebbleBondJoint extends LiquidFunBondSeed {
 
 interface FractureBondJoint extends LiquidFunFractureBondSeed {
 	joint: B2Joint | null;
-}
-
-interface PositionBufferWithGet {
-	get(index: number): unknown;
-}
-
-interface PositionBufferWithAt {
-	at(index: number): unknown;
-}
-
-interface PositionBufferWithAxisGetters {
-	get_x(index: number): number;
-	get_y(index: number): number;
 }
 
 interface VectorWithAxisGetters {
@@ -144,78 +132,6 @@ function readVector(value: unknown): LiquidFunVector {
 		return { x: value.get_x(), y: value.get_y() };
 	}
 	throw new TypeError('LiquidFun returned an unsupported b2Vec2 representation.');
-}
-
-function hasPositionBufferGet(value: unknown): value is PositionBufferWithGet {
-	return (
-		typeof value === 'object' &&
-		value !== null &&
-		'get' in value &&
-		typeof value.get === 'function'
-	);
-}
-
-function hasPositionBufferAt(value: unknown): value is PositionBufferWithAt {
-	return (
-		typeof value === 'object' &&
-		value !== null &&
-		'at' in value &&
-		typeof value.at === 'function'
-	);
-}
-
-function hasPositionBufferAxisGetters(
-	value: unknown
-): value is PositionBufferWithAxisGetters {
-	return (
-		typeof value === 'object' &&
-		value !== null &&
-		'get_x' in value &&
-		typeof value.get_x === 'function' &&
-		'get_y' in value &&
-		typeof value.get_y === 'function'
-	);
-}
-
-function readPositionAt(buffer: unknown, index: number): LiquidFunVector {
-	if (buffer instanceof Float32Array || buffer instanceof Float64Array) {
-		return { x: buffer[index * 2], y: buffer[index * 2 + 1] };
-	}
-	if (Array.isArray(buffer)) {
-		if (
-			typeof buffer[index * 2] === 'number' &&
-			typeof buffer[index * 2 + 1] === 'number'
-		) {
-			return {
-				x: buffer[index * 2],
-				y: buffer[index * 2 + 1]
-			};
-		}
-		return readVector(buffer[index]);
-	}
-	if (hasPositionBufferAxisGetters(buffer)) {
-		return { x: buffer.get_x(index), y: buffer.get_y(index) };
-	}
-	if (hasPositionBufferGet(buffer)) {
-		const point = buffer.get(index);
-		try {
-			return readVector(point);
-		} finally {
-			releaseUnknown(point);
-		}
-	}
-	if (hasPositionBufferAt(buffer)) {
-		const point = buffer.at(index);
-		try {
-			return readVector(point);
-		} finally {
-			releaseUnknown(point);
-		}
-	}
-	if (index === 0) return readVector(buffer);
-	throw new TypeError(
-		'LiquidFun GetPositionBuffer() did not expose an indexed b2Vec2 buffer.'
-	);
 }
 
 function createVector(module: LiquidFunModule, value: LiquidFunVector): B2Vec2 {
@@ -460,37 +376,43 @@ function pointOnCanvas(
 }
 
 function drawParticles(
+	module: LiquidFunModule,
 	context: CanvasRenderingContext2D,
 	particleSystem: B2ParticleSystem,
 	particleCount: number,
-	waterParticleCount: number,
 	width: number,
 	height: number,
 	pixelsPerMeter: number,
 	offsetX: number,
 	offsetY: number
 ): void {
+	// This is a borrowed view into LiquidFun-owned memory; don't destroy the wrapper.
 	const positionBuffer = particleSystem.GetPositionBuffer();
+	const positionBufferPointer = module.getPointer(positionBuffer);
+	const positionBufferHeap = module.HEAPF32;
 	const count = Math.min(particleCount, particleSystem.GetParticleCount());
 	const radius = Math.max(1.8, LIQUIDFUN_PARTICLE_RADIUS_METERS * pixelsPerMeter * 0.48);
-	try {
-		for (let index = 0; index < count; index += 1) {
-			const position = readPositionAt(positionBuffer, index);
-			const point = pointOnCanvas(
-				position,
-				width,
-				height,
-				pixelsPerMeter,
-				offsetX,
-				offsetY
-			);
-			context.beginPath();
-			context.arc(point.x, point.y, radius, 0, Math.PI * 2);
-			context.fillStyle = index < waterParticleCount ? '#64d8ff' : '#ff9e62';
-			context.fill();
-		}
-	} finally {
-		releaseUnknown(positionBuffer);
+	for (let index = 0; index < count; index += 1) {
+		const position = readLiquidFunParticlePosition(
+			positionBufferHeap,
+			positionBufferPointer,
+			index
+		);
+		const point = pointOnCanvas(
+			position,
+			width,
+			height,
+			pixelsPerMeter,
+			offsetX,
+			offsetY
+		);
+		context.beginPath();
+		context.arc(point.x, point.y, radius, 0, Math.PI * 2);
+		context.fillStyle =
+			(particleSystem.GetParticleFlags(index) & module.b2_viscousParticle) !== 0
+				? '#ff9e62'
+				: '#64d8ff';
+		context.fill();
 	}
 }
 
@@ -748,10 +670,10 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 					(height - LIQUIDFUN_BOX2D_DOMAIN_METERS.height * pixelsPerMeter) / 2;
 
 				drawParticles(
+					module,
 					context,
 					activeParticleSystem,
 					workload.waterParticles.length + workload.oilParticles.length,
-					workload.waterParticles.length,
 					width,
 					height,
 					pixelsPerMeter,
