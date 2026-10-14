@@ -2,6 +2,11 @@
 	import { onMount } from 'svelte';
 	import { projectDeviceOrientationGravity } from '#lib/input/sensors.js';
 	import Gate4ParticleSizeControl from '#lib/mpm/Gate4ParticleSizeControl.svelte';
+	import {
+		MPM_LIVE_METRIC_WINDOW_MS,
+		MpmRollingMetric,
+		type MpmMetricDistribution
+	} from '#lib/mpm/performance-metrics.js';
 	import { DEFAULT_MPM_COURANT_LIMIT } from '#lib/mpm/kernels/cfl.js';
 	import {
 		MPM_RENDER_FPS_OPTIONS,
@@ -50,12 +55,20 @@
 
 	const MAX_CPU_MICROSTEPS_PER_BATCH = 8;
 	const METRICS_INTERVAL_MS = 500;
+	const LIVE_METRICS_WINDOW_MS = MPM_LIVE_METRIC_WINDOW_MS;
 	const MAX_SIMULATION_SPEED = 32;
 	const SIMULATION_SPEED_OPTIONS = [0.5, 1, 2, 4, 8, 16, MAX_SIMULATION_SPEED] as const;
 	const DEFAULT_SIMULATION_SPEED = 2;
 	const DEFAULT_RENDER_FPS: MpmRenderFps = 60;
 	const STEP_SECONDS = GATE4_FIXED_STEP_SECONDS;
 	const framePacer = new MpmFramePacer();
+	const renderedFrameIntervals = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const canvasDrawSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const workerBatchCpuSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const workerMicrostepCpuSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const workerRoundTripSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const workerOverheadSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const snapshotApplySamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
 
 	let canvas: HTMLCanvasElement | undefined;
 	let context: CanvasRenderingContext2D | null = null;
@@ -72,6 +85,13 @@
 	let stepsPerSecond = $state(0);
 	let microstepsPerSecond = $state(0);
 	let pendingSimulationMs = $state(0);
+	let frameIntervalDistribution = $state<MpmMetricDistribution | null>(null);
+	let canvasDrawDistribution = $state<MpmMetricDistribution | null>(null);
+	let workerBatchCpuDistribution = $state<MpmMetricDistribution | null>(null);
+	let workerMicrostepCpuDistribution = $state<MpmMetricDistribution | null>(null);
+	let workerRoundTripDistribution = $state<MpmMetricDistribution | null>(null);
+	let workerOverheadDistribution = $state<MpmMetricDistribution | null>(null);
+	let snapshotApplyDistribution = $state<MpmMetricDistribution | null>(null);
 	let gravityMagnitude = $state(GATE4_DEFAULT_GRAVITY.y);
 	let manualGravityX = $state(GATE4_DEFAULT_GRAVITY.x);
 	let manualGravityY = $state(GATE4_DEFAULT_GRAVITY.y);
@@ -92,7 +112,11 @@
 	let generation = 0;
 	let animationFrame = 0;
 	let lastFrameTime = 0;
+	let lastRenderedFrameTime = 0;
 	let lastMetricsTime = 0;
+	let workerRequestStartedAt: number | null = null;
+	let workerRequestMetricsGeneration: number | null = null;
+	let liveMetricsGeneration = 0;
 	let accumulatorSeconds = 0;
 	let frameCount = 0;
 	let physicsStepsForMetrics = 0;
@@ -100,6 +124,38 @@
 	let macroStepRemainderSeconds = 0;
 	let physicsMsForMetrics = 0;
 	let drawMsForMetrics = 0;
+
+	function formatMetricDistribution(
+		distribution: MpmMetricDistribution | null,
+		unit: string,
+		digits = 2
+	): string {
+		return distribution === null
+			? '計測中'
+			: `p50 ${distribution.median.toFixed(digits)} / p95 ${distribution.p95.toFixed(digits)} ${unit} · n=${distribution.samples}`;
+	}
+
+	let particleMicrostepsPerSecond = $derived(
+		(simulation?.particleCount ?? 0) * microstepsPerSecond
+	);
+
+	function resetRollingMetrics(): void {
+		liveMetricsGeneration += 1;
+		renderedFrameIntervals.clear();
+		canvasDrawSamples.clear();
+		workerBatchCpuSamples.clear();
+		workerMicrostepCpuSamples.clear();
+		workerRoundTripSamples.clear();
+		workerOverheadSamples.clear();
+		snapshotApplySamples.clear();
+		frameIntervalDistribution = null;
+		canvasDrawDistribution = null;
+		workerBatchCpuDistribution = null;
+		workerMicrostepCpuDistribution = null;
+		workerRoundTripDistribution = null;
+		workerOverheadDistribution = null;
+		snapshotApplyDistribution = null;
+	}
 
 	function effectiveGravity(): MpmVector2 {
 		if (orientationStatus === 'enabled' && hasSensorGravity) {
@@ -144,9 +200,13 @@
 		macroStepRemainderSeconds = 0;
 		physicsMsForMetrics = 0;
 		drawMsForMetrics = 0;
+		workerRequestStartedAt = null;
+		workerRequestMetricsGeneration = null;
+		lastRenderedFrameTime = 0;
 		accumulatorSeconds = 0;
 		lastFrameTime = 0;
 		lastMetricsTime = 0;
+		resetRollingMetrics();
 		framePacer.reset();
 	}
 
@@ -158,16 +218,25 @@
 			throw new Error('A CPU MLS-MPM worker batch is already in flight.');
 		}
 		workerBusy = true;
+		workerRequestStartedAt = performance.now();
+		workerRequestMetricsGeneration = liveMetricsGeneration;
 		try {
 			cpuWorker.postMessage(request);
 		} catch (error) {
 			workerBusy = false;
+			workerRequestStartedAt = null;
+			workerRequestMetricsGeneration = null;
 			throw error;
 		}
 	}
 
 	function handleWorkerResponse(response: MpmCpuWorkerResponse): void {
 		if (!mounted || response.generation !== generation) return;
+		const responseReceivedAt = performance.now();
+		const requestStartedAt = workerRequestStartedAt;
+		const requestMetricsGeneration = workerRequestMetricsGeneration;
+		workerRequestStartedAt = null;
+		workerRequestMetricsGeneration = null;
 		if (response.type === 'error') {
 			workerBusy = false;
 			failSimulation(new Error(response.message));
@@ -179,7 +248,19 @@
 			return;
 		}
 		try {
+			const snapshotApplyStartedAt = performance.now();
 			simulation.applyRenderSnapshot(response.snapshot);
+			const snapshotAppliedAt = performance.now();
+			if (
+				response.type !== 'ready' &&
+				requestMetricsGeneration === liveMetricsGeneration &&
+				isVisible
+			) {
+				snapshotApplySamples.record(
+					snapshotAppliedAt - snapshotApplyStartedAt,
+					snapshotAppliedAt
+				);
+			}
 		} catch (error) {
 			workerBusy = false;
 			failSimulation(error);
@@ -189,25 +270,57 @@
 		workerBusy = false;
 		accumulatorSeconds += response.remainderSeconds;
 		if (response.type === 'ready') {
+			resetRollingMetrics();
+			fps = 0;
+			canvasDrawMsPerFrame = 0;
+			frameCount = 0;
+			drawMsForMetrics = 0;
+			lastFrameTime = 0;
+			lastRenderedFrameTime = 0;
+			lastMetricsTime = 0;
+			framePacer.reset();
 			appliedLiquidParticleDiameter = liquidParticleDiameter;
 			pendingSimulationMs = accumulatorSeconds * 1_000;
 			phase = 'ready';
 			return;
 		}
 
-		const macroStepProgress =
-			macroStepRemainderSeconds + response.simulatedSeconds;
-		const macroStepTolerance = STEP_SECONDS * Number.EPSILON * 8;
-		const completedMacroSteps = Math.floor(
-			(macroStepProgress + macroStepTolerance) / STEP_SECONDS
-		);
-		physicsStepsForMetrics += completedMacroSteps;
-		macroStepRemainderSeconds = Math.max(
-			0,
-			macroStepProgress - completedMacroSteps * STEP_SECONDS
-		);
-		physicsMicrostepsForMetrics += response.microStepCount;
-		physicsMsForMetrics += response.workerMilliseconds;
+		if (
+			requestMetricsGeneration === liveMetricsGeneration &&
+			isVisible
+		) {
+			workerBatchCpuSamples.record(response.workerMilliseconds, responseReceivedAt);
+			if (response.microStepCount > 0) {
+				workerMicrostepCpuSamples.record(
+					response.workerMilliseconds / response.microStepCount,
+					responseReceivedAt
+				);
+			}
+			if (requestStartedAt !== null) {
+				const roundTripMs = Math.max(0, responseReceivedAt - requestStartedAt);
+				workerRoundTripSamples.record(roundTripMs, responseReceivedAt);
+				workerOverheadSamples.record(
+					Math.max(0, roundTripMs - response.workerMilliseconds),
+					responseReceivedAt
+				);
+			}
+		}
+
+		if (requestMetricsGeneration === liveMetricsGeneration && isVisible) {
+			const macroStepProgress =
+				macroStepRemainderSeconds + response.simulatedSeconds;
+			const macroStepTolerance = STEP_SECONDS * Number.EPSILON * 8;
+			const completedMacroSteps = Math.floor(
+				(macroStepProgress + macroStepTolerance) / STEP_SECONDS
+			);
+			physicsStepsForMetrics += completedMacroSteps;
+			macroStepRemainderSeconds = Math.max(
+				0,
+				macroStepProgress - completedMacroSteps * STEP_SECONDS
+			);
+			physicsMicrostepsForMetrics += response.microStepCount;
+			physicsMsForMetrics += response.workerMilliseconds;
+		}
 		pendingSimulationMs = accumulatorSeconds * 1_000;
 	}
 
@@ -345,6 +458,13 @@
 		}
 
 		if (isVisible && framePacer.shouldRender(now, renderTargetFps)) {
+			if (lastRenderedFrameTime > 0) {
+				renderedFrameIntervals.record(
+					Math.max(0, now - lastRenderedFrameTime),
+					now
+				);
+			}
+			lastRenderedFrameTime = now;
 			const drawStartedAt = performance.now();
 			if (canvas && context && simulation && phase === 'ready') {
 				const bounds = canvas.getBoundingClientRect();
@@ -359,7 +479,10 @@
 				context.fillStyle = '#101a28';
 				context.fillRect(0, 0, bounds.width, bounds.height);
 			}
-			drawMsForMetrics += performance.now() - drawStartedAt;
+			const drawCompletedAt = performance.now();
+			const drawMilliseconds = drawCompletedAt - drawStartedAt;
+			canvasDrawSamples.record(drawMilliseconds, drawCompletedAt);
+			drawMsForMetrics += drawMilliseconds;
 			frameCount += 1;
 		}
 
@@ -376,6 +499,13 @@
 					: 0;
 			canvasDrawMsPerFrame =
 				frameCount > 0 ? drawMsForMetrics / frameCount : 0;
+			frameIntervalDistribution = renderedFrameIntervals.summarize(now);
+			canvasDrawDistribution = canvasDrawSamples.summarize(now);
+			workerBatchCpuDistribution = workerBatchCpuSamples.summarize(now);
+			workerMicrostepCpuDistribution = workerMicrostepCpuSamples.summarize(now);
+			workerRoundTripDistribution = workerRoundTripSamples.summarize(now);
+			workerOverheadDistribution = workerOverheadSamples.summarize(now);
+			snapshotApplyDistribution = snapshotApplySamples.summarize(now);
 			pendingSimulationMs = accumulatorSeconds * 1_000;
 			frameCount = 0;
 			physicsStepsForMetrics = 0;
@@ -503,6 +633,20 @@
 	function handleVisibilityChange(): void {
 		isVisible = document.visibilityState === 'visible';
 		lastFrameTime = 0;
+		lastRenderedFrameTime = 0;
+		lastMetricsTime = 0;
+		frameCount = 0;
+		physicsStepsForMetrics = 0;
+		physicsMicrostepsForMetrics = 0;
+		macroStepRemainderSeconds = 0;
+		physicsMsForMetrics = 0;
+		drawMsForMetrics = 0;
+		fps = 0;
+		physicsMsPerMicrostep = 0;
+		canvasDrawMsPerFrame = 0;
+		stepsPerSecond = 0;
+		microstepsPerSecond = 0;
+		resetRollingMetrics();
 		framePacer.reset();
 	}
 
@@ -737,7 +881,12 @@
 				</button>
 			</div>
 
-			<h2>Live metrics</h2>
+			<h2>Live metrics · rolling 5 s</h2>
+			<p class="metric-note">
+				p50/p95 は直近 5 秒の分布（p50 は中央値、p95 は nearest-rank 法）です。Worker round-trip は dispatch から snapshot 応答までを含みます。
+				worker turnaround minus solver はその時間から Worker 報告の計算時間を引いた概算です。
+				snapshot apply と Canvas2D draw は main thread の CPU 時間です。
+			</p>
 			<dl class="metrics">
 				<div>
 					<dt>描画 FPS</dt>
@@ -756,8 +905,40 @@
 					<dd>{microstepsPerSecond.toFixed(1)}</dd>
 				</div>
 				<div>
+					<dt>Particle-microsteps / s</dt>
+					<dd>{Math.round(particleMicrostepsPerSecond).toLocaleString()}</dd>
+				</div>
+				<div>
 					<dt>Canvas2D draw ms / frame</dt>
 					<dd>{canvasDrawMsPerFrame.toFixed(3)}</dd>
+				</div>
+				<div>
+					<dt>Rendered frame interval</dt>
+					<dd>{formatMetricDistribution(frameIntervalDistribution, 'ms')}</dd>
+				</div>
+				<div>
+					<dt>Canvas2D draw time</dt>
+					<dd>{formatMetricDistribution(canvasDrawDistribution, 'ms')}</dd>
+				</div>
+				<div>
+					<dt>Worker batch CPU time</dt>
+					<dd>{formatMetricDistribution(workerBatchCpuDistribution, 'ms')}</dd>
+				</div>
+				<div>
+					<dt>Worker CPU / CFL microstep</dt>
+					<dd>{formatMetricDistribution(workerMicrostepCpuDistribution, 'ms')}</dd>
+				</div>
+				<div>
+					<dt>Worker round-trip</dt>
+					<dd>{formatMetricDistribution(workerRoundTripDistribution, 'ms')}</dd>
+				</div>
+				<div>
+					<dt>Worker turnaround minus solver</dt>
+					<dd>{formatMetricDistribution(workerOverheadDistribution, 'ms')}</dd>
+				</div>
+				<div>
+					<dt>Snapshot apply on main thread</dt>
+					<dd>{formatMetricDistribution(snapshotApplyDistribution, 'ms')}</dd>
 				</div>
 				<div>
 					<dt>未処理の固定刻み</dt>
@@ -1122,12 +1303,17 @@
 
 	.sensor-status,
 	.control-note,
-	.backlog-controls p {
+	.backlog-controls p,
+	.metric-note {
 		margin: 0;
 		color: #b8c7d8;
 		font-size: 0.84rem;
 		line-height: 1.5;
 		overflow-wrap: anywhere;
+	}
+
+	.metric-note {
+		margin: -0.45rem 0 0.75rem;
 	}
 
 	.backlog-controls {

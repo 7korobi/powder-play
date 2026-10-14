@@ -25,7 +25,7 @@ npm run build
 Cloudflare Workers のビルド・デプロイ設定は次のとおりです。
 
 - ビルドコマンド: `npm run build`
-- デプロイコマンド: `npx wrangler deploy`
+- 公開デプロイ: `main` への `git push` で自動実行されます。通常の公開で `npx wrangler deploy` は不要です。
 - Worker と静的アセットのパスは [`wrangler.jsonc`](./wrangler.jsonc) で設定します。
 
 ## 操作

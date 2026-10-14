@@ -2,6 +2,11 @@
 	import { onMount } from 'svelte';
 	import { projectDeviceOrientationGravity } from '#lib/input/sensors.js';
 	import Gate4ParticleSizeControl from '#lib/mpm/Gate4ParticleSizeControl.svelte';
+	import {
+		MPM_LIVE_METRIC_WINDOW_MS,
+		MpmRollingMetric,
+		type MpmMetricDistribution
+	} from '#lib/mpm/performance-metrics.js';
 	import { encodeMpmConstitutiveModel } from '#lib/mpm/materials.js';
 	import {
 		createMpmMlsGpuSolver,
@@ -79,6 +84,7 @@
 	const WORLD_HEIGHT = GRID.cellsY * GRID.cellSize;
 	const LIQUID_J_FLOOR_BAND_HEIGHT = 8 * GRID.cellSize;
 	const LIQUID_J_FLOOR_MIN_Y = WORLD_HEIGHT - LIQUID_J_FLOOR_BAND_HEIGHT;
+	const LIVE_METRICS_WINDOW_MS = MPM_LIVE_METRIC_WINDOW_MS;
 	const OUTLET_BOUNDS: MpmMlsGpuOutletBounds = {
 		minX: 0,
 		minY: WORLD_HEIGHT - 80,
@@ -101,6 +107,16 @@
 	const PICK_RADIUS = 14;
 	const BRUSH_RADIUS = 24;
 	const PARTICLE_VOLUME = GATE4_PARTICLE_AREA;
+	const renderedFrameIntervals = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const renderSubmitSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const batchSubmitSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const batchWallSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const queueCompletionSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const cflReadbackSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const cflMicrostepSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const cflMicroDtSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const cflRetrySamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
+	const outletTurnaroundSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
 	const PARITY_ABSOLUTE_TOLERANCE = 0.02;
 	const PARITY_VELOCITY_ABSOLUTE_TOLERANCE = 0.025;
 	const PARITY_VELOCITY_RELATIVE_TOLERANCE = 0.0005;
@@ -201,6 +217,7 @@
 	): Promise<CflSpeedReadbackSample> {
 		const startTimeSeconds = simulatedTimeSeconds;
 		const startedAt = performance.now();
+		const metricsGenerationAtSubmit = liveMetricsGeneration;
 		const measurement = currentSolver.stepCflBatchAdaptive(
 			batch.macroStepCount,
 			batch.macroDt,
@@ -240,23 +257,46 @@
 						);
 					}
 				}
-				submittedBatchCount += 1;
-				const macroStepProgress =
-					submittedMacroStepRemainderSeconds + measurement.simulatedDuration;
-				const macroStepTolerance = FIXED_STEP_SECONDS * Number.EPSILON * 8;
-				const completedMacroSteps = Math.floor(
-					(macroStepProgress + macroStepTolerance) / FIXED_STEP_SECONDS
-				);
-				submittedMacroStepCount += completedMacroSteps;
-				submittedMacroStepRemainderSeconds = Math.max(
-					0,
-					macroStepProgress - completedMacroSteps * FIXED_STEP_SECONDS
-				);
-				submittedMicroStepCount += measurement.attemptedMicroStepCount;
-				submittedParticleMicrosteps +=
-					currentSolver.particleCount * measurement.attemptedMicroStepCount;
-				submittedBatchCpuMilliseconds +=
+				const completedAt = performance.now();
+				const batchSubmitMilliseconds =
 					submitMilliseconds + measurement.retrySubmissionMilliseconds;
+				const batchWallMilliseconds = Math.max(0, completedAt - startedAt);
+				if (
+					metricsGenerationAtSubmit === liveMetricsGeneration &&
+					document.visibilityState === 'visible'
+				) {
+					batchSubmitSamples.record(batchSubmitMilliseconds, completedAt);
+					batchWallSamples.record(batchWallMilliseconds, completedAt);
+					cflReadbackSamples.record(
+						measurement.readbackMilliseconds,
+						completedAt
+					);
+					cflMicrostepSamples.record(
+						measurement.attemptedMicroStepCount,
+						completedAt
+					);
+					cflMicroDtSamples.record(
+						batch.microstepPlan.microDt * 1_000,
+						completedAt
+					);
+					cflRetrySamples.record(measurement.retryCount, completedAt);
+					submittedBatchCount += 1;
+					const macroStepProgress =
+						submittedMacroStepRemainderSeconds + measurement.simulatedDuration;
+					const macroStepTolerance = FIXED_STEP_SECONDS * Number.EPSILON * 8;
+					const completedMacroSteps = Math.floor(
+						(macroStepProgress + macroStepTolerance) / FIXED_STEP_SECONDS
+					);
+					submittedMacroStepCount += completedMacroSteps;
+					submittedMacroStepRemainderSeconds = Math.max(
+						0,
+						macroStepProgress - completedMacroSteps * FIXED_STEP_SECONDS
+					);
+					submittedMicroStepCount += measurement.attemptedMicroStepCount;
+					submittedParticleMicrosteps +=
+						currentSolver.particleCount * measurement.attemptedMicroStepCount;
+					submittedBatchCpuMilliseconds += batchSubmitMilliseconds;
+				}
 				return {
 					...measurement,
 					sequence: submittedSequence,
@@ -519,6 +559,18 @@
 	let averageBatchSubmitMs = $state<number | null>(null);
 	let averageQueueCompletionMs = $state<number | null>(null);
 	let averageCflReadbackMs = $state<number | null>(null);
+	let frameIntervalDistribution = $state<MpmMetricDistribution | null>(null);
+	let renderSubmitDistribution = $state<MpmMetricDistribution | null>(null);
+	let batchSubmitDistribution = $state<MpmMetricDistribution | null>(null);
+	let batchWallDistribution = $state<MpmMetricDistribution | null>(null);
+	let queueCompletionDistribution = $state<MpmMetricDistribution | null>(null);
+	let cflReadbackDistribution = $state<MpmMetricDistribution | null>(null);
+	let cflMicrostepDistribution = $state<MpmMetricDistribution | null>(null);
+	let cflMicroDtDistribution = $state<MpmMetricDistribution | null>(null);
+	let cflRetryDistribution = $state<MpmMetricDistribution | null>(null);
+	let outletTurnaroundDistribution = $state<MpmMetricDistribution | null>(null);
+	let queueBackpressurePercent = $state<number | null>(null);
+	let outletBackpressurePercent = $state<number | null>(null);
 	let cflSpeedReadbackCount = $state(0);
 	let renderMode = $state<MpmMlsGpuRenderMode>('surface');
 	let selection = $state<MpmMlsGpuSelection | null>(null);
@@ -547,6 +599,56 @@
 	let pointerGeneration = 0;
 	let pointerPosition: MpmVector2 | null = null;
 	let dragActive = $state(false);
+	let liveMetricsGeneration = 0;
+
+	function formatMetricDistribution(
+		distribution: MpmMetricDistribution | null,
+		unit: string,
+		digits = 2
+	): string {
+		return distribution === null
+			? '計測中'
+			: `p50 ${distribution.median.toFixed(digits)} / p95 ${distribution.p95.toFixed(digits)} ${unit} · n=${distribution.samples}`;
+	}
+
+	function resetLiveMetrics(): void {
+		liveMetricsGeneration += 1;
+		renderedFrameIntervals.clear();
+		renderSubmitSamples.clear();
+		batchSubmitSamples.clear();
+		batchWallSamples.clear();
+		queueCompletionSamples.clear();
+		cflReadbackSamples.clear();
+		cflMicrostepSamples.clear();
+		cflMicroDtSamples.clear();
+		cflRetrySamples.clear();
+		outletTurnaroundSamples.clear();
+		frameIntervalDistribution = null;
+		renderSubmitDistribution = null;
+		batchSubmitDistribution = null;
+		batchWallDistribution = null;
+		queueCompletionDistribution = null;
+		cflReadbackDistribution = null;
+		cflMicrostepDistribution = null;
+		cflMicroDtDistribution = null;
+		cflRetryDistribution = null;
+		outletTurnaroundDistribution = null;
+		queueBackpressurePercent = null;
+		outletBackpressurePercent = null;
+	}
+
+	function updateLiveMetricDistributions(now: number): void {
+		frameIntervalDistribution = renderedFrameIntervals.summarize(now);
+		renderSubmitDistribution = renderSubmitSamples.summarize(now);
+		batchSubmitDistribution = batchSubmitSamples.summarize(now);
+		batchWallDistribution = batchWallSamples.summarize(now);
+		queueCompletionDistribution = queueCompletionSamples.summarize(now);
+		cflReadbackDistribution = cflReadbackSamples.summarize(now);
+		cflMicrostepDistribution = cflMicrostepSamples.summarize(now);
+		cflMicroDtDistribution = cflMicroDtSamples.summarize(now);
+		cflRetryDistribution = cflRetrySamples.summarize(now);
+		outletTurnaroundDistribution = outletTurnaroundSamples.summarize(now);
+	}
 
 	function effectiveGravity(): MpmVector2 {
 		if (orientationStatus === 'enabled' && hasSensorGravity) {
@@ -1036,6 +1138,8 @@
 		) {
 			return;
 		}
+		const startedAt = performance.now();
+		const metricsGenerationAtStart = liveMetricsGeneration;
 		outletPending = true;
 		outletIsError = false;
 		outletMessage = '出口内の水・油粒子を GPU 上で確認しています…';
@@ -1060,6 +1164,13 @@
 			phase = 'error';
 			phaseMessage = '出口処理の GPU readback に失敗したため停止しました。';
 		} finally {
+			const completedAt = performance.now();
+			if (
+				metricsGenerationAtStart === liveMetricsGeneration &&
+				document.visibilityState === 'visible'
+			) {
+				outletTurnaroundSamples.record(completedAt - startedAt, completedAt);
+			}
 			outletPending = false;
 		}
 	}
@@ -1149,8 +1260,12 @@
 		let frameRequest: number | null = null;
 		const framePacer = new MpmFramePacer();
 		let lastFrameTimestamp: number | null = null;
+		let lastRenderedFrameTimestamp: number | null = null;
 		let metricsStartTimestamp: number | null = null;
 		let performanceFrameCount = 0;
+		let scheduledRenderCount = 0;
+		let queueBlockedRenderCount = 0;
+		let outletBlockedRenderCount = 0;
 		let queueWorkPending = false;
 		let queueSampleCount = 0;
 		let queueSampleTotalMs = 0;
@@ -1184,11 +1299,17 @@
 			if (!mounted || !activeSolver || phase !== 'ready') return;
 			frameRequest = requestAnimationFrame(renderFrame);
 			if (!framePacer.shouldRender(timestamp, renderTargetFps)) return;
+			const metricsVisible = document.visibilityState === 'visible';
+			if (metricsVisible) scheduledRenderCount += 1;
 			if (outletPending) {
+				if (metricsVisible) outletBlockedRenderCount += 1;
 				lastFrameTimestamp = null;
 				return;
 			}
-			if (queueWorkPending) return;
+			if (queueWorkPending) {
+				if (metricsVisible) queueBlockedRenderCount += 1;
+				return;
+			}
 			if (continuousEmission) {
 				if (paused || document.visibilityState !== 'visible') {
 					lastContinuousEmissionTimestamp = timestamp;
@@ -1214,6 +1335,7 @@
 			const gravity = effectiveGravity();
 
 			let cflSpeedMeasurement: Promise<CflSpeedReadbackSample> | null = null;
+			let cflMetricsGeneration: number | null = null;
 			if (!paused && document.visibilityState === 'visible') {
 				try {
 					if (cflSpeedReadbackCount >= MAX_IN_FLIGHT_CFL_BATCHES) {
@@ -1238,6 +1360,7 @@
 							horizontalOscillationAmplitude
 						);
 						if (planned.batch.macroStepCount > 0) {
+							cflMetricsGeneration = liveMetricsGeneration;
 							cflSpeedMeasurement = submitBatch(
 								activeSolver,
 								planned.batch,
@@ -1257,7 +1380,22 @@
 			}
 
 			try {
+				const renderStartedAt = performance.now();
 				activeSolver.render(renderMode);
+				const renderCompletedAt = performance.now();
+				if (metricsVisible) {
+					renderSubmitSamples.record(
+						renderCompletedAt - renderStartedAt,
+						renderCompletedAt
+					);
+					if (lastRenderedFrameTimestamp !== null) {
+						renderedFrameIntervals.record(
+							Math.max(0, timestamp - lastRenderedFrameTimestamp),
+							timestamp
+						);
+					}
+				}
+				lastRenderedFrameTimestamp = timestamp;
 			} catch (error) {
 				if (cflSpeedMeasurement !== null) {
 					void cflSpeedMeasurement.catch((readbackError) => {
@@ -1270,41 +1408,57 @@
 				return;
 			}
 
-			performanceFrameCount += 1;
-			if (metricsStartTimestamp === null) metricsStartTimestamp = timestamp;
-			const metricsElapsed = timestamp - metricsStartTimestamp;
-			if (metricsElapsed >= 1_000) {
-				const samplesPerSecond = 1_000 / metricsElapsed;
-				measuredFps = performanceFrameCount * samplesPerSecond;
-				measuredMacroStepsPerSecond =
-					submittedMacroStepCount * samplesPerSecond;
-				measuredMicroStepsPerSecond =
-					submittedMicroStepCount * samplesPerSecond;
-				measuredParticleMicrostepsPerSecond =
-					submittedParticleMicrosteps * samplesPerSecond;
-				averageBatchSubmitMs =
-					submittedBatchCount > 0
-						? submittedBatchCpuMilliseconds / submittedBatchCount
-						: null;
-				averageQueueCompletionMs =
-					queueSampleCount > 0 ? queueSampleTotalMs / queueSampleCount : null;
-				averageCflReadbackMs =
-					cflReadbackSampleCount > 0
-						? cflReadbackTotalMs / cflReadbackSampleCount
-						: null;
+			if (metricsVisible) {
+				performanceFrameCount += 1;
+				if (metricsStartTimestamp === null) metricsStartTimestamp = timestamp;
+				const metricsElapsed = timestamp - metricsStartTimestamp;
+				if (metricsElapsed >= 1_000) {
+					const samplesPerSecond = 1_000 / metricsElapsed;
+					measuredFps = performanceFrameCount * samplesPerSecond;
+					measuredMacroStepsPerSecond =
+						submittedMacroStepCount * samplesPerSecond;
+					measuredMicroStepsPerSecond =
+						submittedMicroStepCount * samplesPerSecond;
+					measuredParticleMicrostepsPerSecond =
+						submittedParticleMicrosteps * samplesPerSecond;
+					averageBatchSubmitMs =
+						submittedBatchCount > 0
+							? submittedBatchCpuMilliseconds / submittedBatchCount
+							: null;
+					averageQueueCompletionMs =
+						queueSampleCount > 0
+							? queueSampleTotalMs / queueSampleCount
+							: null;
+					averageCflReadbackMs =
+						cflReadbackSampleCount > 0
+							? cflReadbackTotalMs / cflReadbackSampleCount
+							: null;
+					queueBackpressurePercent =
+						scheduledRenderCount > 0
+							? (queueBlockedRenderCount * 100) / scheduledRenderCount
+							: null;
+					outletBackpressurePercent =
+						scheduledRenderCount > 0
+							? (outletBlockedRenderCount * 100) / scheduledRenderCount
+							: null;
+					updateLiveMetricDistributions(timestamp);
 
-				metricsStartTimestamp = timestamp;
-				performanceFrameCount = 0;
-				submittedMacroStepCount = 0;
-				submittedMacroStepRemainderSeconds = 0;
-				submittedMicroStepCount = 0;
-				submittedParticleMicrosteps = 0;
-				submittedBatchCount = 0;
-				submittedBatchCpuMilliseconds = 0;
-				queueSampleCount = 0;
-				queueSampleTotalMs = 0;
-				cflReadbackSampleCount = 0;
-				cflReadbackTotalMs = 0;
+					metricsStartTimestamp = timestamp;
+					performanceFrameCount = 0;
+					scheduledRenderCount = 0;
+					queueBlockedRenderCount = 0;
+					outletBlockedRenderCount = 0;
+					submittedMacroStepCount = 0;
+					submittedMacroStepRemainderSeconds = 0;
+					submittedMicroStepCount = 0;
+					submittedParticleMicrosteps = 0;
+					submittedBatchCount = 0;
+					submittedBatchCpuMilliseconds = 0;
+					queueSampleCount = 0;
+					queueSampleTotalMs = 0;
+					cflReadbackSampleCount = 0;
+					cflReadbackTotalMs = 0;
+				}
 			}
 
 			const submittedSolver = activeSolver;
@@ -1313,21 +1467,33 @@
 					.then((sample) => {
 						if (!mounted || activeSolver !== submittedSolver) return;
 						applyCflSpeedSample(sample);
-						cflReadbackSampleCount += 1;
-						cflReadbackTotalMs += sample.elapsedMilliseconds;
+						if (
+							cflMetricsGeneration === liveMetricsGeneration &&
+							document.visibilityState === 'visible'
+						) {
+							cflReadbackSampleCount += 1;
+							cflReadbackTotalMs += sample.elapsedMilliseconds;
+						}
 					})
 					.catch((error) => {
 						if (!mounted || activeSolver !== submittedSolver) return;
 						fail(error);
 					});
 			}
+			const queueMetricsGeneration = liveMetricsGeneration;
 			queueWorkPending = true;
 			void submittedSolver
 				.measureQueueCompletionMs()
 				.then(async (completionMs) => {
 					if (!mounted || activeSolver !== submittedSolver) return;
-					queueSampleCount += 1;
-					queueSampleTotalMs += completionMs;
+					if (
+						queueMetricsGeneration === liveMetricsGeneration &&
+						document.visibilityState === 'visible'
+					) {
+						queueSampleCount += 1;
+						queueSampleTotalMs += completionMs;
+						queueCompletionSamples.record(completionMs, performance.now());
+					}
 					if (
 						cflSpeedReadbackCount === 0 &&
 						timestamp - lastNumericalStatusCheckTimestamp >= 1_000
@@ -1347,7 +1513,31 @@
 
 		function handleVisibilityChange(): void {
 			lastFrameTimestamp = null;
+			lastRenderedFrameTimestamp = null;
 			lastContinuousEmissionTimestamp = null;
+			metricsStartTimestamp = null;
+			performanceFrameCount = 0;
+			scheduledRenderCount = 0;
+			queueBlockedRenderCount = 0;
+			outletBlockedRenderCount = 0;
+			submittedMacroStepCount = 0;
+			submittedMacroStepRemainderSeconds = 0;
+			submittedMicroStepCount = 0;
+			submittedParticleMicrosteps = 0;
+			submittedBatchCount = 0;
+			submittedBatchCpuMilliseconds = 0;
+			queueSampleCount = 0;
+			queueSampleTotalMs = 0;
+			cflReadbackSampleCount = 0;
+			cflReadbackTotalMs = 0;
+			measuredFps = null;
+			measuredMacroStepsPerSecond = null;
+			measuredMicroStepsPerSecond = null;
+			measuredParticleMicrostepsPerSecond = null;
+			averageBatchSubmitMs = null;
+			averageQueueCompletionMs = null;
+			averageCflReadbackMs = null;
+			resetLiveMetrics();
 			framePacer.reset();
 			if (
 				document.visibilityState !== 'visible' &&
@@ -1501,7 +1691,9 @@
 						`${parityMeasurement.attemptedMicroStepCount} microsteps）。時間刻みを再試行時に変更したため、` +
 						'この起動時CPU/GPU比較は省略しました。';
 				}
+				resetLiveMetrics();
 				submittedMacroStepCount = 0;
+				submittedMacroStepRemainderSeconds = 0;
 				submittedMicroStepCount = 0;
 				submittedParticleMicrosteps = 0;
 				submittedBatchCount = 0;
@@ -1512,6 +1704,10 @@
 				simulationAccumulatorSeconds = parityMeasurement.remainingDuration;
 				metricsStartTimestamp = null;
 				performanceFrameCount = 0;
+				scheduledRenderCount = 0;
+				queueBlockedRenderCount = 0;
+				outletBlockedRenderCount = 0;
+				measuredFps = null;
 				measuredMacroStepsPerSecond = null;
 				measuredMicroStepsPerSecond = null;
 				measuredParticleMicrostepsPerSecond = null;
@@ -2045,7 +2241,13 @@
 		</p>
 
 		<section class="performance" aria-labelledby="performance-title">
-			<h2 id="performance-title">GPU 実測性能（直近1秒）</h2>
+			<h2 id="performance-title">WebGPU live metrics</h2>
+			<p>
+				基本 throughput と平均値は約1秒ごと、p50/p95 は直近5秒の rolling 分布（p50 は中央値、p95 は nearest-rank 法）です。
+				render() と batch submit は main-thread の CPU 時間です。batch end-to-end は submit から速度 readback 完了までの経過時間、
+				queue 完了待ちは queue 全体の待ち時間で、どちらも GPU kernel 単独時間ではありません。
+				microDt は adaptive retry 前の計画値です。queue/outlet backpressure は描画目標時刻のうち各処理で描画できなかった割合で、両方が進行中の場合は outlet 側に分類します。
+			</p>
 			<dl class="performance-metrics">
 				<div>
 					<dt>描画</dt>
@@ -2122,6 +2324,62 @@
 								: '—'
 							: `${averageCflReadbackMs.toFixed(2)} ms`}
 					</dd>
+				</div>
+				<div>
+					<dt>Rendered frame interval</dt>
+					<dd>{formatMetricDistribution(frameIntervalDistribution, 'ms')}</dd>
+				</div>
+				<div>
+					<dt>render() CPU submit</dt>
+					<dd>{formatMetricDistribution(renderSubmitDistribution, 'ms')}</dd>
+				</div>
+				<div>
+					<dt>CFL batch CPU submit incl. retries</dt>
+					<dd>{formatMetricDistribution(batchSubmitDistribution, 'ms')}</dd>
+				</div>
+				<div>
+					<dt>CFL batch submit → readback wall</dt>
+					<dd>{formatMetricDistribution(batchWallDistribution, 'ms')}</dd>
+				</div>
+				<div>
+					<dt>GPU queue completion wait</dt>
+					<dd>{formatMetricDistribution(queueCompletionDistribution, 'ms')}</dd>
+				</div>
+				<div>
+					<dt>CFL speed scalar readback</dt>
+					<dd>{formatMetricDistribution(cflReadbackDistribution, 'ms')}</dd>
+				</div>
+				<div>
+					<dt>Attempted CFL microsteps / batch</dt>
+					<dd>{formatMetricDistribution(cflMicrostepDistribution, 'steps', 0)}</dd>
+				</div>
+				<div>
+					<dt>Planned microDt before retries</dt>
+					<dd>{formatMetricDistribution(cflMicroDtDistribution, 'ms', 4)}</dd>
+				</div>
+				<div>
+					<dt>Adaptive retries / batch</dt>
+					<dd>{formatMetricDistribution(cflRetryDistribution, 'retries', 0)}</dd>
+				</div>
+				<div>
+					<dt>Queue-blocked render opportunities</dt>
+					<dd>
+						{queueBackpressurePercent === null
+							? '計測中'
+							: `${queueBackpressurePercent.toFixed(1)}%`}
+					</dd>
+				</div>
+				<div>
+					<dt>Outlet-blocked render opportunities</dt>
+					<dd>
+						{outletBackpressurePercent === null
+							? '計測中'
+							: `${outletBackpressurePercent.toFixed(1)}%`}
+					</dd>
+				</div>
+				<div>
+					<dt>Outlet remove turnaround</dt>
+					<dd>{formatMetricDistribution(outletTurnaroundDistribution, 'ms')}</dd>
 				</div>
 			</dl>
 			<p>
