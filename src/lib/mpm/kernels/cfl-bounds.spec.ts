@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { GATE4_GRID, createMpmGate4Scene } from '../scenes/gate4.js';
+import {
+	createMpmGate4MlsScene,
+	GATE4_MPM_GRID,
+	GATE4_PARTICLE_AREA,
+	GATE4_SOLID_PARTICLE_MASS
+} from '../scenes/gate4.js';
 import {
 	calculateMpmCflVelocityBound,
 	deriveMpmMlsGpuCflBounds,
@@ -8,15 +13,15 @@ import {
 import { calculateMpmCflStepBatch } from './step-scheduler.js';
 
 const gate4Config = {
-	grid: GATE4_GRID,
-	particleMass: 1,
-	particleVolume: 25,
+	grid: GATE4_MPM_GRID,
+	particleMass: GATE4_SOLID_PARTICLE_MASS,
+	particleVolume: GATE4_PARTICLE_AREA,
 	material: { lambda: 20, mu: 10, model: 'neo-hookean' as const }
 };
 
 describe('GPU MPM CFL bound derivation', () => {
 	it('derives wave and velocity bounds from the actual seeded Gate 4 state', () => {
-		const scene = createMpmGate4Scene(0x4c414234);
+		const scene = createMpmGate4MlsScene(0x4c414234);
 		const bounds = deriveMpmMlsGpuCflBounds(scene.particles, gate4Config);
 		const actualInitialSpeed = Math.max(
 			...scene.particles.map((particle) =>
@@ -152,7 +157,7 @@ describe('GPU MPM CFL velocity envelope', () => {
 	});
 
 	it('plans a bounded default 1x Gate 4 frame without discarding macro time', () => {
-		const scene = createMpmGate4Scene(0x4c414234);
+		const scene = createMpmGate4MlsScene(0x4c414234);
 		const bounds = deriveMpmMlsGpuCflBounds(scene.particles, gate4Config);
 		expect(bounds).not.toBeNull();
 
@@ -161,7 +166,7 @@ describe('GPU MPM CFL velocity envelope', () => {
 			elapsedSeconds: 1 / 60,
 			simulationSpeed: 1,
 			fixedStepSeconds: 1 / 240,
-			cellSize: GATE4_GRID.cellSize,
+			cellSize: GATE4_MPM_GRID.cellSize,
 			waveSpeedBound: bounds!.waveSpeedBound,
 			currentVelocityBound: bounds!.velocityBound,
 			gravityMagnitude: 90,

@@ -60,8 +60,9 @@ buffer are asynchronously mapped on the CPU.
 before a numerical failure. For CFL violations and recoverable deformation
 failures with finite diagnostics, it retries only the failed interval using at
 least twice as many microsteps and updates velocity and wave-speed envelopes
-from the failed trial. Retries are limited to four and share the caller's total
-microstep budget, including work from rejected attempts. The result reports
+from the failed trial. Retries share the caller's total microstep budget,
+including work from rejected attempts; there is no separate retry-count cap.
+The result reports
 `simulatedDuration`, `remainingDuration`, and a `recommendedVelocityBound`.
 When a safe retry or continuation does not fit the remaining budget, the solver
 preserves committed progress and returns the unprocessed duration for the
@@ -112,15 +113,20 @@ CFL batch and its compact readback may be pending; later frame time remains in
 the accumulator until it completes. Work-cap overflow is deferred rather than
 treated as a fatal solver error or silently dropping simulated time.
 
-The retuned Gate 4 sample starts with 2,000 water, 1,500 oil, 50 Neo-Hookean
+The retuned Gate 4 MPM sample starts with 2,000 water, 1,500 oil, 50 Neo-Hookean
 elastic pebbles built from three particles each, and a 24-particle connected
 solid (3,674 active particles total, one quarter of the previous 14,696).
-Relative to the preceding 3,674-particle tuning, water and oil particle
-reference area grows from 100 to 400 (4×); at unchanged densities, each phase's
-total reference volume and mass also grow 4× (water 16,000, oil 9,600).
-Liquid particle counts, spacing (18 world units), and initial positions remain
+The MPM page uses a dedicated 220 × 600 grid at 10-unit cell size
+(2,200 × 6,000 world units); the legacy 220 × 150 `GATE4_GRID` remains unchanged
+for the LiquidFun comparison. The scene is shifted 4,500 world units upward in
+Y so its liquid, pebble, and fracture-body floor clearances remain unchanged.
+Relative to the preceding 3,674-particle MPM tuning, water and oil particle
+reference area grows from 400 to 1,600 (4×); the resulting total reference
+areas are 3.2M / 2.4M world-area units, and total masses are 64,000 / 38,400.
+Each phase's reference volume and mass both grow 4× at unchanged density.
+Liquid particle counts, spacing (18 world units), and horizontal positions remain
 unchanged. The particle-marker radius therefore doubles, while the independent
-display-area multiplier remains 2×. The compressive EOS stiffness is four
+display-area multiplier remains 2×. The compressive EOS stiffness remains four
 times the earlier baseline (water 40,000 → 160,000; oil 30,000 → 120,000) to
 resist volume collapse. Pebble and fracture-solid reference area remains 100,
 and solid particle mass remains 4. The pebbles form an 8-column × 7-row array with
@@ -140,8 +146,12 @@ separate grid velocity/volume channels and receive normal contact impulses from
 their phase-volume gradients. The phase contact also applies an equal-and-
 opposite separation impulse scaled by local phase overlap and approach speed;
 its node-level target is the larger of `0.25 × overlap × cellSize / 0.05 s`
-and twice the closing normal speed. This is an approximate interface response,
-not full immiscibility.
+and the closing normal speed. The approach-speed term does not amplify relative
+kinetic energy. This is an approximate interface response,
+not full immiscibility. When the phase-gradient normal conflicts with the
+gravitationally stable density order, the solver reverses it so the denser
+phase is driven with gravity and the lighter phase against it. This promotes
+layer reordering but is not a continuum buoyancy or surface-tension solve.
 The triangle signed-distance field projects liquid particles out of the
 pebbles and gathers the opposing normal impulse back to the three vertices.
 Pebble pairs use triangle SAT contact to reduce approaching normal velocity;
@@ -205,20 +215,23 @@ damage loading have not been measured across devices/resolutions.
 Water and oil reference densities remain 0.02 and 0.016, with EOS stiffnesses
 160,000 and 120,000 (four times the preceding 40,000 and 30,000). Relative to
 the original 14,696-particle scene, the liquid count is one quarter while
-particle area is 16 times larger (25 → 400), so total liquid reference volume
-and mass are 4× that baseline. Relative to the latest 3,674-particle tuning,
-area and total liquid volume/mass are each 4× (100 → 400). The 18-unit spacing
-is unchanged; reference area per lattice spacing is now `400 / 18²`, 4× the
-previous `100 / 18²` and `25 / 9²`. The grid remains 220 × 150 cells at
-10-unit cell size. A previous 20,000-particle scene
+particle area is 64 times larger (25 → 1,600), so total liquid reference volume
+and mass are 16× that baseline. Relative to the preceding 3,674-particle MPM
+tuning at area 400, the area and total liquid volume/mass are each 4×. The
+18-unit spacing is unchanged; reference area per lattice spacing is now
+`1,600 / 18²`, 4× the preceding MPM value `400 / 18²`. The MPM grid is
+220 × 600 cells at 10-unit cell size; the independent LiquidFun baseline remains
+220 × 150. At J≈1.03 the liquid volume estimate is about 5.77 million units²,
+or 44% of the 13.2-million-unit² MPM domain; even at the configured J=2 ceiling,
+the reference volume would occupy about 85%. A previous 20,000-particle scene
 used 6,000 powder particles; the later 200-pebble and 14,696-particle layouts
 are historical. The current sample reserves capacity for 1,000,000 particles,
 so reducing active count does not materially reduce the fixed GPU allocation.
 
 The surface and particle-marker renderers apply an additional 2× display-area
-scale independently of physical particle area. Compared with the original
-25-unit liquid particle area, the current 400-unit reference area and renderer
-multiplier produce 32× display area; the marker radius is about 5.7× larger.
+scale independently of physical particle area. The 1,600-unit reference area
+makes the marker radius 2× larger than in the preceding area-400 MPM tuning;
+the display multiplier remains unchanged.
 Surface pixels use the
 dominant water/oil phase color with a narrow interface highlight; this is a
 visual cue, not a guarantee of physical separation. The sinusoidal horizontal
@@ -292,11 +305,12 @@ and oil keep separate current-volume fields. Mixed water/oil nodes apply an
 equal-and-opposite node-owned normal impulse from phase-volume gradients.
 Water/oil particles also receive an approximate local density-contrast
 acceleration after G2P, based on liquid mass and current area deposited to
-neighboring grid nodes. These operations retain phase IDs and make the
-controlled reference interface resist crossing, but do not prove complete
-immiscibility or general interface stability. GPU surface occupancy is
-render-only. The liquid polar projection bounds `det(F)` to `[0.5, 2]` to
-prevent unbounded volume drift in the tension-free equation of state.
+neighboring grid nodes. Together with the density-aware contact impulse,
+these operations favor gravitationally stable layering while retaining phase
+IDs; they do not prove complete immiscibility or general interface stability.
+GPU surface occupancy is render-only. The liquid polar projection bounds
+`det(F)` to `[0.5, 2]` to prevent unbounded volume drift in the tension-free
+equation of state.
 Surface tension, wetting, tangential interface friction, powder compaction,
 gas, and thermal behavior remain unimplemented. The deformation-gradient
 update uses fused 2×2 products and a compensated determinant. It adaptively
@@ -359,7 +373,9 @@ to 64 substeps; P2G and grid-velocity update remain explicit.
   small local neighborhood around one probe per fluid and the central triangle
   pebble, now positioned at the liquid interface; it does not measure fracture
   GPU accuracy or scene-scale mixing. The explicit paused-state
-  check remains a full readback.
+  check remains a full readback and reports water/oil `det(F)` ranges and means
+  separately for all particles and the bottom eight grid cells, together with
+  each phase's vertical extent.
 
 The pure config/layout and batch-encoding tests run without WebGPU. A historical
 Apple Metal/Chrome 154 performance benchmark verified shader

@@ -40,7 +40,7 @@
 	} from '#lib/mpm/reference/solver.js';
 	import {
 		createMpmCpuParitySample,
-		createMpmGate4Scene,
+		createMpmGate4MlsScene,
 		GATE4_CLONE_OFFSET,
 		GATE4_FRACTURE_BOND_COUNT,
 		GATE4_FRACTURE_COLUMNS,
@@ -48,12 +48,14 @@
 		GATE4_FRACTURE_OBJECT_ID,
 		GATE4_FRACTURE_PARTICLE_COUNT,
 		GATE4_FRACTURE_ROWS,
-		GATE4_GRID,
+		GATE4_LIQUID_PARTICLE_AREA,
 		GATE4_LIQUID_BULK_MODULUS_SCALE,
 		GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX,
-		GATE4_LIQUID_PARTICLE_AREA,
-		GATE4_LIQUID_PARTICLE_AREA_SCALE,
 		GATE4_LIQUID_PARTICLE_SPACING,
+		GATE4_MPM_GRID,
+		GATE4_MPM_INITIAL_Y_OFFSET,
+		GATE4_MPM_LIQUID_PARTICLE_AREA,
+		GATE4_MPM_LIQUID_PARTICLE_AREA_SCALE,
 		GATE4_PARTICLE_CAPACITY,
 		GATE4_PARTICLE_COUNT,
 		GATE4_PARTICLE_AREA,
@@ -70,9 +72,11 @@
 		type MpmEmitterShape
 	} from '#lib/mpm/scenes/emitter.js';
 
-	const GRID = GATE4_GRID;
+	const GRID = GATE4_MPM_GRID;
 	const WORLD_WIDTH = GRID.cellsX * GRID.cellSize;
 	const WORLD_HEIGHT = GRID.cellsY * GRID.cellSize;
+	const LIQUID_J_FLOOR_BAND_HEIGHT = 8 * GRID.cellSize;
+	const LIQUID_J_FLOOR_MIN_Y = WORLD_HEIGHT - LIQUID_J_FLOOR_BAND_HEIGHT;
 	const OUTLET_BOUNDS: MpmMlsGpuOutletBounds = {
 		minX: 0,
 		minY: WORLD_HEIGHT - 80,
@@ -299,6 +303,88 @@
 			: 'GPU MLS-MPM の処理に失敗しました。';
 	}
 
+	interface LiquidJAccumulator {
+		count: number;
+		sum: number;
+		min: number;
+		max: number;
+		minY: number;
+		maxY: number;
+	}
+
+	function createLiquidJAccumulator(): LiquidJAccumulator {
+		return {
+			count: 0,
+			sum: 0,
+			min: Number.POSITIVE_INFINITY,
+			max: Number.NEGATIVE_INFINITY,
+			minY: Number.POSITIVE_INFINITY,
+			maxY: Number.NEGATIVE_INFINITY
+		};
+	}
+
+	function includeLiquidJ(
+		accumulator: LiquidJAccumulator,
+		value: number,
+		positionY: number
+	): void {
+		accumulator.count += 1;
+		accumulator.sum += value;
+		accumulator.min = Math.min(accumulator.min, value);
+		accumulator.max = Math.max(accumulator.max, value);
+		accumulator.minY = Math.min(accumulator.minY, positionY);
+		accumulator.maxY = Math.max(accumulator.maxY, positionY);
+	}
+
+	function formatLiquidJAccumulator(accumulator: LiquidJAccumulator): string {
+		if (accumulator.count === 0) return 'n=0';
+		return (
+			`n=${accumulator.count} y=${accumulator.minY.toFixed(0)}..${accumulator.maxY.toFixed(0)} ` +
+			`min/平均/max=` +
+			`${accumulator.min.toFixed(3)}/${(accumulator.sum / accumulator.count).toFixed(3)}/` +
+			`${accumulator.max.toFixed(3)}`
+		);
+	}
+
+	function formatLiquidJReadout(particles: readonly MpmParticle[]): string {
+		const summaries = {
+			water: { all: createLiquidJAccumulator(), floor: createLiquidJAccumulator() },
+			oil: { all: createLiquidJAccumulator(), floor: createLiquidJAccumulator() }
+		};
+
+		for (const particle of particles) {
+			const model = particle.material?.model;
+			if (model !== 'water' && model !== 'oil') continue;
+
+			const jacobian =
+				particle.F.m00 * particle.F.m11 - particle.F.m01 * particle.F.m10;
+			if (
+				!Number.isFinite(jacobian) ||
+				jacobian <= 0 ||
+				!Number.isFinite(particle.position.y)
+			) {
+				throw new RangeError(`GPU の${model === 'water' ? '水' : '油'}粒子で det(F) が不正です。`);
+			}
+
+			const summary = summaries[model];
+			includeLiquidJ(summary.all, jacobian, particle.position.y);
+			if (particle.position.y >= LIQUID_J_FLOOR_MIN_Y) {
+				includeLiquidJ(summary.floor, jacobian, particle.position.y);
+			}
+		}
+
+		const formatPhase = (
+			label: string,
+			summary: (typeof summaries)['water']
+		): string =>
+			`${label} 全体 ${formatLiquidJAccumulator(summary.all)} / 床近傍 ${formatLiquidJAccumulator(summary.floor)}`;
+
+		return (
+			`液体 J=det(F)（床近傍: y≥${LIQUID_J_FLOOR_MIN_Y}、床から${LIQUID_J_FLOOR_BAND_HEIGHT}以内）: ` +
+			`${formatPhase('水', summaries.water)}; ${formatPhase('油', summaries.oil)}`
+		);
+	}
+
 	function particleValues(particle: MpmParticle): number[] {
 		const material = particle.material ?? MATERIAL;
 		const density =
@@ -460,7 +546,7 @@
 	let emitterSeed = $state(0x5eed_1234);
 	let emitterSequence = $state(0);
 	let emitterX = $state(700);
-	let emitterY = $state(200);
+	let emitterY = $state(200 + GATE4_MPM_INITIAL_Y_OFFSET);
 	let emitterSpacing = $state(GATE4_LIQUID_PARTICLE_SPACING);
 	let emitterVelocityX = $state(0);
 	let emitterVelocityY = $state(30);
@@ -829,7 +915,7 @@
 				material: emitterMaterial,
 				particleVolume:
 					emitterMaterial === 'water' || emitterMaterial === 'oil'
-						? GATE4_LIQUID_PARTICLE_AREA
+						? GATE4_MPM_LIQUID_PARTICLE_AREA
 						: PARTICLE_VOLUME,
 				grid: GRID
 			});
@@ -1044,11 +1130,11 @@
 
 		stateCheckPending = true;
 		stateCheckIsError = false;
-		stateCheckMessage = 'GPU 数値状態を読み取り中…';
+		stateCheckMessage = 'GPU 数値状態と液体 J を読み取り中…';
 		try {
-			await currentSolver.checkNumericalStatus();
+			const particles = await currentSolver.readParticles();
 			if (solver !== currentSolver || phase !== 'ready') return;
-			stateCheckMessage = 'GPU 数値状態は正常です。';
+			stateCheckMessage = `GPU 数値状態は正常です。${formatLiquidJReadout(particles)}`;
 		} catch (error) {
 			if (solver !== currentSolver || phase !== 'ready') return;
 			stateCheckIsError = true;
@@ -1289,7 +1375,7 @@
 
 			try {
 				resizeCanvas();
-				const initialScene = createMpmGate4Scene(0x4d504d34);
+				const initialScene = createMpmGate4MlsScene(0x4d504d34);
 				const paritySample = createMpmCpuParitySample(
 					initialScene.particles,
 					initialScene.parityProbeIndices,
@@ -1496,7 +1582,7 @@
 			<p class="intro">
 				水・油・Neo-Hookean 固体を repeatable / continuous emitter から追加し、傾きまたは手動の2D重力で操作します。
 				水と油は相別速度場・node-owned normal contact で接触し、各相の mass と接触 impulse を小規模 CPU reference で検証します。
-				初期シーンは{GATE4_PARTICLE_COUNT.toLocaleString()}粒子（旧14,696粒子の1/4）です。水・油の粒子参照面積と総質量は従来設定からさらに{GATE4_LIQUID_PARTICLE_AREA_SCALE}倍（{GATE4_PARTICLE_AREA}→{GATE4_LIQUID_PARTICLE_AREA}）にし、密度・粒子数・初期配置は維持します。粒子マーカーの半径は2倍です。圧縮抵抗はEOS係数を{GATE4_LIQUID_BULK_MODULUS_SCALE}倍に強化し、水・油の相境界には独立した重なり緩和を加えました。初期速度は水・油±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX}へ上げ、揺れは初期停止にしています。
+				初期シーンは{GATE4_PARTICLE_COUNT.toLocaleString()}粒子（旧14,696粒子の1/4）です。MPM専用領域は{WORLD_WIDTH}×{WORLD_HEIGHT}（grid {GRID.cellsX}×{GRID.cellsY}・cell {GRID.cellSize}）です。水・油の参照面積と質量は従来のMPM設定からさらに{GATE4_MPM_LIQUID_PARTICLE_AREA_SCALE}倍（{GATE4_LIQUID_PARTICLE_AREA}→{GATE4_MPM_LIQUID_PARTICLE_AREA}）にし、密度・粒子数・間隔18は維持します。全初期物体をY方向に{GATE4_MPM_INITIAL_Y_OFFSET}移動して床との余白を維持し、粒子マーカー半径は従来設定の2倍です。EOS係数は160,000・120,000のまま、水・油の相境界には運動エネルギーを増幅しない接触を使います。初期速度は水・油±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX}、揺れは初期停止です。
 				50個の三粒子小石に加え、{GATE4_FRACTURE_COLUMNS}×{GATE4_FRACTURE_ROWS}ノード・{GATE4_FRACTURE_BOND_COUNT} bond の固体を GPU 上で損傷・局所破断させます。
 				これは制御可能な研究用 vertical slice であり、一般用途の流体・破壊エンジンや物理精度保証ではありません。
 			</p>
@@ -1674,7 +1760,7 @@
 						<button
 							type="button"
 							onclick={togglePaused}
-							disabled={phase !== 'ready' || outletPending}
+							disabled={phase !== 'ready' || outletPending || stateCheckPending}
 							aria-pressed={paused}
 						>
 							{paused ? '再開' : '一時停止'}
@@ -1758,7 +1844,7 @@
 				<section class="source-controls" aria-labelledby="source-title">
 					<h3 id="source-title">材料 emitter · 容量 · outlet</h3>
 					<p class="control-note">
-						各追加は seed + burst 番号から決定論的に配置します。水・油は参照面積{GATE4_LIQUID_PARTICLE_AREA.toLocaleString()}、固体は{PARTICLE_VOLUME}を使います。GPU 粒子 state が正本です。一時停止中は連続追加も停止します。容量超過分は追加せず件数を報告し、削除スロットは再利用しません。
+						各追加は seed + burst 番号から決定論的に配置します。水・油は参照面積{GATE4_MPM_LIQUID_PARTICLE_AREA.toLocaleString()}、固体は{PARTICLE_VOLUME}を使います。GPU 粒子 state が正本です。一時停止中は連続追加も停止します。容量超過分は追加せず件数を報告し、削除スロットは再利用しません。
 					</p>
 					<div class="source-grid">
 						<label>
@@ -1895,6 +1981,7 @@
 			<div class="canvas-frame">
 				<canvas
 					bind:this={canvas}
+					style:aspect-ratio={`${WORLD_WIDTH} / ${WORLD_HEIGHT}`}
 					tabindex="0"
 					aria-label={`GPU MLS-MPM シミュレーション。現在の表示: ${
 						renderMode === 'surface' ? '水・油の自由表面' : '粒子マーカー診断'
@@ -1931,7 +2018,7 @@
 			<span><i class="oil-swatch"></i> 油 {GATE4_OIL_PARTICLE_COUNT.toLocaleString()}粒子（密度 0.016・圧縮係数 {(30_000 * GATE4_LIQUID_BULK_MODULUS_SCALE).toLocaleString()}）</span>
 			<span><i class="pebble-swatch"></i> 弾性小石{GATE4_PEBBLE_COUNT}個（各3粒子・Neo-Hookean・λ 20・μ 10）</span>
 			<span><i class="fracture-swatch"></i> GPU fracture body（{GATE4_FRACTURE_PARTICLE_COUNT} node・{GATE4_FRACTURE_BOND_COUNT} bond・赤は damage）</span>
-			固体粒子の参照面積は旧25から100へ4倍、水・油は参照面積100・密度を保ち、総質量・参照体積も従来sceneから変えていません。水・油の弱圧縮EOS係数を4倍（160,000・120,000）にして、同じ圧縮に対する復元圧力を強めました。相別grid fieldで従来の接近速度除去に加え、両相が同じcellを占める割合と接近速度に応じた分離biasを与え、等量・反対向きのimpulseで運動量を保ちます。node-levelの接近速度に対するtargetはその2倍ですが、これは接触・圧縮抵抗の近似であり、任意状態の完全な非混和性や粒子貫入ゼロを保証しません。粒子数・初期座標・間隔18 world unitsは変更していません。小石は一辺132 world units、中心間隔150の正三角形を塗りと輪郭線で描画します。液体の初速は各成分±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石頂点は±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX} world units/s、左右揺れの初期値は0です。界面表示は物理場とは独立した描画近似です。controlled reference testは圧縮応答・接触impulse・質量・運動量を検査しますが、幅広い速度・解像度・長時間挙動を保証しません。表面張力、濡れ、接線摩擦、連続衝突検出、界面の微視的物理は未実装です。
+			固体粒子の参照面積は旧25から100へ4倍、水・油は従来のMPM設定400から1600へさらに4倍（旧100の16倍）にし、密度・粒子数・間隔は維持したため総液体質量・参照体積も4倍（水64,000・油38,400）です。相対配置と底部余白を維持するため全初期物体をY方向に4,500移動し、MPM専用gridは220×600 cell、cellSize 10（world 2,200×6,000）です。水・油の弱圧縮EOS係数160,000・120,000は変更せず、相別grid fieldでは重なりに応じた基礎分離速度と、接近速度を増幅しない等量・反対向きのimpulseを使います。これは近似的な接触応答であり、完全な非混和性や粒子貫入ゼロを保証しません。小石は一辺132 world units、中心間隔150の正三角形を塗りと輪郭線で描画します。液体の初速は各成分±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石頂点は±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX} world units/s、左右揺れの初期値は0です。界面表示は物理場とは独立した描画近似です。controlled reference testは圧縮応答・接触impulse・質量・運動量を検査しますが、幅広い速度・解像度・長時間挙動を保証しません。表面張力、濡れ、接線摩擦、連続衝突検出、界面の微視的物理は未実装です。
 		</p>
 
 		<section class="performance" aria-labelledby="performance-title">
@@ -2017,7 +2104,7 @@
 			<p>
 				描画目標は15・30・60・90・120 FPSから選択できます。実際の描画FPSはディスプレイの更新頻度と GPU 処理時間に制約されます。
 				標準物理 macrostep は 1/240 秒で、CFL 条件に応じて数値 microstep に分割します。1 batch の初回処理上限は合計512 microstepです。処理量が上限を超えた場合は一部を実行して未処理時間を累積し、後続batchへ繰り越します。固定macrostepが上限に収まらない高速度では、macrostep自体を正のfloat32安全刻みまで短縮するため、クラッシュではなく時間の進みが遅くなります。未処理時間は自動破棄せず、要求・実効倍率とともに表示します。一時停止中は粒子状態を保ったまま、未処理時間だけを明示的に破棄できます。
-				Gate 4 の波速上限は液体 EOS と Neo-Hookean acoustic tensor から導出し、速度包絡は GPU 上の粒子最大速度と重力・左右揺れ・有限半径ドラッグの入力包絡から batch ごとに計算します。GPU guard は各 microstep の実速度を、選択した float32 microDt で波速と合わせて CFL 条件を満たす速度許容域内か検査します。Neo-Hookean 変形行列の主伸長が安全域[0.05, 20]を外れる場合は範囲内に射影し、float32での特異化・極端な伸長を防ぎます。CFL 違反や診断可能な変形失敗では、違反 microstep を rollback して最後の有効状態から残り時間を少なくとも倍の刻みで最大4回まで再試行します。初回batchは512 microstepまで、適応再試行は失敗済みworkを含め合計1024 microstepまでです。emitterの初速は追加前にCFL事前確認し、float32で正の安全刻みを作れないbatchは既存状態を止めずに拒否します。回復不能な数値異常や有効な進捗がない場合は理由を表示して停止し、初期シーンからの再起動を案内します。
+				Gate 4 の波速上限は液体 EOS と Neo-Hookean acoustic tensor から導出し、速度包絡は GPU 上の粒子最大速度と重力・左右揺れ・有限半径ドラッグの入力包絡から batch ごとに計算します。GPU guard は各 microstep の実速度を、選択した float32 microDt で波速と合わせて CFL 条件を満たす速度許容域内か検査します。Neo-Hookean 変形行列の主伸長が安全域[0.05, 20]を外れる場合は範囲内に射影し、float32での特異化・極端な伸長を防ぎます。CFL 違反や診断可能な変形失敗では、違反 microstep を rollback して最後の有効状態から残り時間を少なくとも倍の刻みで再試行し、固定回数ではなく共有microstep予算で上限を決めます。初回batchは512 microstepまで、適応再試行は失敗済みworkを含め合計1024 microstepまでです。emitterの初速は追加前にCFL事前確認し、float32で正の安全刻みを作れないbatchは既存状態を止めずに拒否します。回復不能な数値異常や有効な進捗がない場合は理由を表示して停止し、初期シーンからの再起動を案内します。
 				左右揺れはシミュレーション時間に同期し、batch区間の平均加速度を適用します（0で停止）。queue 完了待ちは GPU 単体の実行時間ではなく、完了を待ってから次の frame を送信します。毎 physics batch の速度計測は GPU 最大値 reduction と非同期の小さな scalar/status readback で、全 particle state の readback は行いません。表示する readback 平均値にはこのコストを含みます。
 			</p>
 		</section>
@@ -2420,7 +2507,6 @@
 	canvas {
 		display: block;
 		width: 100%;
-		aspect-ratio: 3 / 2;
 		touch-action: none;
 	}
 

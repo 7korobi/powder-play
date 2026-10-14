@@ -174,29 +174,31 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			[makeParticle()],
 			makeConfig({
 				capacity: 1_000_000,
-				grid: { cellsX: 220, cellsY: 150, cellSize: 10 }
+				grid: { cellsX: 220, cellsY: 600, cellSize: 10 }
 			})
 		);
 		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
 
 		expect(layout.particleCapacity).toBe(1_000_000);
+		expect(layout.nodeCount).toBe(134_469);
 		expect(layout.pairCount).toBe(9_000_000);
 		expect(layout.particleBufferBytes).toBe(80_000_000);
 		expect(layout.preparedAffineBytes).toBe(16_000_000);
 		expect(layout.objectIdBufferBytes).toBe(4_000_000);
 		expect(layout.bucketNextBytes).toBe(36_000_000);
-		expect(layout.gridStateBytes).toBe(2_729_520);
-		expect(layout.triangleFieldBytes).toBe(1_091_808);
+		expect(layout.bucketHeadBytes).toBe(537_876);
+		expect(layout.gridStateBytes).toBe(10_757_520);
+		expect(layout.triangleFieldBytes).toBe(4_303_008);
 		expect(layout.triangleFieldCandidateWordCount).toBe(0);
 		expect(layout.triangleFieldCandidateBytes).toBe(Uint32Array.BYTES_PER_ELEMENT);
-		expect(layout.triangleFieldCandidateTileCount).toBe(140);
+		expect(layout.triangleFieldCandidateTileCount).toBe(532);
 		expect(layout.bondedBodyStartBytes).toBe(1_333_332);
 		expect(layout.triangleContactStateBytes).toBe(5_333_328);
 		expect(layout.bondedBodyCapacity).toBe(333_333);
 		expect(layout.trianglePairContactCacheCapacity).toBe(0);
 		expect(layout.trianglePairContactCacheBytes).toBe(16);
 		expect(layout.trianglePairContactCandidateBytes).toBe(4);
-		expect(layout.surfaceFieldBytes).toBe(272_952);
+		expect(layout.surfaceFieldBytes).toBe(1_075_752);
 		expect(layout.readbackBytes).toBe(84_000_032);
 	});
 

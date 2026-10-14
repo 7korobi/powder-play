@@ -1,7 +1,8 @@
 import {
 	MPM_LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER,
 	MPM_LIQUID_CONTACT_RELAXATION_SECONDS,
-	MPM_LIQUID_CONTACT_SEPARATION_FRACTION
+	MPM_LIQUID_CONTACT_SEPARATION_FRACTION,
+	MPM_LIQUID_STABLE_ORDER_EPSILON
 } from '../materials.js';
 
 export const MLS_MPM_COMPUTE_WGSL = /* wgsl */ `
@@ -160,6 +161,7 @@ const TRIANGLE_CONTACT_IMPULSE_RELAXATION: f32 = 0.25;
 const LIQUID_CONTACT_SEPARATION_FRACTION: f32 = ${MPM_LIQUID_CONTACT_SEPARATION_FRACTION};
 const LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER: f32 = ${MPM_LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER};
 const LIQUID_CONTACT_RELAXATION_SECONDS: f32 = ${MPM_LIQUID_CONTACT_RELAXATION_SECONDS};
+const LIQUID_STABLE_ORDER_EPSILON: f32 = ${MPM_LIQUID_STABLE_ORDER_EPSILON};
 const TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT: u32 = 512u;
 const TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS: u32 = 32u;
 const TRIANGLE_FIELD_CANDIDATE_TILE_SIZE: u32 = 16u;
@@ -1350,7 +1352,35 @@ fn updateGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		let separation = oilGradient - waterGradient;
 		let separationLength = length(separation);
 		if (finiteFloat(separationLength) && separationLength > 1e-8) {
-			let normal = separation / separationLength;
+			var normal = separation / separationLength;
+			let waterDensity = waterMass / waterVolume;
+			let oilDensity = oilMass / oilVolume;
+			let densityScale = max(waterDensity, oilDensity);
+			let densityContrast = (oilDensity - waterDensity) / densityScale;
+			let gravity = params.gravityAndDomain.xy;
+			let gravityMagnitude = length(gravity);
+			var gravityAlignment = 0.0;
+			if (
+				!finiteFloat(waterDensity) ||
+				waterDensity <= 0.0 ||
+				!finiteFloat(oilDensity) ||
+				oilDensity <= 0.0 ||
+				!finiteFloat(densityContrast) ||
+				!finiteFloat(gravityMagnitude)
+			) {
+				atomicOr(&stateError[0], ERROR_GRID);
+				return;
+			}
+			if (gravityMagnitude > 0.0) {
+				gravityAlignment = dot(normal, gravity) / gravityMagnitude;
+			}
+			if (!finiteFloat(gravityAlignment)) {
+				atomicOr(&stateError[0], ERROR_GRID);
+				return;
+			}
+			if (densityContrast * gravityAlignment < -LIQUID_STABLE_ORDER_EPSILON) {
+				normal = -normal;
+			}
 			let relativeNormalVelocity = dot(oilVelocity - waterVelocity, normal);
 			let overlapFraction = clamp(
 				2.0 * min(waterVolume, oilVolume) / (waterVolume + oilVolume),

@@ -675,6 +675,46 @@ describe('GPU MLS-MPM batch encoding', () => {
 		solver.dispose();
 	});
 
+	it('continues CFL recovery beyond four retries while microstep budget remains', async () => {
+		const gpu = setupDevice();
+		const bounds = { waveSpeedBound: 25, velocityBound: 1 };
+		const solver = await createMpmMlsGpuSolver(CANVAS, [PARTICLE], CONFIG, bounds);
+		const plan = calculateMpmCflMicrosteps({
+			macroDt: 0.001,
+			cellSize: CONFIG.grid.cellSize,
+			...bounds,
+			maxMicrosteps: 64
+		});
+		let readbackCount = 0;
+		gpu.setMappedBytes(() => {
+			const snapshot = new ArrayBuffer(4 + 4 + 32);
+			const view = new DataView(snapshot);
+			view.setFloat32(0, 50, true);
+			if (readbackCount++ < 5) {
+				view.setUint32(8, 16_384, true);
+				view.setUint32(32, 3, true);
+				view.setFloat32(16, 50, true);
+				view.setFloat32(20, bounds.waveSpeedBound, true);
+				view.setFloat32(24, 40, true);
+				view.setFloat32(28, bounds.waveSpeedBound, true);
+			}
+			return snapshot;
+		});
+
+		const measurement = await solver.stepCflBatchAdaptive(
+			1,
+			0.001,
+			plan,
+			bounds.velocityBound,
+			64,
+			{ x: 0, y: 0 }
+		);
+
+		expect(measurement.retryCount).toBe(5);
+		expect(measurement.remainingDuration).toBe(0);
+		solver.dispose();
+	});
+
 	it('returns valid partial progress when the retry budget cannot fit, then resumes the remainder', async () => {
 		const gpu = setupDevice();
 		const bounds = { waveSpeedBound: 25, velocityBound: 1 };

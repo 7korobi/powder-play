@@ -488,6 +488,51 @@ describe('CPU MLS-MPM reference', () => {
 		expect(result.particles[0].position.y).toBeGreaterThan(result.particles[1].position.y);
 	});
 
+	it('moves denser water down through lighter oil when their layers start inverted', () => {
+		let particles = [
+			makeParticle({
+				position: { x: 8, y: 7.5 },
+				volume: 1,
+				material: { lambda: 8, mu: 0, model: 'water', density: 2 }
+			}),
+			makeParticle({
+				position: { x: 8, y: 8.5 },
+				volume: 1,
+				material: { lambda: 8, mu: 0, model: 'oil', density: 1 }
+			})
+		];
+		const config = makeConfig({ dt: 0.001, gravity: { x: 0, y: 10 } });
+
+		for (let step = 0; step < 500; step += 1) {
+			particles = [...stepMpm(particles, config).particles];
+		}
+
+		expect(particles[0].position.y).toBeGreaterThan(particles[1].position.y);
+	});
+
+	it('orients the interface for the denser oil phase when oil is heavier', () => {
+		const particles = [
+			makeParticle({
+				position: { x: 8, y: 8.5 },
+				volume: 1,
+				material: { lambda: 8, mu: 0, model: 'water', density: 1 }
+			}),
+			makeParticle({
+				position: { x: 8, y: 7.5 },
+				volume: 1,
+				material: { lambda: 8, mu: 0, model: 'oil', density: 2 }
+			})
+		];
+		const result = stepMpm(
+			particles,
+			makeConfig({ dt: 0.001, gravity: { x: 0, y: 10 } })
+		);
+
+		expect(result.particles[1].velocity.y).toBeGreaterThan(
+			result.particles[0].velocity.y
+		);
+	});
+
 	it.each([
 		{ dt: 0.0001, speed: 0.5 },
 		{ dt: 0.001, speed: 0.5 },
@@ -525,7 +570,10 @@ describe('CPU MLS-MPM reference', () => {
 			expect(result.particles[1].velocity.x).toBeGreaterThan(-speed);
 			expect(
 				result.particles[1].velocity.x - result.particles[0].velocity.x
-			).toBeGreaterThan(0);
+			).toBeGreaterThanOrEqual(0);
+			expect(
+				result.particles[1].velocity.x - result.particles[0].velocity.x
+			).toBeLessThanOrEqual(Math.max(2 * speed, 5) + 1e-8);
 			expect(result.particles[0].material?.model).toBe('water');
 			expect(result.particles[1].material?.model).toBe('oil');
 			expect(result.particles[0].position.x).toBeLessThanOrEqual(

@@ -70,7 +70,6 @@ export interface MpmMlsGpuCflBatchMeasurement extends MpmMlsGpuSpeedMeasurement 
 const ERROR_DEFORMATION = 2;
 const ERROR_DEFORMATION_SUBSTEP_LIMIT = 32;
 const ERROR_CFL_BOUND = 16_384;
-const MAX_CFL_STEP_RETRIES = 4;
 const CFL_RECOVERY_BOUND_SAFETY_FACTOR = 1.25;
 
 function isCflMicrostepCapacityError(error: unknown): boolean {
@@ -1841,9 +1840,6 @@ function createSolver(
 				}
 
 				const retryMicrostepBudget = maxMicrosteps - consumedMicrostepBudget;
-				if (retryCount >= MAX_CFL_STEP_RETRIES) {
-					stopRecovery('retry limit reached');
-				}
 				if (retryMicrostepBudget < 2) {
 					session.device.queue.writeBuffer(
 						runtime.buffers.stateError,
@@ -1879,7 +1875,7 @@ function createSolver(
 					if (!isCflMicrostepCapacityError(cause)) {
 						throw new Error(
 							`Adaptive CFL recovery could not schedule a finer step (${describeError(cause)}; ` +
-								`retry=${retryCount + 1}/${MAX_CFL_STEP_RETRIES}, failedIntervalDuration=${failedIntervalDuration}, ` +
+								`retry=${retryCount + 1}, failedIntervalDuration=${failedIntervalDuration}, ` +
 								`previousMicroDt=${attemptPlan.microDt}, minimumStepCount=${minimumStepCount}, ` +
 								`microstepBudget=${retryMicrostepBudget}): ${error.message}`,
 							{ cause }

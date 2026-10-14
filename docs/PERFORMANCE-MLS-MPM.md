@@ -672,8 +672,50 @@ mode in dedicated Headless Chrome / Apple Metal 3 with 3,674 particles, stayed
 active, and reported no runtime/console errors. The particle-marker mode was
 also switched on and confirmed separately, with larger markers visible and no
 console errors. This confirms only a short smoke, not performance,
-time-backlog bounds, or scene-scale physical quality. See the current verification record in
+time-backlog bounds, or scene-scale physical quality. See the earlier area-400 verification record in
 `docs/HANDOFF-MLS-MPM-2026-10-13.md`.
+
+### 2026-10-14: MPM-only 1,600 reference area and 6,000-unit domain
+
+The interactive MPM scene now uses a dedicated `220 × 600` grid with cell size
+10 (`2,200 × 6,000` world units). Liquid particle count and spacing remain
+unchanged, while water/oil reference area increases from 400 to 1,600 per
+particle. At the unchanged densities 0.02 / 0.016, this gives 64,000 / 38,400
+total mass and 3.2M / 2.4M reference area. The scene remains at 3,674 particles;
+all initial objects move upward by 4,500 units to preserve the former bottom
+clearance. The LiquidFun comparison scene retains its original grid and
+configuration.
+
+The combined liquid reference area is 5.6M, or 42.4% of the 13.2M domain area.
+If the former mean `J ≈ 1.03` remains representative, the projected liquid
+area is 5.77M (43.7% of the domain). With the solver's per-particle
+`J = 0.5–2` clamp, the corresponding mathematical envelope is 2.8M–11.2M
+(21.2%–84.8% of the domain); these are sizing calculations, not measured
+global occupancy. At a fixed horizontal footprint, quadrupling reference area
+would yield roughly four times the settled depth, but the actual water/oil
+depths depend on their spreading footprint, contact response, and evolving
+`J`. No scene-scale settled-depth measurement is available yet. EOS coefficients
+remain 160,000 / 120,000; they control compression recovery, not the reference
+volume itself.
+
+The high-speed recovery path also changed: water/oil approach velocity is no
+longer amplified at contact, and the fixed four-retry ceiling was removed.
+Initial processing is limited to 512 microsteps; adaptive retries share a
+1,024-microstep batch budget including failed work. If that budget cannot cover
+the requested interval, unprocessed time is retained as backlog instead of
+discarded. The browser's initial macrostep completed using 2 retries and 25
+attempted microsteps. The integrated browser reported a hidden document
+visibility state, so no sustained GPU run, frame timing, or rendered-scene
+verification was obtained.
+
+The targeted MPM tests passed (103 tests across 6 files), and the full unit
+suite passed (208 tests across 22 files). `npm run check` reported no Svelte or
+TypeScript diagnostics; `npm run build` and `git diff --check` also succeeded.
+The new grid's allocation is
+estimated at about 243.63 MB for the fixed one-million-particle capacity,
+including the roughly 12.44 MB increase in grid-dependent buffers. The old
+0.217 ms median / 0.256 ms p95 benchmark belongs to the prior area-100 setup
+and is not a performance result for this configuration.
 
 ## 6. 参照
 

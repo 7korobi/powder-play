@@ -2,8 +2,14 @@ import { describe, expect, it } from 'vitest';
 import {
 	createMpmCpuParitySample,
 	createMpmGate4Scene,
+	createMpmGate4MlsScene,
 	GATE4_CLONE_OFFSET,
 	GATE4_GRID,
+	GATE4_MPM_DOMAIN_HEIGHT_SCALE,
+	GATE4_MPM_GRID,
+	GATE4_MPM_INITIAL_Y_OFFSET,
+	GATE4_MPM_LIQUID_PARTICLE_AREA,
+	GATE4_MPM_LIQUID_PARTICLE_AREA_SCALE,
 	GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX,
 	GATE4_LIQUID_BULK_MODULUS_SCALE,
 	GATE4_LIQUID_PARTICLE_AREA,
@@ -197,6 +203,65 @@ describe('Gate 4 mixed-material sample scene', () => {
 		expect(scene.particles[GATE4_WATER_PARTICLE_COUNT].volume).toBe(
 			GATE4_LIQUID_PARTICLE_AREA
 		);
+	});
+
+	it('expands the MPM-only liquid volume and domain while preserving floor clearance', () => {
+		const mlsScene = createMpmGate4MlsScene(sceneSeed);
+		const mlsWaterFloorParticle =
+			mlsScene.particles[GATE4_WATER_PARTICLE_COUNT - 1];
+
+		expect(GATE4_GRID).toEqual({ cellsX: 220, cellsY: 150, cellSize: 10 });
+		expect(GATE4_MPM_DOMAIN_HEIGHT_SCALE).toBe(4);
+		expect(GATE4_MPM_GRID).toEqual({ cellsX: 220, cellsY: 600, cellSize: 10 });
+		expect(GATE4_MPM_INITIAL_Y_OFFSET).toBe(4_500);
+		expect(GATE4_MPM_LIQUID_PARTICLE_AREA_SCALE).toBe(4);
+		expect(GATE4_MPM_LIQUID_PARTICLE_AREA).toBe(
+			GATE4_LIQUID_PARTICLE_AREA * GATE4_MPM_LIQUID_PARTICLE_AREA_SCALE
+		);
+		expect(mlsScene.particles).toHaveLength(GATE4_PARTICLE_COUNT);
+		expect(mlsScene.fractureBonds).toEqual(scene.fractureBonds);
+		expect(mlsScene.particles[0].position).toEqual({
+			x: GATE4_LIQUID_START_X,
+			y: GATE4_WATER_START_Y + GATE4_MPM_INITIAL_Y_OFFSET
+		});
+		expect(
+			mlsScene.particles[GATE4_WATER_PARTICLE_COUNT].position
+		).toEqual({
+			x: GATE4_LIQUID_START_X,
+			y: GATE4_OIL_START_Y + GATE4_MPM_INITIAL_Y_OFFSET
+		});
+		expect(
+			mlsScene.particles.every(
+				(particle, index) =>
+					particle.position.y - scene.particles[index].position.y ===
+					GATE4_MPM_INITIAL_Y_OFFSET
+			)
+		).toBe(true);
+		expect(
+			GATE4_MPM_GRID.cellsY * GATE4_MPM_GRID.cellSize -
+				mlsWaterFloorParticle.position.y
+		).toBe(158);
+		expect(
+			mlsScene.particles.every(
+				({ position }) =>
+					position.x >= 0 &&
+					position.x <= GATE4_MPM_GRID.cellsX * GATE4_MPM_GRID.cellSize &&
+					position.y >= 0 &&
+					position.y <= GATE4_MPM_GRID.cellsY * GATE4_MPM_GRID.cellSize
+			)
+		).toBe(true);
+		expect(
+			mlsScene.particles[0].volume
+		).toBe(GATE4_MPM_LIQUID_PARTICLE_AREA);
+		expect(
+			mlsScene.particles[GATE4_WATER_PARTICLE_COUNT].volume
+		).toBe(GATE4_MPM_LIQUID_PARTICLE_AREA);
+		expect(
+			GATE4_WATER_PARTICLE_COUNT * GATE4_MPM_LIQUID_PARTICLE_AREA * 0.02
+		).toBe(64_000);
+		expect(
+			GATE4_OIL_PARTICLE_COUNT * GATE4_MPM_LIQUID_PARTICLE_AREA * 0.016
+		).toBe(38_400);
 	});
 
 	it('gives every particle bounded random initial velocity and gives pebbles angular momentum', () => {

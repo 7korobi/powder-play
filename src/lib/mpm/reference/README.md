@@ -72,9 +72,16 @@ a_separation = gravity * (rho_p - rho_local) / rho_p
 v_p' = sum_i(w_ip * v_i) + dt * a_separation
 ```
 
-This approximate differential acceleration moves a denser liquid along the
-effective gravity and a lighter liquid against it in mixed neighborhoods. It
-is not a separate velocity grid or an explicit interface/contact model.
+This correction changes the phases' relative acceleration in mixed
+neighborhoods; it is not, by itself, an Archimedean buoyancy force and may not
+accelerate a lighter phase upward against gravity. Water and oil have separate
+grid velocities. At mixed nodes, a phase-volume-gradient contact impulse
+provides an additional ordering bias: if the current interface normal points
+against the density ordering implied by gravity, the normal is reversed so
+the denser phase is driven with gravity and the lighter phase against it.
+Near-equal density contrasts or near-tangential gravity do not trigger the
+reversal. This is a discrete sorting heuristic, not a full interface or
+buoyancy model.
 
 The default constitutive law is compressible 2D Neo-Hookean elasticity:
 
@@ -105,11 +112,12 @@ their deformation determinant `J`, the stress-times-transpose used by P2G is
 P * F^T = lambda * min(J - 1, 0) * I
 ```
 
-They have no shear stress. Their reference density changes particle mass;
-the local mixture-density correction above approximates buoyant separation
-without preserving a water/oil interface. After each G2P update, the liquid
-polar projection clamps `det(F)` to `[0.5, 2]`; this prevents the tension-free
-equation of state from accumulating unbounded area expansion or collapse.
+They have no shear stress. Their reference density changes particle mass; the
+local mixture-density correction and density-aware contact bias above promote
+buoyant ordering, but do not provide surface tension or guarantee a clean
+water/oil interface. After each G2P update, the liquid polar projection clamps
+`det(F)` to `[0.5, 2]`; this prevents the tension-free equation of state from
+accumulating unbounded area expansion or collapse.
 
 Powder uses a simplified Drucker-Prager-like shear cap in log-stretch space.
 With principal log stretches `ell_i = log(sigma_i)`, the volumetric log strain
@@ -121,13 +129,14 @@ a hard deformation bound, not particle contact or plastic compaction. This is
 an exploratory model without cohesion or material calibration; it is not a
 complete granular solver.
 
-These models can coexist in one particle array and grid, but that grid has a
-single velocity field. Water/oil density contrast gets only the approximate
-local correction described above. There is no explicit particle contact, water/oil interface or surface tension,
-immiscibility, damage, or automatic CFL-based physical substepping. Large
-deformation-gradient increments alone are adaptively subdivided, up to 64
-increments. A mixed scene can therefore interpenetrate or numerically mix
-phases even though each particle retains its material identity.
+These models can coexist in one particle array and grid. Solids use the common
+grid velocity, while water and oil use separate phase velocity and volume
+fields. The density-aware grid contact is approximate: there is no
+particle-level interphase contact, surface tension, wetting, or full
+immiscibility, and phases can still interpenetrate or numerically mix. There
+is also no automatic CFL-based physical substepping in this CPU reference;
+large deformation-gradient increments alone are adaptively subdivided, up to
+64 increments.
 
 ## Numerical limits
 

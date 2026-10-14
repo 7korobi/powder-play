@@ -3,6 +3,7 @@ import {
 	MPM_LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER,
 	MPM_LIQUID_CONTACT_RELAXATION_SECONDS,
 	MPM_LIQUID_CONTACT_SEPARATION_FRACTION,
+	MPM_LIQUID_STABLE_ORDER_EPSILON,
 	SNOW_PLASTICITY
 } from '../materials.js';
 import {
@@ -984,7 +985,29 @@ function solveLiquidGridContact(
 	};
 	const gradientLength = Math.hypot(gradient.x, gradient.y);
 	if (!Number.isFinite(gradientLength) || gradientLength <= 1e-12) return;
-	const normal = scaleVector(gradient, 1 / gradientLength);
+	let normal = scaleVector(gradient, 1 / gradientLength);
+	const waterDensity = node.waterMass / node.waterVolume;
+	const oilDensity = node.oilMass / node.oilVolume;
+	const densityScale = Math.max(waterDensity, oilDensity);
+	const densityContrast = (oilDensity - waterDensity) / densityScale;
+	const gravityMagnitude = Math.hypot(config.gravity.x, config.gravity.y);
+	const gravityAlignment =
+		gravityMagnitude > 0
+			? (normal.x * config.gravity.x + normal.y * config.gravity.y) /
+				gravityMagnitude
+			: 0;
+	assertComputedFinite(waterDensity, 'water contact density');
+	assertComputedFinite(oilDensity, 'oil contact density');
+	assertComputedFinite(densityContrast, 'liquid contact density contrast');
+	assertComputedFinite(gravityMagnitude, 'gravity magnitude');
+	assertComputedFinite(gravityAlignment, 'liquid contact gravity alignment');
+	if (densityScale <= 0 || waterDensity <= 0 || oilDensity <= 0) {
+		throw new RangeError('liquid contact densities must be positive');
+	}
+	// Reverse an unstable interface normal so denser liquid is driven with gravity.
+	if (densityContrast * gravityAlignment < -MPM_LIQUID_STABLE_ORDER_EPSILON) {
+		normal = scaleVector(normal, -1);
+	}
 	const relativeNormalVelocity =
 		(node.oilVelocityX - node.waterVelocityX) * normal.x +
 		(node.oilVelocityY - node.waterVelocityY) * normal.y;
