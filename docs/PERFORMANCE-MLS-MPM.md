@@ -585,7 +585,7 @@ layout / shaders / solverのSHA-256は変更前
 `f7d344a157d2e7bb4b86a3939265d95f2e6fd0752d371636ff19b329907bb846` /
 `f11c6e55b520ca314060b2c1a5bf0b571264881c4d7a3a9fe220237171083b30`。
 
-### 2026-10-14: retuned 3,674-particle scene `stages` smoke
+### 2026-10-14: retuned 3,674-particle scene `stages` smoke (before EOS/contact strengthening)
 
 現行Gate 4 scene（水2,000・油1,500・50個の三粒子小石・24粒子破断solid）を
 1,000,000 capacity、220×150 cells、cellSize 10、`dt=1/240`、重力 `(0,90)`、
@@ -616,6 +616,39 @@ console errorなしを確認した。
 layout `57b00a93775a75dbfb71739f7331701d27a1898088b3c84107096932aaea50e7`,
 shaders `29cd62ffa0303ebf72f38b7376d226e266c5303bb41897096874382bf23e0dad`,
 solver `882eb942baa834c032dea10232c4d0a172016c7e2ce6e9e0eb2e9dc116762b0c`.
+
+### 2026-10-14: fourfold liquid EOS and approach-scaled contact (`batch`)
+
+After increasing the Gate 4 water/oil EOS coefficients to 160,000 / 120,000 and
+adding the overlap- and approach-scaled normal contact impulse, the same
+3,674-particle scene was measured on Headless Chrome 154 / Apple Metal 3
+(hardware adapter, `timestamp-query`). Configuration remained capacity
+1,000,000, 220×150 cells, cellSize 10, `dt=1/240`, gravity `(0,90)`, and no
+rendering. The measured batch used one compute pass, 64 warmup steps followed
+by 600 ms stationary warmup, then 12 batches of 8 steps.
+
+| 指標 | 結果 |
+|---|---:|
+| allocated GPU buffers | 231,188,500 byte |
+| GPU step median / p95 / max | 0.216618 / 0.256122 / 0.270127 ms |
+| queue wait median / p95 | 2.4 / 2.6 ms/batch |
+| CPU/GPU parity, 45 particles / 5 materials / 8 steps | max absolute error 0.0000139553 |
+| batch-vs-single error | 0 |
+
+The separate `stages` profile for this source measured 0.267246 ms median and
+0.281220 ms p95; it splits the compute work into 112 passes and must not be
+compared directly to the one-pass `batch` profile. The high-speed GPU phase
+contact fixture used water/oil velocity components `+64` / `-64` world-units/s,
+`dt=0.001`, and 8 steps. It had no particle crossing, zero phase-mass error,
+maximum momentum residual `2.861e-6`, and CPU/GPU maximum absolute error
+`0.000051878`.
+
+This is one short, no-render run on one adapter. It does not establish
+adaptive-CFL throughput, rendered or long-duration performance, or
+scene-scale immiscibility/contact accuracy. Source hashes:
+layout `57b00a93775a75dbfb71739f7331701d27a1898088b3c84107096932aaea50e7`,
+shaders `39b103fe8e97cf8633b7359ad2d99c666c15ba0924a1c0424583bbd13fbd1317`,
+solver `52ae85b48e1a08f4f9d54c5aa7e6a5ecf9b72aa3129fe13fbb7fea7ef285fcfa`.
 
 ## 6. 参照
 
