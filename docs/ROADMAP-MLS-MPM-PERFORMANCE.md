@@ -273,6 +273,32 @@ proxy更新は別途測定する。
 - indexed solverを小規模brute-force oracleと比較する。物理係数、接触skin、描画radiusを
   変えて候補数増大を見えにくくしない。
 
+## P6 — CPU処理への切り替え評価（最後の手段）
+
+状態: 判断基準のみ。CPU offloadは未実装であり、GPU側に測定済みの最適化余地が残る間は
+切り替えを始めない。LiquidFunの実績はCPU経路を調査する動機にはなるが、
+異なるアルゴリズム・精度・workloadの速度をこのMLS-MPMへそのまま当てはめない。
+
+### 調査を始める条件
+
+- timestamp計測で特定stageが反復可能な主要ボトルネックと確認できている。
+- 当該GPU stageに適用可能な空間索引、候補削減、データ配置、workgroup等のGPU側手法を
+  測定し、必要な端末・精度・メモリ条件では採用可能な改善策が残っていない。
+- CPUへ移す処理単位とデータ入出力を限定できる。大規模な粒子状態を毎step GPUから読み戻す
+  必要がある方式は、転送・queue同期を含めて優位性が実測されない限り採用しない。
+
+### 比較方法と採用ゲート
+
+- CPU演算時間だけでなく、GPU queue完了待ち、readback/copy、CPU/GPU間転送、
+  worker通信、再upload、command submitを含むend-to-end batch時間を測る。
+- 同一scene・seed・step列でGPU-onlyと候補CPU/hybrid経路を比較し、
+  batch median/p95、frame/input latency、メモリ、CPU負荷、実機の持続性能を記録する。
+- P4の固定Gate 4採用基準（GPU step median 10%以上改善）を下回る変更は採用しない。
+  加えてp95、操作応答、rollback、数値・接触品質を悪化させず、小規模CPU oracleとの
+  許容誤差を満たすこと。CPU stage単体が速いだけでは合格にしない。
+- CPUが得意そうという推測だけで処理を移さず、測定したcrossoverがある場合のみ
+  workload別の切替を検討する。合格しない場合はGPU-resident経路を維持する。
+
 ## ソース訂正前チェック
 
 - [x] 計測する指標・観点・固定条件を記録。

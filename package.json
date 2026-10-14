@@ -15,7 +15,8 @@
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"test:unit": "vitest",
 		"test": "npm run test:unit -- --run",
-		"benchmark:mpm": "node scripts/benchmark-mpm.mjs"
+		"benchmark:mpm": "node scripts/benchmark-mpm.mjs",
+		"benchmark:liquidfun": "node scripts/benchmark-liquidfun.mjs"
 	},
 	"devDependencies": {
 		"@sveltejs/adapter-cloudflare": "^8.0.0",
@@ -31,5 +32,8 @@
 	"imports": {
 		"#lib": "./src/lib/index.js",
 		"#lib/*": "./src/lib/*"
+	},
+	"dependencies": {
+		"liquidfun-wasm": "7.0.0"
 	}
 }
