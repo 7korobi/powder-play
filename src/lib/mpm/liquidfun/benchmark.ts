@@ -84,15 +84,14 @@ export async function runLiquidFunBenchmark({
 				waterParticleCount: simulation.waterParticleCount,
 				oilViscousParticleCount: simulation.oilParticleCount,
 				pebbleNodeCount: simulation.pebbleNodeCount,
-				pebbleTriangleGroupCount: simulation.triangleGroupCount,
-				pebbleBondCount: simulation.pebbleBondCount,
+				pebbleTriangleBodyCount: simulation.triangleBodyCount,
 				fractureNodeCount: simulation.fractureNodeCount,
 				fractureBondCount: simulation.fractureBondCount,
 				activeFractureBondCountAfterMeasurement:
 					simulation.activeFractureBondCount,
 				fractureBondFailureStrain: LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN,
-				dynamicSolidNodeBodyCount:
-					simulation.pebbleNodeCount + simulation.fractureNodeCount,
+				dynamicSolidBodyCount:
+					simulation.triangleBodyCount + simulation.fractureNodeCount,
 				staticWallBodyCount: simulation.staticWallBodyCount,
 				grid: {
 					cellsX: GATE4_GRID.cellsX,
@@ -117,9 +116,9 @@ export async function runLiquidFunBenchmark({
 				rendered: false
 			},
 			measurement: {
-				scope: 'Synchronous CPU wall-clock time around eight LiquidFun simulation steps per batch, including world.Step() and fracture bond checks.',
+				scope: 'Synchronous CPU wall-clock time around eight LiquidFun simulation steps per batch, including world.Step(), 50 polygon triangle bodies, and fracture bond checks.',
 				clock: 'performance.now()',
-				includes: 'JavaScript-to-WASM call overhead, LiquidFun/Box2D world.Step() work, and fracture bond strain checks.',
+				includes: 'JavaScript-to-WASM call overhead, Box2D polygon/circle contact solving, and fracture bond strain checks.',
 				excludes: 'Canvas2D drawing, UI work, GPU timestamps, GPU queue completion/wait, and world construction.',
 				simulationStepBatchCpuMs: batchDistribution,
 				simulationStepCpuMsPerStep: summarizeSamples(

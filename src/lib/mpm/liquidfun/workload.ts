@@ -35,22 +35,11 @@ export const LIQUIDFUN_SOLID_NODE_RADIUS_METERS = Math.sqrt(
 );
 export const LIQUIDFUN_SOLID_NODE_DENSITY =
 	GATE4_SOLID_PARTICLE_MASS / LIQUIDFUN_SOLID_NODE_AREA_SQUARE_METERS;
-export const LIQUIDFUN_PEBBLE_BOND_FREQUENCY_HZ = 30;
 export const LIQUIDFUN_FRACTURE_BOND_FREQUENCY_HZ = 8;
 export const LIQUIDFUN_BOND_DAMPING_RATIO = 1;
-const LIQUIDFUN_PEBBLE_BOND_ANGULAR_FREQUENCY =
-	2 * Math.PI * LIQUIDFUN_PEBBLE_BOND_FREQUENCY_HZ;
 const LIQUIDFUN_FRACTURE_BOND_ANGULAR_FREQUENCY =
 	2 * Math.PI * LIQUIDFUN_FRACTURE_BOND_FREQUENCY_HZ;
 const LIQUIDFUN_REDUCED_SOLID_NODE_MASS = GATE4_SOLID_PARTICLE_MASS / 2;
-export const LIQUIDFUN_PEBBLE_BOND_STIFFNESS =
-	LIQUIDFUN_REDUCED_SOLID_NODE_MASS *
-	LIQUIDFUN_PEBBLE_BOND_ANGULAR_FREQUENCY ** 2;
-export const LIQUIDFUN_PEBBLE_BOND_DAMPING =
-	2 *
-	LIQUIDFUN_BOND_DAMPING_RATIO *
-	LIQUIDFUN_REDUCED_SOLID_NODE_MASS *
-	LIQUIDFUN_PEBBLE_BOND_ANGULAR_FREQUENCY;
 export const LIQUIDFUN_FRACTURE_BOND_STIFFNESS =
 	LIQUIDFUN_REDUCED_SOLID_NODE_MASS *
 	LIQUIDFUN_FRACTURE_BOND_ANGULAR_FREQUENCY ** 2;
@@ -106,7 +95,6 @@ export interface LiquidFunGate4Workload {
 	readonly oilParticles: readonly MpmParticle[];
 	readonly pebbleNodes: readonly MpmParticle[];
 	readonly pebbleGroups: readonly LiquidFunTriangleGroupSeed[];
-	readonly pebbleBonds: readonly LiquidFunBondSeed[];
 	readonly fractureNodes: readonly MpmParticle[];
 	readonly fractureBonds: readonly LiquidFunFractureBondSeed[];
 }
@@ -173,7 +161,6 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 
 	const pebbleNodes: MpmParticle[] = [];
 	const pebbleGroups: LiquidFunTriangleGroupSeed[] = [];
-	const pebbleBonds: LiquidFunBondSeed[] = [];
 	for (const [objectId, nodes] of [...pebbleNodesByObject.entries()].sort(
 		([first], [second]) => first - second
 	)) {
@@ -201,23 +188,6 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 				firstNodeIndex + 2
 			]
 		});
-		for (let firstVertex = 0; firstVertex < orderedNodes.length; firstVertex += 1) {
-			for (
-				let secondVertex = firstVertex + 1;
-				secondVertex < orderedNodes.length;
-				secondVertex += 1
-			) {
-				const first = orderedNodes[firstVertex].position;
-				const second = orderedNodes[secondVertex].position;
-				pebbleBonds.push({
-					firstNodeIndex: firstNodeIndex + firstVertex,
-					secondNodeIndex: firstNodeIndex + secondVertex,
-					restLengthMeters:
-						Math.hypot(second.x - first.x, second.y - first.y) /
-						LIQUIDFUN_GATE4_UNITS_PER_METER
-				});
-			}
-		}
 	}
 
 	const fractureBonds: LiquidFunFractureBondSeed[] = scene.fractureBonds.map(
@@ -248,7 +218,6 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 		oilParticles.length !== GATE4_OIL_PARTICLE_COUNT ||
 		pebbleGroups.length !== GATE4_PEBBLE_COUNT ||
 		pebbleNodes.length !== GATE4_PEBBLE_PARTICLE_COUNT ||
-		pebbleBonds.length !== GATE4_PEBBLE_COUNT * 3 ||
 		fractureNodes.length !== GATE4_FRACTURE_PARTICLE_COUNT ||
 		fractureBonds.length !== GATE4_FRACTURE_BOND_COUNT ||
 		mappedMpmNodeCount !== scene.particles.length ||
@@ -272,7 +241,6 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 		oilParticles,
 		pebbleNodes,
 		pebbleGroups,
-		pebbleBonds,
 		fractureNodes,
 		fractureBonds
 	};

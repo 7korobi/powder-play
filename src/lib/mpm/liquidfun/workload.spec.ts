@@ -75,16 +75,6 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 		expect(workload.pebbleNodes).toEqual(pebbleNodes);
 		expect(workload.pebbleGroups).toHaveLength(GATE4_PEBBLE_COUNT);
 		expect(workload.pebbleGroups).toHaveLength(50);
-		expect(workload.pebbleBonds).toHaveLength(GATE4_PEBBLE_COUNT * 3);
-		expect(workload.pebbleBonds).toHaveLength(150);
-		expect(
-			new Set(
-				workload.pebbleBonds.map(
-					({ firstNodeIndex, secondNodeIndex }) =>
-						`${firstNodeIndex}:${secondNodeIndex}`
-				)
-			).size
-		).toBe(150);
 		for (const group of workload.pebbleGroups) {
 			const nodes = group.nodeIndices.map(
 				(nodeIndex) => workload.pebbleNodes[nodeIndex]

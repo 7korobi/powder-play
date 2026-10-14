@@ -42,42 +42,48 @@ Gate 4 coordinates are y-down; Box2D coordinates are y-up:
   timestep, or source scene counts.
 
 The source has 3,674 MPM nodes: 2,000 water, 1,500 oil, 150 pebble vertices,
-and 24 fracture nodes. LiquidFun maps every node's seeded initial position and
-velocity. Water uses the default `b2_waterParticle` flag; oil uses
+and 24 fracture nodes. Water uses the default `b2_waterParticle` flag; oil uses
 `b2_viscousParticle`. Both are created in the **same** LiquidFun particle
 system, with a shared radius and system density.
 
-Each of the 150 pebble nodes becomes an individual dynamic circle body. The
-nodes are grouped into the same 50 triangles, and each triangle's three edges
-are represented by distance joints. The 24 fracture nodes are individual
-dynamic circle bodies connected by the same 53 Gate 4 bonds. Those bonds break
-when their tensile strain reaches the Gate 4 12% threshold. Solid-node circle
-area and mass are mapped from Gate 4 particle area and mass.
+Each set of three pebble vertices initializes one dynamic Box2D polygon body,
+for 50 full-triangle collision shapes. The initial polygon keeps the three
+source positions; its center velocity is their mean, its angular velocity is
+the least-squares rigid fit to their velocities, and its mass is the sum of the
+three source-node masses. Unlike the previous three-circle representation,
+the fixture used for collision now covers the same triangle that is drawn.
+The 24 fracture nodes remain individual dynamic circle bodies connected by
+the same 53 Gate 4 bonds. Those bonds break when tensile strain reaches the
+Gate 4 12% threshold.
 
-This preserves the source node count, initial state, and bond topology while
-using Box2D constraints as an approximation: distance joints do not reproduce
-MPM deformation gradients or Neo-Hookean constitutive behavior, and Box2D
-contact/constraint solving differs from MLS-MPM. One LiquidFun particle system
-shares density across water and oil, so it cannot preserve the MPM phase
-densities 0.02 and 0.016 independently. Expect different trajectories and
-breakage timing; the comparison holds the seeded workload and timestep fixed,
-not the exact physical response.
+This is a rigid-body approximation of the MPM pebble material, not a
+deformable match: it does not reproduce MPM deformation gradients or
+Neo-Hookean constitutive behavior, and Box2D contact/constraint solving differs
+from MLS-MPM. One LiquidFun particle system shares density across water and
+oil, so it cannot preserve the MPM phase densities 0.02 and 0.016
+independently. Expect different trajectories and breakage timing; the
+comparison holds the seeded source scene and fixed timestep, not the exact
+physical response.
 
 ## Interactive metrics
 
-The live page runs fixed `1/240 s` simulation steps and draws with Canvas2D. A
-simulation step includes `world.Step()` and the CPU tensile-strain checks that
-destroy fracture joints. It reports:
+The live page runs fixed `1/240 s` simulation steps and draws with Canvas2D.
+The speed multiplier scales elapsed simulation time without changing the
+fixed step. A simulation step includes `world.Step()` and the CPU
+tensile-strain checks that destroy fracture joints. It reports:
 
-- browser animation-frame FPS;
+- rendered FPS, capped by the selected render target;
 - synchronous CPU time around each complete simulation step;
 - completed physics steps per wall-clock second;
 - Canvas2D draw time per frame, reported separately from physics time;
 - any fixed-step backlog retained by the frame scheduler.
 
-The live UI does not claim GPU measurements. Pause and Reset are available;
-Reset rebuilds the same fixed-seed scene. The `Start` control advances the
-solver without changing its timestep.
+The UI supports pause/resume, one fixed step, reset, two-axis gravity,
+optional device tilt, speed multipliers, surface/particle-marker rendering,
+render-rate selection, horizontal oscillation, and discarding accumulated
+simulation backlog while paused. Surface mode draws larger circles for visual
+continuity; it does not change the LiquidFun particle physics. The live UI
+does not claim GPU measurements. Reset rebuilds the same fixed-seed scene.
 
 ## Repeatable simulation-only benchmark
 

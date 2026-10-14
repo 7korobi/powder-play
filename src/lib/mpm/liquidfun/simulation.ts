@@ -26,10 +26,9 @@ import {
 	LIQUIDFUN_FRACTURE_BOND_DAMPING,
 	LIQUIDFUN_FRACTURE_BOND_STIFFNESS,
 	LIQUIDFUN_PARTICLE_RADIUS_METERS,
-	LIQUIDFUN_PEBBLE_BOND_DAMPING,
-	LIQUIDFUN_PEBBLE_BOND_STIFFNESS,
 	LIQUIDFUN_POSITION_ITERATIONS,
 	LIQUIDFUN_SHARED_PARTICLE_DENSITY,
+	LIQUIDFUN_SOLID_NODE_AREA_SQUARE_METERS,
 	LIQUIDFUN_SOLID_NODE_DENSITY,
 	LIQUIDFUN_SOLID_NODE_RADIUS_METERS,
 	LIQUIDFUN_VELOCITY_ITERATIONS,
@@ -37,7 +36,6 @@ import {
 	mapGate4VelocityToBox2D,
 	type LiquidFunBondSeed,
 	type LiquidFunFractureBondSeed,
-	type LiquidFunTriangleGroupSeed,
 	type LiquidFunVector
 } from './workload.js';
 
@@ -45,14 +43,15 @@ const B2_STATIC_BODY = 0;
 const B2_DYNAMIC_BODY = 2;
 const WALL_THICKNESS_METERS = 0.1;
 
+export type LiquidFunRenderMode = 'surface' | 'particles';
+
 export interface LiquidFunSimulation {
 	readonly particleCount: number;
 	readonly waterParticleCount: number;
 	readonly oilParticleCount: number;
 	readonly mappedMpmNodeCount: number;
 	readonly pebbleNodeCount: number;
-	readonly triangleGroupCount: number;
-	readonly pebbleBondCount: number;
+	readonly triangleBodyCount: number;
 	readonly fractureNodeCount: number;
 	readonly fractureBondCount: number;
 	readonly activeFractureBondCount: number;
@@ -61,12 +60,18 @@ export interface LiquidFunSimulation {
 	readonly particleIterations: number;
 	step(): void;
 	setGravityFromGate4(gravity: MpmVector2): void;
-	draw(context: CanvasRenderingContext2D, width: number, height: number): void;
+	draw(
+		context: CanvasRenderingContext2D,
+		width: number,
+		height: number,
+		renderMode: LiquidFunRenderMode
+	): void;
 	dispose(): void;
 }
 
-interface PebbleBondJoint extends LiquidFunBondSeed {
-	readonly joint: B2Joint;
+interface PebbleTriangleBody {
+	readonly body: B2Body;
+	readonly localVertices: readonly LiquidFunVector[];
 }
 
 interface FractureBondJoint extends LiquidFunFractureBondSeed {
@@ -214,6 +219,112 @@ function createSolidNodeBody(
 		release(body);
 		throw error;
 	}
+}
+
+function createPebbleTriangleBody(
+	module: LiquidFunModule,
+	world: B2World,
+	nodes: readonly [MpmParticle, MpmParticle, MpmParticle]
+): PebbleTriangleBody {
+	const positions = nodes.map((node) => mapGate4PositionToBox2D(node.position));
+	const velocities = nodes.map((node) => mapGate4VelocityToBox2D(node.velocity));
+	const positionSum = positions.reduce(average, { x: 0, y: 0 });
+	const velocitySum = velocities.reduce(average, { x: 0, y: 0 });
+	const center = {
+		x: positionSum.x / positions.length,
+		y: positionSum.y / positions.length
+	};
+	const linearVelocity = {
+		x: velocitySum.x / velocities.length,
+		y: velocitySum.y / velocities.length
+	};
+
+	let angularVelocityNumerator = 0;
+	let angularVelocityDenominator = 0;
+	const localVertices = positions.map((position, index) => {
+		const velocity = velocities[index];
+		if (!velocity) {
+			throw new RangeError('A Gate 4 pebble must identify three node velocities.');
+		}
+		const relativePosition = {
+			x: position.x - center.x,
+			y: position.y - center.y
+		};
+		const relativeVelocity = {
+			x: velocity.x - linearVelocity.x,
+			y: velocity.y - linearVelocity.y
+		};
+		angularVelocityNumerator +=
+			relativePosition.x * relativeVelocity.y -
+			relativePosition.y * relativeVelocity.x;
+		angularVelocityDenominator +=
+			relativePosition.x ** 2 + relativePosition.y ** 2;
+		return relativePosition;
+	});
+	if (angularVelocityDenominator <= Number.EPSILON) {
+		throw new RangeError('A Gate 4 pebble triangle must have nonzero area.');
+	}
+	const angularVelocity = angularVelocityNumerator / angularVelocityDenominator;
+
+	let twiceArea = 0;
+	for (let index = 0; index < localVertices.length; index += 1) {
+		const current = localVertices[index];
+		const next = localVertices[(index + 1) % localVertices.length];
+		if (!current || !next) {
+			throw new RangeError('A Gate 4 pebble must identify three polygon vertices.');
+		}
+		twiceArea += current.x * next.y - next.x * current.y;
+	}
+	const areaSquareMeters = Math.abs(twiceArea) / 2;
+	if (!Number.isFinite(areaSquareMeters) || areaSquareMeters <= Number.EPSILON) {
+		throw new RangeError('A Gate 4 pebble triangle must have finite, nonzero area.');
+	}
+
+	const body = createBody(
+		module,
+		world,
+		B2_DYNAMIC_BODY,
+		center,
+		linearVelocity,
+		angularVelocity
+	);
+	let shape: B2PolygonShape | undefined;
+	const vertices: B2Vec2[] = [];
+	let fixture: B2Fixture | undefined;
+	try {
+		shape = new module.b2PolygonShape();
+		for (const vertex of localVertices) {
+			vertices.push(createVector(module, vertex));
+		}
+		const setVertices = shape.SetAsArray ?? shape.Set;
+		if (!setVertices) {
+			throw new Error('LiquidFun does not expose polygon vertex initialization.');
+		}
+		setVertices.call(shape, vertices, vertices.length);
+		const triangleMass =
+			LIQUIDFUN_SOLID_NODE_AREA_SQUARE_METERS *
+			LIQUIDFUN_SOLID_NODE_DENSITY *
+			nodes.length;
+		fixture = body.CreateFixture(shape, triangleMass / areaSquareMeters);
+		if (!fixture) {
+			throw new Error('LiquidFun did not create a Gate 4 pebble polygon fixture.');
+		}
+		return { body, localVertices };
+	} catch (error) {
+		release(body);
+		throw error;
+	} finally {
+		release(fixture);
+		release(shape);
+		for (const vertex of vertices) release(vertex);
+	}
+}
+
+function average(
+	total: LiquidFunVector,
+	value: LiquidFunVector
+): LiquidFunVector {
+	return { x: total.x + value.x, y: total.y + value.y };
 }
 
 function createBondJoint(
@@ -380,6 +491,7 @@ function drawParticles(
 	context: CanvasRenderingContext2D,
 	particleSystem: B2ParticleSystem,
 	particleCount: number,
+	renderMode: LiquidFunRenderMode,
 	width: number,
 	height: number,
 	pixelsPerMeter: number,
@@ -391,7 +503,10 @@ function drawParticles(
 	const positionBufferPointer = module.getPointer(positionBuffer);
 	const positionBufferHeap = module.HEAPF32;
 	const count = Math.min(particleCount, particleSystem.GetParticleCount());
-	const radius = Math.max(1.8, LIQUIDFUN_PARTICLE_RADIUS_METERS * pixelsPerMeter * 0.48);
+	const radius =
+		renderMode === 'surface'
+			? Math.max(2.2, LIQUIDFUN_PARTICLE_RADIUS_METERS * pixelsPerMeter * 1.35)
+			: Math.max(1.8, LIQUIDFUN_PARTICLE_RADIUS_METERS * pixelsPerMeter * 0.48);
 	for (let index = 0; index < count; index += 1) {
 		const position = readLiquidFunParticlePosition(
 			positionBufferHeap,
@@ -410,8 +525,8 @@ function drawParticles(
 		context.arc(point.x, point.y, radius, 0, Math.PI * 2);
 		context.fillStyle =
 			(particleSystem.GetParticleFlags(index) & module.b2_viscousParticle) !== 0
-				? '#ff9e62'
-				: '#64d8ff';
+				? '#f2bf38'
+				: '#2e8cf2';
 		context.fill();
 	}
 }
@@ -427,33 +542,39 @@ function readBodyPosition(body: B2Body): LiquidFunVector {
 
 function drawPebbleTriangles(
 	context: CanvasRenderingContext2D,
-	pebbleGroups: readonly LiquidFunTriangleGroupSeed[],
-	pebbleNodeBodies: readonly B2Body[],
+	triangleBodies: readonly PebbleTriangleBody[],
 	width: number,
 	height: number,
 	pixelsPerMeter: number,
 	offsetX: number,
 	offsetY: number
 ): void {
-	const points = pebbleNodeBodies.map((body) =>
-		pointOnCanvas(
-			readBodyPosition(body),
-			width,
-			height,
-			pixelsPerMeter,
-			offsetX,
-			offsetY
-		)
-	);
 	context.fillStyle = '#f5d77a';
 	context.strokeStyle = '#fff0b8';
 	context.lineWidth = 1.25;
-	for (const { nodeIndices } of pebbleGroups) {
-		const first = points[nodeIndices[0]];
-		const second = points[nodeIndices[1]];
-		const third = points[nodeIndices[2]];
+	for (const triangle of triangleBodies) {
+		const center = readBodyPosition(triangle.body);
+		const angle = triangle.body.GetAngle();
+		const cosine = Math.cos(angle);
+		const sine = Math.sin(angle);
+		const points = triangle.localVertices.map((vertex) =>
+			pointOnCanvas(
+				{
+					x: center.x + cosine * vertex.x - sine * vertex.y,
+					y: center.y + sine * vertex.x + cosine * vertex.y
+				},
+				width,
+				height,
+				pixelsPerMeter,
+				offsetX,
+				offsetY
+			)
+		);
+		const first = points[0];
+		const second = points[1];
+		const third = points[2];
 		if (!first || !second || !third) {
-			throw new RangeError('A Gate 4 pebble must identify three drawable nodes.');
+			throw new RangeError('A Gate 4 pebble must identify three drawable vertices.');
 		}
 		context.beginPath();
 		context.moveTo(first.x, first.y);
@@ -521,8 +642,7 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 	}
 
 	let particleSystem: B2ParticleSystem | undefined;
-	const pebbleNodeBodies: B2Body[] = [];
-	const pebbleBondJoints: PebbleBondJoint[] = [];
+	const pebbleTriangleBodies: PebbleTriangleBody[] = [];
 	const fractureNodeBodies: B2Body[] = [];
 	const fractureBondJoints: FractureBondJoint[] = [];
 	let disposed = false;
@@ -566,21 +686,16 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 		}
 
 		const staticWallBodyCount = createStaticWalls(module, world);
-		for (const particle of workload.pebbleNodes) {
-			pebbleNodeBodies.push(createSolidNodeBody(module, world, particle));
-		}
-		for (const bond of workload.pebbleBonds) {
-			pebbleBondJoints.push({
-				...bond,
-				joint: createBondJoint(
-					module,
-					world,
-					pebbleNodeBodies,
-					bond,
-					LIQUIDFUN_PEBBLE_BOND_STIFFNESS,
-					LIQUIDFUN_PEBBLE_BOND_DAMPING
-				)
-			});
+		for (const group of workload.pebbleGroups) {
+			const first = workload.pebbleNodes[group.nodeIndices[0]];
+			const second = workload.pebbleNodes[group.nodeIndices[1]];
+			const third = workload.pebbleNodes[group.nodeIndices[2]];
+			if (!first || !second || !third) {
+				throw new RangeError('A Gate 4 pebble must identify three existing nodes.');
+			}
+			pebbleTriangleBodies.push(
+				createPebbleTriangleBody(module, world, [first, second, third])
+			);
 		}
 		for (const particle of workload.fractureNodes) {
 			fractureNodeBodies.push(createSolidNodeBody(module, world, particle));
@@ -613,9 +728,8 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 			waterParticleCount: workload.waterParticles.length,
 			oilParticleCount: workload.oilParticles.length,
 			mappedMpmNodeCount: workload.mappedMpmNodeCount,
-			pebbleNodeCount: pebbleNodeBodies.length,
-			triangleGroupCount: workload.pebbleGroups.length,
-			pebbleBondCount: pebbleBondJoints.length,
+			pebbleNodeCount: workload.pebbleNodes.length,
+			triangleBodyCount: pebbleTriangleBodies.length,
 			fractureNodeCount: fractureNodeBodies.length,
 			fractureBondCount: fractureBondJoints.length,
 			get activeFractureBondCount(): number {
@@ -653,7 +767,8 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 			draw(
 				context: CanvasRenderingContext2D,
 				width: number,
-				height: number
+				height: number,
+				renderMode: LiquidFunRenderMode
 			): void {
 				if (disposed || width <= 0 || height <= 0) return;
 				context.clearRect(0, 0, width, height);
@@ -674,6 +789,7 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 					context,
 					activeParticleSystem,
 					workload.waterParticles.length + workload.oilParticles.length,
+					renderMode,
 					width,
 					height,
 					pixelsPerMeter,
@@ -682,8 +798,7 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 				);
 				drawPebbleTriangles(
 					context,
-					workload.pebbleGroups,
-					pebbleNodeBodies,
+					pebbleTriangleBodies,
 					width,
 					height,
 					pixelsPerMeter,
@@ -713,15 +828,13 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 			dispose(): void {
 				if (disposed) return;
 				disposed = true;
-				for (const { joint } of pebbleBondJoints) release(joint);
-				pebbleBondJoints.length = 0;
 				for (const bond of fractureBondJoints) {
 					release(bond.joint);
 					bond.joint = null;
 				}
 				fractureBondJoints.length = 0;
-				for (const body of pebbleNodeBodies) release(body);
-				pebbleNodeBodies.length = 0;
+				for (const triangle of pebbleTriangleBodies) release(triangle.body);
+				pebbleTriangleBodies.length = 0;
 				for (const body of fractureNodeBodies) release(body);
 				fractureNodeBodies.length = 0;
 				release(activeParticleSystem);
@@ -729,9 +842,8 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 			}
 		};
 	} catch (error) {
-		for (const { joint } of pebbleBondJoints) release(joint);
 		for (const bond of fractureBondJoints) release(bond.joint);
-		for (const body of pebbleNodeBodies) release(body);
+		for (const triangle of pebbleTriangleBodies) release(triangle.body);
 		for (const body of fractureNodeBodies) release(body);
 		release(particleSystem);
 		release(world);
