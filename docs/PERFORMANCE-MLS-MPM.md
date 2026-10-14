@@ -650,6 +650,31 @@ layout `57b00a93775a75dbfb71739f7331701d27a1898088b3c84107096932aaea50e7`,
 shaders `39b103fe8e97cf8633b7359ad2d99c666c15ba0924a1c0424583bbd13fbd1317`,
 solver `52ae85b48e1a08f4f9d54c5aa7e6a5ecf9b72aa3129fe13fbb7fea7ef285fcfa`.
 
+### 2026-10-14: liquid reference area increased from 100 to 400
+
+The next tuning kept the 3,674-particle scene, liquid density, particle count,
+spacing, and initial positions, but multiplied each water/oil reference area
+and corresponding particle mass by four. Total liquid reference mass is now
+16,000 for water and 9,600 for oil. The scene particle-marker radius grows by
+`sqrt(4) = 2`; solid parameters and the EOS/contact coefficients are unchanged.
+
+The regular `npm run benchmark:mpm -- --profile=batch` run did not yield a
+performance result. This harness directly advances the seeded Gate 4 scene at
+fixed `dt=1/240 s`; it does not use the interactive lab's adaptive-CFL
+scheduler/retry path. After the stationary warmup, the fixed-step path raised
+`deformation update exceeded the adaptive substep limit at particle 509` and
+rolled back. The earlier 0.216618 ms median / 0.256122 ms p95 measured the
+area-100 configuration and must not be attributed to the current area-400
+scene.
+
+Separately, the interactive adaptive-CFL lab ran for 15 seconds in free-surface
+mode in dedicated Headless Chrome / Apple Metal 3 with 3,674 particles, stayed
+active, and reported no runtime/console errors. The particle-marker mode was
+also switched on and confirmed separately, with larger markers visible and no
+console errors. This confirms only a short smoke, not performance,
+time-backlog bounds, or scene-scale physical quality. See the current verification record in
+`docs/HANDOFF-MLS-MPM-2026-10-13.md`.
+
 ## 6. 参照
 
 - [WebGPU: usage scopes](https://www.w3.org/TR/webgpu/#usage-scopes) —

@@ -12,16 +12,18 @@
   実機受け入れやscene-scale物理受け入れを完了した状態ではない。
 - 現行初期scene: 水2,000、油1,500、Neo-Hookean小石50個（各3粒子、計150）、
   6×4 node・53 bondの破断solid（24粒子）、合計3,674 active粒子。旧14,696の1/4。
-- 固体 particle reference areaは旧25から100へ4倍、固体massは1から4へ4倍。液体参照面積は100のまま、
-  各相の総参照体積・massも前sceneから維持した。水・油のEOS係数は160,000・120,000
+- 固体 particle reference areaは旧25から100へ4倍、固体massは1から4へ4倍。液体参照面積は100から400へ
+  さらに4倍、密度0.02・0.016を維持して各相の総参照体積・massも直前設定の4倍
+  （水16,000・油9,600）とした。液体粒子数・間隔18・初期位置は変更していない。
+  粒子 marker 半径は2倍となる。水・油のEOS係数は160,000・120,000
   （従来の40,000・30,000から4倍）へ上げ、相別grid接触に重なり量・接近速度を使う
   equal-and-opposite separation impulseを加えた。水・油burstにも同じ参照面積とEOSを適用する。
 - 小石を液体範囲内へ配置し、初期速度は水・油各成分±64、小石頂点±240、破断solid各成分±80。
   小石はsurface・particle-marker両modeで塗り三角形と輪郭線を描画する。左右揺れは初期offで、
   UIボタンから既定±240 world units/s²・0.16 Hzを開始／停止できる。
-- GPU capacityは1,000,000。現構成のApple Metal 3 / Headless Chrome 154
+- GPU capacityは1,000,000。液体volumeを4倍にする前のApple Metal 3 / Headless Chrome 154
   `batch` profile（3,674粒子、描画なし、12 sample×8 step）ではGPU buffer確保量
-  231,188,500 byte、GPU step median 0.217 ms / p95 0.256 msだった。
+  231,188,500 byte、GPU step median 0.217 ms / p95 0.256 msだった。最新設定での再測定は本書末尾に記録する。
   `stages` profileはmedian 0.267 ms / p95 0.281 msだが、dispatchごとにpassを分ける診断値であり、
   通常batchとの比較には使わない。  queue完了待ちはmedian 2.4 ms / p95 2.6 msでGPU単体時間ではない。
   単一端末・短時間・描画なしの測定で、適応CFLを通した描画込みの持続性能を保証しない。
@@ -214,7 +216,7 @@ runごとのwarmup step数・scene状態が完全一致しないため、1回の
 - [benchmark harness](../scripts/benchmark-mpm.mjs)
 - [kernel実装と制約](../src/lib/mpm/kernels/README.md)
 
-## 6. 2026-10-14 retune後の検証記録
+## 6. 2026-10-14 retune後の検証記録（液体面積100の設定）
 
 - 自動検証: `npm test` 20 files / 198 tests、`npm run check` 0 errors / 0 warnings、
   `npm run build` 成功。
@@ -237,3 +239,18 @@ runごとのwarmup step数・scene状態が完全一致しないため、1回の
   表示mode切替・emitter追加・容量境界・scene-scale接触品質は未確認。
 - 現行sceneの単一runであり、mobile/他adapter、scene-scale接触・破断品質は未検証。
   測定条件とsource hashは[性能計測資料](./PERFORMANCE-MLS-MPM.md)を参照。
+
+## 7. 液体参照面積をさらに4倍にした後の確認
+
+- Gate 4の水・油だけparticle reference areaを100から400へ4倍にした。密度、粒子数3,500、
+  spacing 18 world units、初期位置は維持し、各相の総質量・参照体積は水16,000・油9,600。
+  物理面積に連動してparticle-marker半径が2倍になる。固体のarea/massとEOS/contact係数は変更なし。
+- 自動検証: `npm test` 21 files / 203 tests、`npm run check` 0 errors / 0 warnings、
+  `npm run build` 成功。
+- 現行sceneの `npm run benchmark:mpm -- --profile=batch` はGPU数値guardで失敗した。
+  このharnessはGate 4を固定dtで直接進め、lab本体のadaptive CFL/retryを通さない。
+  area400の初期sceneでは約600 ms warmup後の固定step中にparticle 509の変形更新上限を越えたため、
+  現設定のbenchmark値は採用しない。以前の0.217 msはarea100の歴史値である。
+- ブラウザーsmoke: 専用Headless Chrome / Apple Metal 3で、自由表面canvasでadaptive labを15秒実行し、
+  3,674粒子・GPU実行statusを保ち、runtime/console errorなし。particle-marker modeにも切り替え、
+  拡大したmarkerと実行継続を確認した。未処理時間・端末持続性能・scene-scale接触品質は別途検証が必要。

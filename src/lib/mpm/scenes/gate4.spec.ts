@@ -7,6 +7,7 @@ import {
 	GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX,
 	GATE4_LIQUID_BULK_MODULUS_SCALE,
 	GATE4_LIQUID_PARTICLE_AREA,
+	GATE4_LIQUID_PARTICLE_AREA_SCALE,
 	GATE4_LIQUID_PARTICLE_SPACING,
 	GATE4_LIQUID_START_X,
 	GATE4_OIL_PARTICLE_COUNT,
@@ -142,7 +143,10 @@ describe('Gate 4 mixed-material sample scene', () => {
 				.every((particle) => particle.volume === GATE4_PARTICLE_AREA)
 		).toBe(true);
 		expect(GATE4_PARTICLE_AREA).toBe(4 * 25);
-		expect(GATE4_LIQUID_PARTICLE_AREA).toBe(GATE4_PARTICLE_AREA);
+		expect(GATE4_LIQUID_PARTICLE_AREA_SCALE).toBe(4);
+		expect(GATE4_LIQUID_PARTICLE_AREA).toBe(
+			GATE4_PARTICLE_AREA * GATE4_LIQUID_PARTICLE_AREA_SCALE
+		);
 		expect(GATE4_LIQUID_BULK_MODULUS_SCALE).toBe(4);
 		expect(scene.particles[0].material?.lambda).toBe(160_000);
 		expect(
@@ -151,13 +155,19 @@ describe('Gate 4 mixed-material sample scene', () => {
 		expect(
 			GATE4_WATER_PARTICLE_COUNT * GATE4_LIQUID_PARTICLE_AREA * 0.02
 		).toBe(
-			GATE4_WATER_PARTICLE_COUNT * GATE4_PARTICLE_AREA * 0.02
+			4 * GATE4_WATER_PARTICLE_COUNT * GATE4_PARTICLE_AREA * 0.02
 		);
 		expect(
 			GATE4_OIL_PARTICLE_COUNT * GATE4_LIQUID_PARTICLE_AREA * 0.016
 		).toBe(
-			GATE4_OIL_PARTICLE_COUNT * GATE4_PARTICLE_AREA * 0.016
+			4 * GATE4_OIL_PARTICLE_COUNT * GATE4_PARTICLE_AREA * 0.016
 		);
+		expect(
+			GATE4_WATER_PARTICLE_COUNT * GATE4_LIQUID_PARTICLE_AREA * 0.02
+		).toBe(16_000);
+		expect(
+			GATE4_OIL_PARTICLE_COUNT * GATE4_LIQUID_PARTICLE_AREA * 0.016
+		).toBe(9_600);
 		expect(GATE4_PEBBLE_PARTICLE_COUNT * GATE4_SOLID_PARTICLE_MASS).toBe(600);
 		expect(GATE4_FRACTURE_PARTICLE_COUNT * GATE4_SOLID_PARTICLE_MASS).toBe(96);
 	});
@@ -174,7 +184,7 @@ describe('Gate 4 mixed-material sample scene', () => {
 		).toBe(GATE4_LIQUID_PARTICLE_SPACING);
 	});
 
-	it('keeps the initial liquid positions and reference area', () => {
+	it('keeps initial liquid positions while using fourfold reference area', () => {
 		expect(scene.particles[0].position).toEqual({
 			x: GATE4_LIQUID_START_X,
 			y: GATE4_WATER_START_Y
@@ -270,18 +280,22 @@ describe('Gate 4 mixed-material sample scene', () => {
 		expect(() => createMpmGate4Scene(0x1_0000_0000)).toThrow(RangeError);
 	});
 
-	it('preserves liquid density and volume with stronger EOS and Neo-Hookean pebbles', () => {
+	it('uses fourfold liquid particle area and stronger EOS with Neo-Hookean pebbles', () => {
 		expect(scene.particles).toHaveLength(GATE4_PARTICLE_COUNT);
 		expect(scene.particles[0].material).toMatchObject({
 			model: 'water',
 			lambda: 160_000,
 			density: 0.02
 		});
+		expect(scene.particles[0].volume).toBe(GATE4_LIQUID_PARTICLE_AREA);
 		expect(scene.particles[GATE4_WATER_PARTICLE_COUNT].material).toMatchObject({
 			model: 'oil',
 			lambda: 120_000,
 			density: 0.016
 		});
+		expect(scene.particles[GATE4_WATER_PARTICLE_COUNT].volume).toBe(
+			GATE4_LIQUID_PARTICLE_AREA
+		);
 		expect(scene.particles[PEBBLE_START].material).toMatchObject({
 			model: 'neo-hookean',
 			lambda: 20,

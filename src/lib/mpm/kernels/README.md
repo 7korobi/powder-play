@@ -116,12 +116,14 @@ The retuned Gate 4 sample starts with 2,000 water, 1,500 oil, 50 Neo-Hookean
 elastic pebbles built from three particles each, and a 24-particle connected
 solid (3,674 active particles total, one quarter of the previous 14,696).
 Relative to the preceding 3,674-particle tuning, water and oil particle
-reference area remains 100, and each liquid phase's reference volume and mass
-remain unchanged. Instead, the compressive EOS stiffness increases fourfold
-(water 40,000 → 160,000; oil 30,000 → 120,000) to resist volume collapse.
+reference area grows from 100 to 400 (4×); at unchanged densities, each phase's
+total reference volume and mass also grow 4× (water 16,000, oil 9,600).
 Liquid particle counts, spacing (18 world units), and initial positions remain
-unchanged. Pebble and fracture-solid reference area remains 100, and solid
-particle mass remains 4. The pebbles form an 8-column × 7-row array with
+unchanged. The particle-marker radius therefore doubles, while the independent
+display-area multiplier remains 2×. The compressive EOS stiffness is four
+times the earlier baseline (water 40,000 → 160,000; oil 30,000 → 120,000) to
+resist volume collapse. Pebble and fracture-solid reference area remains 100,
+and solid particle mass remains 4. The pebbles form an 8-column × 7-row array with
 150-world-unit center spacing; the last row contains two centered pebbles.
 Each is an equilateral triangle with 132-world-unit edges and width, about
 6% of the simulation-domain width. The array overlaps the liquid region
@@ -176,10 +178,15 @@ With 50 active pebble bodies, the full-scan upper bound is about 1.71 million
 node/body candidates per step and unordered SAT pairs fall from 19,900 to
 1,225. A current no-render `batch` profile on Apple Metal 3 / Headless Chrome
 154 used 3,674 particles and 12 samples of eight steps: GPU step median was
-0.217 ms and p95 was 0.256 ms. One short run is not sustained or cross-device
-performance evidence. The diagnostic `stages` profile splits the batch into
-multiple passes and its times are not directly comparable. Node-level field
-candidate counts remain unmeasured. The GPU contact fixture also passed at
+0.217 ms and p95 was 0.256 ms before the liquid area increase from 100 to 400.
+The same fixed-step harness does not run the lab's adaptive CFL scheduler; with
+the larger liquid area, it now rejects a step after the deformation update
+exceeds its adaptive substep limit at particle 509. Treat the old timing as
+historical and the current performance as unmeasured. The interactive lab did
+remain active for a 15-second adaptive-CFL browser smoke. The diagnostic
+`stages` profile splits the batch into multiple passes and its times are not
+directly comparable. Node-level field candidate counts remain unmeasured. The
+GPU contact fixture also passed at
 opposed ±64 world-units/s with no particle crossing over eight 0.001-second
 steps, while preserving phase mass and momentum within the stated tolerance. Contact
 friction, surface tension, wetting, complete water/oil separation in arbitrary
@@ -196,19 +203,23 @@ calibrated continuum fracture model; GPU numerical accuracy and sustained
 damage loading have not been measured across devices/resolutions.
 
 Water and oil reference densities remain 0.02 and 0.016, with EOS stiffnesses
-160,000 and 120,000 (four times the preceding 40,000 and 30,000). Their count
-is one quarter of the previous scene and each particle's reference area is
-four times larger, preserving per-phase reference mass and total area. The
-18-unit spacing preserves the previous liquid reference area per unit domain
-area (`100 / 18²` equals `25 / 9²`). The grid remains 220 × 150 cells at
+160,000 and 120,000 (four times the preceding 40,000 and 30,000). Relative to
+the original 14,696-particle scene, the liquid count is one quarter while
+particle area is 16 times larger (25 → 400), so total liquid reference volume
+and mass are 4× that baseline. Relative to the latest 3,674-particle tuning,
+area and total liquid volume/mass are each 4× (100 → 400). The 18-unit spacing
+is unchanged; reference area per lattice spacing is now `400 / 18²`, 4× the
+previous `100 / 18²` and `25 / 9²`. The grid remains 220 × 150 cells at
 10-unit cell size. A previous 20,000-particle scene
 used 6,000 powder particles; the later 200-pebble and 14,696-particle layouts
 are historical. The current sample reserves capacity for 1,000,000 particles,
 so reducing active count does not materially reduce the fixed GPU allocation.
 
 The surface and particle-marker renderers apply an additional 2× display-area
-scale independently of physical particle area, making each particle appear
-about 8× larger in area than the previous layout. Surface pixels use the
+scale independently of physical particle area. Compared with the original
+25-unit liquid particle area, the current 400-unit reference area and renderer
+multiplier produce 32× display area; the marker radius is about 5.7× larger.
+Surface pixels use the
 dominant water/oil phase color with a narrow interface highlight; this is a
 visual cue, not a guarantee of physical separation. The sinusoidal horizontal
 acceleration averages over each batch's simulation-time interval; the

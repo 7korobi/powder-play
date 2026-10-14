@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { GATE4_LIQUID_BULK_MODULUS_SCALE } from './gate4.js';
+import {
+	GATE4_LIQUID_BULK_MODULUS_SCALE,
+	GATE4_LIQUID_PARTICLE_AREA
+} from './gate4.js';
 import { createMpmEmitterParticles } from './emitter.js';
 
 const BASE_CONFIG = {
@@ -32,7 +35,15 @@ describe('deterministic GPU MPM emitter', () => {
 	});
 
 	it('supports distinct oil, solid, and rectangle source definitions', () => {
-		const oil = createMpmEmitterParticles({ ...BASE_CONFIG, material: 'oil' });
+		const water = createMpmEmitterParticles({
+			...BASE_CONFIG,
+			particleVolume: GATE4_LIQUID_PARTICLE_AREA
+		});
+		const oil = createMpmEmitterParticles({
+			...BASE_CONFIG,
+			material: 'oil',
+			particleVolume: GATE4_LIQUID_PARTICLE_AREA
+		});
 		const solid = createMpmEmitterParticles({
 			...BASE_CONFIG,
 			material: 'neo-hookean',
@@ -40,6 +51,7 @@ describe('deterministic GPU MPM emitter', () => {
 			particleVolume: 100
 		});
 
+		expect(water.every((particle) => particle.volume === GATE4_LIQUID_PARTICLE_AREA)).toBe(true);
 		expect(oil.every((particle) => particle.material?.model === 'oil')).toBe(true);
 		expect(
 			oil.every(
@@ -48,6 +60,7 @@ describe('deterministic GPU MPM emitter', () => {
 		).toBe(true);
 		expect(solid.every((particle) => particle.material?.model === 'neo-hookean')).toBe(true);
 		expect(solid.every((particle) => particle.volume === 100)).toBe(true);
+		expect(oil.every((particle) => particle.volume === GATE4_LIQUID_PARTICLE_AREA)).toBe(true);
 		expect(new Set(solid.map(({ position }) => `${position.x}:${position.y}`)).size).toBe(
 			BASE_CONFIG.count
 		);

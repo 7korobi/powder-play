@@ -52,6 +52,7 @@
 		GATE4_LIQUID_BULK_MODULUS_SCALE,
 		GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX,
 		GATE4_LIQUID_PARTICLE_AREA,
+		GATE4_LIQUID_PARTICLE_AREA_SCALE,
 		GATE4_LIQUID_PARTICLE_SPACING,
 		GATE4_PARTICLE_CAPACITY,
 		GATE4_PARTICLE_COUNT,
@@ -1495,7 +1496,7 @@
 			<p class="intro">
 				水・油・Neo-Hookean 固体を repeatable / continuous emitter から追加し、傾きまたは手動の2D重力で操作します。
 				水と油は相別速度場・node-owned normal contact で接触し、各相の mass と接触 impulse を小規模 CPU reference で検証します。
-				初期シーンは{GATE4_PARTICLE_COUNT.toLocaleString()}粒子（旧14,696粒子の1/4）です。水・油の参照面積・総質量は維持し、圧縮抵抗を{GATE4_LIQUID_BULK_MODULUS_SCALE}倍に強化しました。水・油の相境界には独立した重なり緩和を加え、初期配置は維持します。初期速度は水・油±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX}へ上げ、揺れは初期停止にしています。
+				初期シーンは{GATE4_PARTICLE_COUNT.toLocaleString()}粒子（旧14,696粒子の1/4）です。水・油の粒子参照面積と総質量は従来設定からさらに{GATE4_LIQUID_PARTICLE_AREA_SCALE}倍（{GATE4_PARTICLE_AREA}→{GATE4_LIQUID_PARTICLE_AREA}）にし、密度・粒子数・初期配置は維持します。粒子マーカーの半径は2倍です。圧縮抵抗はEOS係数を{GATE4_LIQUID_BULK_MODULUS_SCALE}倍に強化し、水・油の相境界には独立した重なり緩和を加えました。初期速度は水・油±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX}へ上げ、揺れは初期停止にしています。
 				50個の三粒子小石に加え、{GATE4_FRACTURE_COLUMNS}×{GATE4_FRACTURE_ROWS}ノード・{GATE4_FRACTURE_BOND_COUNT} bond の固体を GPU 上で損傷・局所破断させます。
 				これは制御可能な研究用 vertical slice であり、一般用途の流体・破壊エンジンや物理精度保証ではありません。
 			</p>
