@@ -1,10 +1,10 @@
 # 2D GPU MLS-MPM ロードマップ
 
-更新日: 2026-10-13
+更新日: 2026-10-14
 
 状態: Gate 0 のGPU操作ラボ、Gate 2の基本操作、Gate 4の水・油接触／小石接触／破断prototypeを実装済み。S3/S4の小規模な制御GPU fixtureは通過したが、scene-scale物理受け入れ、Android/iOS実機、材料校正、Gate 5の製品統合は未完了。既存のβ v0.2は維持する。
 
-2026-10-13にApple Metal 3 / Headless Chrome 154で14,696粒子sceneを計測し、別途小規模S3/S4 fixtureと45粒子・5材料の回帰を確認した。これらは同日に記録したsource hashのコードに対する結果である。その後、作業treeにCFL microstep/recoveryの未commit変更が加わっているため、数値・性能結果はその変更を含む現行treeの検証結果ではない。詳細は[引継ぎ・動作確認手順](./HANDOFF-MLS-MPM-2026-10-13.md)を参照する。
+2026-10-13にApple Metal 3 / Headless Chrome 154で14,696粒子sceneを計測し、別途小規模S3/S4 fixtureと45粒子・5材料の回帰を確認した。これらは同日に記録したsource hashと旧scene構成に対する歴史的結果である。2026-10-14に初期sceneを3,674粒子へ変更したため、旧benchmarkは新しいsceneの性能・物理受け入れを示さない。adaptive CFL/recoveryは現行sourceに実装済みだが、新scene scaleでの物理・性能受け入れは未実施である。詳細は[引継ぎ・動作確認手順](./HANDOFF-MLS-MPM-2026-10-13.md)を参照する。
 
 ## 材料表現の調査・詳細計画
 
@@ -20,6 +20,12 @@ Gate 4接触prototypeの部分実装と、残る実装・検証の詳細計画�
 [ステージ5–6](./ROADMAP-MLS-MPM-STAGES-5-6.md) に分ける。
 1–4のコードが存在することと物理ゲート合格は区別し、5–6はゲートを通るまで実装しない。
 
+2026-10-14のscene retuneでは、水2,000・油1,500・小石50個・破断solid24粒子の合計を
+3,674粒子（旧14,696の1/4）にした。各粒子の参照面積は25から100へ4倍、液体間隔は9から18へ2倍、
+固体粒子質量は1から4へ4倍とし、各相の総質量・参照面積を保つ。表示専用面積はさらに2倍にして、
+粒子1個あたりの見かけの面積を約8倍にした。配置・描画・初期揺れも同時に調整したため、
+新しいGPU benchmarkとscene-scale物理受け入れが必要である。
+
 現行solverのチューニングは [パフォーマンス計測・検討指針](./PERFORMANCE-MLS-MPM.md) と
 [パフォーマンスチューニングのロードマップ](./ROADMAP-MLS-MPM-PERFORMANCE.md) に分離する。
 P1–P5の性能改善では計測とロードマップを先に完成させ、物理条件を変えないソース変更をその後まとめて行う。
@@ -28,7 +34,7 @@ P1–P5の性能改善では計測とロードマップを先に完成させ、�
 
 現在の進捗、再現可能な動作確認手順、検証上の知見をまとめた
 [MLS-MPM作業引継ぎ・動作確認手順](./HANDOFF-MLS-MPM-2026-10-13.md)を追加した。
-この記録の測定結果は制御fixtureと現行sceneの範囲に限り、未完了の物理gateを合格扱いにしない。
+この記録の測定結果は制御fixtureと旧sceneの範囲に限り、未完了の物理gateを合格扱いにしない。
 
 ### ロードマップの読み方
 
@@ -42,10 +48,10 @@ P1–P5の性能改善では計測とロードマップを先に完成させ、�
 後続物理の **Stage 5（気体・キャビテーション）**、材料ロードマップの **M5/M7** は別のgateである。
 Gate 4のprototypeやM4の一部実装が存在することも、各物理gateの合格を意味しない。
 
-### 現在の推奨作業順（2026-10-13）
+### 現在の推奨作業順（2026-10-14）
 
-1. **M2のCFL time steppingを検証する**。作業treeにある未commitのadaptive microstep/recoveryを
-   既存の変更前M0 snapshotと細かいstepのreferenceを使ってunit/type check・実GPUで確認する。
+1. **M2のCFL time steppingをscene retune後に再検証する**。adaptive microstep/recoveryは実装済みだが、
+   既存の変更前M0 snapshotと細かいstepのreferenceを使ったunit/type check・実GPU確認を新sceneで行う。
    rollback後も要求時間を全て処理すること、retry上限・512
    microstep/frame予算で明示的に停止すること、細かいstepのreferenceへ収束することを確認する。
    結果が揃うまでM2合格や後続sceneの物理受け入れを宣言しない。
@@ -54,7 +60,7 @@ Gate 4のprototypeやM4の一部実装が存在することも、各物理gate�
 3. **S3.1のscene-scale水・油normal contactを受け入れる**。層状／斜めinterface、速度・密度差を
    増やし、crossing、penetration、gap、相別mass/momentumの測定条件と許容値を先に決める。
    表面張力はこのgateに混ぜず、必要性を確認した後に別判定する。
-4. **S4 loaded fractureを単体、次に流体連成で確認する**。12×8 bodyのdamage pattern、
+4. **S4 loaded fractureを単体、次に流体連成で確認する**。6×4 bodyのdamage pattern、
    fragment motion、mass/momentum、boundsを測り、解像度依存のfailure thresholdを校正する。
 5. **S1/S2の端末・操作確認を完了し、S1–S4統合gateを行う**。sensor許可・向き、emitter停止、
    material別追加、capacity境界、outlet対象、fluid loadからfractureまでを記録する。
@@ -67,14 +73,16 @@ Gate 4のprototypeやM4の一部実装が存在することも、各物理gate�
 性能目標へ合わせない。S1/S2の低コストなmanual smoke checkは他の作業中に先行してもよいが、
 統合gateの完了条件は省略しない。
 
-現行ラボの初期sceneは水8,000・油6,000・正三角形の Neo-Hookean 弾性小石200個
-（各3粒子、計600粒子、合計14,600粒）に、12×8 nodeの破断solid96粒子を加えた14,696 active粒子である。
-小石は14列×15行（最終行4個）に中心間隔68 world unitsで配置し、
-各三角形の辺長・水平幅を枠幅の3%（66 world units、直前版の2倍）、`objectId`を3〜202とした。
-水・油の初速は各成分±60、小石頂点は±120 world units/sの独立擬似乱数で与える。
-旧20,000粒子粉体版と途中の14,003粒子・小石1個版の長時間試験・性能値は現構成の結果ではない。
-2026-10-12の14,600粒子sceneのGPU buffer確保量は221,564,392 byte、現行14,696粒子sceneは
-2026-10-13のbenchmarkで221,626,976 byteと計測した。初回局所CPU/GPU比較は位置・変形と速度に別々の誤差基準を使う。
+現行ラボの初期sceneは水2,000・油1,500・正三角形の Neo-Hookean 弾性小石50個
+（各3粒子、計150粒子）に、6×4 nodeの破断solid24粒子を加えた3,674 active粒子である。
+小石は8列×7行（最終行2個）に中心間隔150 world unitsで配置し、
+各三角形の辺長・水平幅は枠幅の6%（132 world units）、`objectId`を3〜52とした。
+水・油の初速は各成分±8、小石頂点は±30 world units/sの独立擬似乱数で与える。
+水・油の基準密度は0.02・0.016を維持し、粒子参照面積25→100・個数1/4・間隔9→18で
+各相の総参照面積と質量を維持する。Neo-Hookean粒子の質量も1→4として総量を維持する。
+現行GPU容量は1,000,000の固定予約であり、過去のbuffer確保量はretuned sceneで再計測していない。
+2026-10-13までの14,696粒子sceneの時間・メモリ・物理結果は歴史的baselineであり、
+現構成の性能根拠にしない。初回局所CPU/GPU比較は位置・変形と速度に別々の誤差基準を使う。
 
 **性能変更の実装結果**: 粒子別の応力・アフィン運動量precomputeと１batch１compute passを実装した。
 ８stepではcompute passが48から１、dispatchが48から56になる。100万capacityのGPU bufferは、
@@ -86,11 +94,11 @@ Gate 4のprototypeやM4の一部実装が存在することも、各物理gate�
 ## 現在の実装状況
 
 - **Gate 0**: `/labs/mpm` に GPU 粒子描画、要求時ピッキング、ドラッグ、複製を実装。粒子位置・速度は GPU buffer を正本とし、毎フレーム全量 readback はしない。ユーザーからラボが動作したとの報告あり。長時間・性能測定は未確認。
-- **Gate 1**: `src/lib/mpm/reference/` にCPU reference、`src/lib/mpm/kernels/` にGPU上のP2G / grid update / G2PとGPU描画を実装。`/labs/mpm/kernels` で初回stepのCPU reference比較を行う。Neo-Hookeanの基準シーンを含む。2026-10-13にApple Metal 3 / Headless Chrome 154で現行14,696粒子sceneのGPU shader compile・dispatch・数値statusを確認し、別途45粒子・５モデル・８stepのCPU/GPU回帰も通過した。他GPU/端末での実行やscene-scale物理精度は未確認。
+- **Gate 1**: `src/lib/mpm/reference/` にCPU reference、`src/lib/mpm/kernels/` にGPU上のP2G / grid update / G2PとGPU描画を実装。`/labs/mpm/kernels` で初回stepのCPU reference比較を行う。Neo-Hookeanの基準シーンを含む。2026-10-13にApple Metal 3 / Headless Chrome 154で旧14,696粒子sceneのGPU shader compile・dispatch・数値statusを確認し、別途45粒子・５モデル・８stepのCPU/GPU回帰も通過した。3,674粒子への変更後はGPU再確認が必要。他GPU/端末での実行やscene-scale物理精度は未確認。
 - **Gate 2**: `/labs/mpm/kernels` に Gate 0 の操作を統合する。選択時だけ16 byteのGPU結果を読み戻し、ドラッグはgrid上の減衰付き局所力、複製は連続した `objectId` 範囲をGPU内でコピーする。粒子と ID buffer は初期化時に固定容量を確保し、容量超過は明示的に拒否する。基本操作はユーザー確認済み。長時間操作、容量境界、readback、数値安定性、性能は未確認。
 - **Gate 3**: 粒子単位でNeo-HookeanとSnow型2D弾塑性モデルを選べる。Snow型は主伸長の降伏射影と塑性体積履歴を持ち、両モデルを同一のGPU粒子配列に置ける。CPU referenceとlayoutテストは実装済み。専用の可視化シーンはGate 4ラボに置き換わった。45粒子・５モデル・８stepのGPU parityは確認したが、繰返し塑性負荷、`Jp`・変形の長期挙動、clone後の材料状態は未完了。
-- **Gate 4 試作**: 水・油には引張応力のない弱圧縮性EOS（基準密度0.02・0.016、係数40,000・30,000）を使い、液体は体積を保つ極分解回転へ射影し、G2P後の `det(F)` は0.5〜2に制限する。粉体のDrucker-Prager風モデルと `det(F) >= 0.5` 安定化はsolverに残すが、初期シーンには使わない。現シーンは水8,000・油6,000・Neo-Hookean弾性小石200個（各3粒子、計600粒子）に12×8 nodeの破断solid（96粒子）を加えた計14,696粒で、GPU capacityは1,000,000。小石は独立`objectId`の正三角形（辺長66、中心間隔68 world units、λ20・μ10）で、各頂点を±120 world units/s、水・油を各成分±60から独立抽選する。小石の三辺に位置制約を適用し、水・油は相別格子速度場で法線接触を行う。液体–小石は三角形距離場と両側法線impulse、小石同士はSAT法線接触を使う。水・油の密度差による相対沈降・浮上も近似する。2026-10-13の実GPU benchmarkでbuffer確保量は221,626,976 byte。CPU/GPU比較は各材料の局所サンプルとし、全量readbackを避ける。接線摩擦、表面張力、濡れ、完全な界面分離、連続衝突検出、scene-scale運動量・貫入誤差、長時間安定性は未実装または未検証であり、M4合格とはしない。旧20,000粒子粉体版、小石1個版、14,600粒子で破断solidを含まない版の試験・計測は現構成を代表しない。詳細な性能・誤差結果は性能資料に記録する。
-- **Gate 4 速度設定**: 描画目標15・30・60・90・120 FPS（既定60 FPS）と、0.5×〜32×の速度倍率（既定2×）を選べる。UIのmacrostepは1/240秒で、CFL条件に応じて内部microstepへ分割する。現在の未commit実装は材料由来の波速・速度上限、GPU guard、違反microstepのrollbackと最大4回の細分化retryを持ち、通常処理とretryを合わせて1 frameあたり最大512 microstepとする。残り時間を完了できない場合は理由を示して停止し、時間を黙って破棄・clampしない。これは作業中の実装方針であり、rollback・時間会計・収束・実機性能の検証が済むまで受け入れ済みとは扱わない。
+- **Gate 4 試作**: 水・油には引張応力のない弱圧縮性EOS（基準密度0.02・0.016、係数40,000・30,000）を使い、液体は体積を保つ極分解回転へ射影し、G2P後の `det(F)` は0.5〜2に制限する。粉体のDrucker-Prager風モデルと `det(F) >= 0.5` 安定化はsolverに残すが、初期シーンには使わない。現シーンは水2,000・油1,500・Neo-Hookean弾性小石50個（各3粒子、計150粒子）に6×4 nodeの破断solid（24粒子）を加えた計3,674粒で、GPU capacityは1,000,000。各粒子の参照面積は100（旧25の4倍）、液体間隔は18（旧9の2倍）、固体質量は4（旧1の4倍）とし、各相の総質量・参照面積を維持する。小石は独立`objectId`の正三角形（辺長132、中心間隔150 world units、λ20・μ10）で、各頂点を±30 world units/s、水・油を各成分±8から独立抽選する。小石は液体領域へ配置する。小石の三辺に位置制約を適用し、水・油は相別格子速度場で法線接触を行う。液体–小石は三角形距離場と両側法線impulse、小石同士はSAT法線接触を使う。水・油の密度差による相対沈降・浮上も近似する。surface/particle markerは物理面積と分離した2倍の描画面積係数を使う。水・油のsurface colorは優勢相と狭い界面highlightで表示するが、色による物理的完全分離を保証しない。2026-10-13の実GPU benchmark値は旧14,696粒子sceneの歴史的baselineであり、新構成のbuffer・速度を再計測していない。CPU/GPU比較は各材料の局所サンプルとし、全量readbackを避ける。接線摩擦、表面張力、濡れ、完全な界面分離、連続衝突検出、scene-scale運動量・貫入誤差、長時間安定性は未実装または未検証であり、M4合格とはしない。詳細な性能・誤差結果は性能資料に記録する。
+- **Gate 4 速度設定**: 描画目標15・30・60・90・120 FPS（既定60 FPS）と、0.5×〜32×の速度倍率（既定2×）を選べる。UIのmacrostepは1/240秒で、CFL条件に応じて内部microstepへ分割する。adaptive CFLは材料由来の波速・速度上限、GPU guard、違反microstepのrollbackと最大4回の細分化retryを持ち、通常処理とretryを合わせた処理予算で残り時間を黙って破棄しない。左右揺れは初期停止し、ボタンで既定±240 world units/s²・0.16 Hzを開始／停止できる。適応CFL・rollback・時間会計・収束・新scene実機性能の検証は残っており、受け入れ済みとは扱わない。
 - **未実装**: 接線摩擦、表面張力・濡れ・完全な非混和性／分離、連続衝突検出、粉体の塑性圧密・校正。
 - **未確認**: Gate 1の弾性基準検証とGate 3のSnow型繰返し塑性負荷、Gate 2〜4の容量境界・操作readback、水・油・小石のscene-scale貫入／運動量／長時間復元、新しいGate 4条件での描画込み実効時間倍率、Android/iOS実機での長時間・熱・性能試験。ラボの性能表示はブラウザー側の測定値で、pass単位のGPU timestampではない。
 - **統合方針**: 実験画面は `/labs/mpm` に隔離し、通常画面 `/` の β v0.2 と既存のクラッシュ対策を置き換えない。
@@ -220,14 +228,16 @@ batch/単発 parity、pick/drag/clone/render/rollbackをApple Metal 3で確認�
 
 **コード試作**: `/labs/mpm/kernels` に水・油と弾性小石の混在シーンを実装した。水・油は
 `lambda * min(J - 1, 0) * I` の体積応力だけを持ち、せん断応力を持たない。基準密度と粒子体積から
-粒子質量を変える。小石はlambda 20・mu 10のNeo-Hookean材料を割り当てた三頂点の正三角形で、
-200個を14列×15行（最終行4個）に中心間隔68 world unitsで配置する。各objectIdは個別で3〜202、
-辺長・水平幅は66 world units（計算枠幅の3%、直前版の2倍）。各小石の3辺を位置制約し、
+粒子質量を変える。2026-10-14の初期sceneは水2,000・油1,500・小石50個（各3粒子）・
+6×4 nodeの破断solid24粒子、合計3,674 active particles。各粒子の参照面積は100、
+Neo-Hookean粒子massは4とし、液体間隔18 world unitsと合わせて総質量・参照面積を維持する。
+小石はlambda 20・mu 10のNeo-Hookean材料を割り当てた三頂点の正三角形で、
+8列×7行（最終行2個）に中心間隔150 world unitsで配置する。各objectIdは個別で3〜52、
+辺長・水平幅は132 world units（計算枠幅の6%）。各小石の3辺を位置制約し、
 小石同士はSAT法線接触、水・油は相別gridで法線impulseを解く。
 液体と三角形小石は距離場で接触し、法線反力を小石頂点にも返す。
-水・油・小石の基礎sceneは14,600粒である。現行ラボではこれに12×8 nodeの破断solid
-96粒子を加え、初期active countは14,696、GPU capacityは1,000,000となる。
-初回 CPU/GPU 比較は水・油と小石群中央の局所粒子サンプルだけを読み戻し、
+surface/particle markerの表示面積は物理面積とは分離して2倍にし、優勢相の色で表示する。
+初回 CPU/GPU 比較は水・油と中央小石の局所粒子サンプルだけを読み戻し、
 明示的な一時停止状態確認は従来どおり全量を確認する。
 性能欄には描画FPS、step/s、実効時間倍率、要求・完了・未処理のsimulation duration、submit換算particle-steps/s、
 CPU batch submit平均とqueue完了待ちを表示する。水・油は局所液体密度に基づく相対沈降・浮上の近似補正を行い、

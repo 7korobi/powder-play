@@ -1,26 +1,33 @@
 # MLS-MPM 作業引継ぎ・動作確認手順
 
-記録日: 2026-10-13
+記録日: 2026-10-14
 
 この文書は、次の作業再開時に現在地・再現手順・判断上の注意をすぐ確認するための入口である。
-詳細な設計、stage別gate、長期の性能履歴は末尾の既存資料を正とする。
+詳細な設計、stage別gate、長期の性能履歴は末尾の既存資料を正とする。文書名は旧baseline記録に
+対応したまま維持している。
 
 ## 1. 現在地
 
 - 対象ラボ: `/labs/mpm/kernels`。Stage 1–4の操作経路と物理prototypeはあるが、全stageの
   実機受け入れやscene-scale物理受け入れを完了した状態ではない。
-- 現行初期scene: 水8,000、油6,000、Neo-Hookean小石200個（各3粒子、計600）、
-  12×8 node・249 bondの破断solid（96粒子）、合計14,696 active粒子。
-- GPU capacityは1,000,000。Apple Metal 3 / Headless Chrome 154でのbuffer確保量は
-  221,626,976 byte。これは確保量であり、同時に動かせる物体数や持続性能の保証ではない。
-- benchmark harnessに制御S3/S4 fixtureを追加した。今回の受け入れ確認ではsolver/shader本体を
-  変更していない。破断stateの `COPY_SRC` は、時間計測後の制御fixture readbackに限って有効にする。
+- 現行初期scene: 水2,000、油1,500、Neo-Hookean小石50個（各3粒子、計150）、
+  6×4 node・53 bondの破断solid（24粒子）、合計3,674 active粒子。旧14,696の1/4。
+- particle reference areaは25から100へ4倍、液体間隔は9から18へ2倍、固体粒子massは1から4へ4倍。
+  相ごとの質量・総参照面積を維持し、表示専用面積をさらに2倍にして粒子ごとの見かけを約8倍にした。
+  小石は液体範囲内へ配置し、液体／小石の初速は±8／±30へ弱めた。左右揺れは初期offで、
+  UIボタンから既定±240 world units/s²・0.16 Hzを開始／停止できる。
+- GPU capacityは1,000,000。retuned sceneはApple Metal 3 / Headless Chrome 155の
+  `stages` profileで1回計測し、GPU buffer確保量231,188,500 byte、GPU step median
+  0.229376 ms / p95 0.286720 msだった。これは描画なしの診断profileで、batchの持続性能を代表しない。
+  旧14,696 sceneの221,626,976 byteは別revision・別sceneの歴史値である。
+- benchmark harnessには制御S3/S4 fixtureがある。retuneでlayout・solver・shaderにも変更が入った。
+  破断stateの `COPY_SRC` は時間計測後の制御fixture readbackに限って有効にする。
 - `fix(mpm): preserve progress under adaptive CFL limits`（`c471ee2`）でadaptive CFL、
   rollback/retry、および短い安全刻みへの分割が追加された。続く操作改善では未処理時間の表示、
   一時停止中の明示的な時間破棄、emitter CFL事前確認、エラー時の初期シーン再起動を追加した。
-- この更新時点の自動検証は `npm test` 20 files / 178 tests、`npm run check` 0 errors /
-  0 warnings、`npm run build` 成功。共有ブラウザーでの今回の操作UI smoke checkと、adaptive
-  CFL変更後の実GPU性能・scene-scale物理受け入れは未実施で、旧benchmark値から推定しない。
+- 2026-10-14のscene retune後の自動検証・browser smoke結果は、本書末尾の作業完了記録に記録する。
+  2026-10-13以前の178 testsと14,696 scene benchmarkは旧構成の記録であり、新sceneの実GPU性能・
+  scene-scale物理受け入れを示さない。
 - 継続作業前には `git status` / `git diff` を先に確認し、既存変更をreset/checkoutで破棄しない。
 
 ## 2. 再現する検証手順
@@ -39,7 +46,7 @@ npm test
 npm run build
 ```
 
-adaptive CFLと操作改善を含む更新後sourceでは `npm test` が20 files / 178 tests、
+adaptive CFLと操作改善を含むretune後sourceでは `npm test` が20 files / 192 tests、
 `npm run check` が0 errors / 0 warnings、`npm run build` が成功した。
 これらのコマンド自体は実GPUや物理品質の合格を意味しない。
 
@@ -54,15 +61,18 @@ npm run dev -- --host 127.0.0.1 --port 4181 --strictPort
 
 確認する項目:
 
-1. 見出しが「水・油・弾性小石・GPU破断固体 · 14,696粒子」で、statusが
+1. 見出しが「水・油・弾性小石・GPU破断固体 · 3,674粒子」で、statusが
    `GPU MLS-MPM を実行中です` になる。
-2. 活動数・使用slotが初期状態で14,696、gridが220×150と表示される。
-3. 手動重力を変え、一時停止・1 step・表示mode切替が操作できる。
-4. emitterを水・64粒子にして `1回追加` を押す。以前の実操作では受入64、拒否0、
-   容量超過0となり、活動数・使用slotが14,696から14,760へ増えた。
+2. 活動数・使用slotが初期状態で3,674、gridが220×150と表示される。
+3. 手動重力、一時停止・1 step、表示mode切替、左右揺れの開始／停止を操作する。
+   初期状態は揺れ0、開始ボタンで±240、停止ボタンで0へ戻ることを確認する。
+4. emitterを水・64粒子にして `1回追加` を押す。受入64、拒否0、容量超過0となり、
+   活動数・使用slotが3,674から3,738へ増えることを確認する。
 5. 繰返す時はreloadして初期sceneに戻す。outletで消したslotを含め、削除slotは再利用されない。
 
-このsmoke checkで確認済みなのはラボ起動と上記の水64粒子の一回追加まで。
+2026-10-14のretuned scene browser smokeでは項目1・2、canvas描画、左右揺れの初期0から
+開始±240・停止0への切替を確認し、起動・操作中のconsole errorは0件だった。
+手動重力・一時停止/1 step・表示mode切替・emitter追加はこのsmokeでは未操作。
 傾きsensorの許可・画面向き、連続追加停止、油/固体emitter、容量境界、outletの対象限定、
 負荷をかけた破断は未受け入れである。モバイルsensor試験はHTTPSのAndroid Chrome /
 iOS Safari実機で別途行い、stage別手順は[Stage 1–4ロードマップ](./ROADMAP-MLS-MPM-STAGES-1-4.md)に従う。
@@ -109,7 +119,7 @@ Chrome起動条件と指標定義は[性能計測資料](./PERFORMANCE-MLS-MPM.m
 adaptive CFL変更を含む現行treeの性能・fixture結果を記録するには、その変更を固定した後に実行し、
 出力JSONと新しいsource hashを一組として保管する。
 
-### 2.4 最終確認済みsnapshot（2026-10-13、adaptive CFL変更前）
+### 2.4 歴史的benchmark snapshot（2026-10-13、adaptive CFL・scene retune前）
 
 5回の有効な `batch` runにおけるGPU step medianは
 `0.41254 / 0.40143 / 0.40109 / 0.36103 / 0.39817 ms`。
@@ -128,7 +138,7 @@ runごとのwarmup step数・scene状態が完全一致しないため、1回の
 - **数値回帰**: 45粒子・5材料・8 stepのCPU/GPU最大差`1.3955e-5`、
   batchと単step呼出しの差0。pick / drag / clone / render / rollback /
   persistent numerical statusも確認。
-- これらは小規模・制御fixtureの結果。14,696粒子sceneのinterface penetration、
+- これらは小規模・制御fixtureおよび旧14,696粒子sceneの結果。現3,674粒子sceneのinterface penetration、
   相別mass/momentum、実sceneでのfracture pattern、長時間形状保持を検証した結果ではない。
   `1e-3`は数値parity toleranceであり、製品品質の貫入・形状許容値ではない。
 
@@ -156,7 +166,7 @@ runごとのwarmup step数・scene状態が完全一致しないため、1回の
 - **scene改版間の数字を直結しない**: 旧20,000粒子粉体、14,600粒子小石、現行14,696粒子solid追加後は
   workloadが異なる。性能差や物理差をpaired testなしで比較しない。
 
-### 共有ブラウザーの注意（2026-10-13）
+### 旧sceneでの共有ブラウザー記録（2026-10-13）
 
 共有された `127.0.0.1:4181` は現行14,696粒子routeで、GPU実行中と初回macrostepの
 3 CFL microsteps表示を確認した。これは現在の未commit変更を含むbrowser smokeであり、M2の数値・時間会計gateの合格ではない。
@@ -197,3 +207,21 @@ runごとのwarmup step数・scene状態が完全一致しないため、1回の
 - [パフォーマンスチューニングロードマップ](./ROADMAP-MLS-MPM-PERFORMANCE.md)
 - [benchmark harness](../scripts/benchmark-mpm.mjs)
 - [kernel実装と制約](../src/lib/mpm/kernels/README.md)
+
+## 6. 2026-10-14 retune後の検証記録
+
+- 自動検証: `npm test` 20 files / 192 tests、`npm run check` 0 errors / 0 warnings、
+  `npm run build` 成功。
+- 実GPU: `npm run benchmark:mpm -- --profile=stages`。Headless Chrome 155 / macOS /
+  Apple Metal 3（fallbackなし、`timestamp-query`あり）、3,674粒子、capacity 1,000,000、
+  220×150 grid、描画なし。GPU buffer確保量231,188,500 byte。12 batch×8 stepのGPU stepは
+  median 0.229376 ms、p95 0.286720 ms。`stages` profileはpassを112へ分割する診断計測であり、
+  通常の`batch`値・旧scene値との比較や、描画込みの持続性能を示さない。
+- 数値fixture: 45粒子・5材料・8 step回帰の最大絶対差0.0000139553、batch/single差0。
+  水/油contact、triangle pair contact、fractureの小規模physics acceptanceも通過した。
+  いずれもscene全体の物理品質や長時間安定性の保証ではない。
+- ブラウザー: 1440×1100の専用Headless Chromeでscene見出し、3,674 active粒子、
+  220×150 grid、GPU実行中とcanvas描画を確認。揺れは初期停止、ボタン操作で±240、
+  再度停止で0へ戻り、確認中のruntime/console errorは0件。
+- 現行sceneの単一runであり、`profile=batch`の反復、mobile/他adapter、scene-scale接触・
+  破断品質は未検証。測定条件とsource hashは[性能計測資料](./PERFORMANCE-MLS-MPM.md)を参照。

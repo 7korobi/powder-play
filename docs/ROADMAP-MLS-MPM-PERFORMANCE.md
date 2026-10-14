@@ -14,6 +14,9 @@
 この測定は後に三粒子弾性小石へ置換された旧20,000粒子・粉体シーンを対象とする。
 2026-10-12の14,600粒子・200小石sceneは、後に加わった96粒子の破断solidを含まない。
 現行14,696粒子sceneで同じA/B条件を再測定した結果ではない。
+2026-10-14に現行sceneを3,674粒子・50小石へretuneしたため、本書の計測と候補数は
+各節の歴史的構成に対する値である。retuned sceneの`stages`診断計測は1回だけ実施したが、
+反復`batch`性能とnode/body候補数は未計測。
 計画を先に確定した履歴が分かるよう、以下の変更内容・採否基準は維持する。
 
 ## P0 — 計測と候補の選定
@@ -205,13 +208,13 @@ scanへfallbackするため、全体の二次candidate enumerationは解消し�
 P5全体の採用ゲートも未通過である。測定条件と現状のA/B値は
 [性能資料](./PERFORMANCE-MLS-MPM.md#2026-10-14-tile-field-candidates-and-pair-traversal)を参照。
 
-**問題**: 現行sceneの `G=34,119` halo込みgrid nodes、`B=200` 三角形colliderでは、
-full scan時およびdense overlapのworst caseでは `buildTriangleField` が最大
-`G·B ≈ 6.82M` node/body候補をsubstepごとに調べる。tile bitsetはsparse caseの候補を絞るが、
-実際のnode/body candidate countはまだ計測していない。
-`gatherTrianglePairContacts` は最大 `B·(B−1)/2 = 19,900` unordered SAT候補を評価し、
+**問題**: 現行sceneの `G=34,119` halo込みgrid nodes、`B=50` 三角形colliderでは、
+full scan時およびdense overlapのworst caseで `buildTriangleField` が最大
+`G·B ≈ 1.71M` node/body候補をsubstepごとに調べる。tile bitsetはsparse caseの候補を絞るが、
+retuned sceneのnode/body candidate countはまだ計測していない。
+`gatherTrianglePairContacts` は最大 `B·(B−1)/2 = 1,225` unordered SAT候補を評価し、
 `applyTrianglePairContacts` はactive contact bitsetを使い、sparse caseでは接触候補のみを処理する。
-全pairが接触するdense caseの上限は `B·(B−1) = 39,800` directed contactsである。
+全pairが接触するdense caseの上限は `B·(B−1) = 2,450` directed contactsである。
 1,000 colliderならfull-scan fieldは約34.12M、unordered SATは499.5k、dense directed contactsは999k。
 pair cacheはSAT再計算を省き、active-contact bitsetはsparse apply走査を減らすが、
 pair-gatherの候補列挙は二次のまま残る。

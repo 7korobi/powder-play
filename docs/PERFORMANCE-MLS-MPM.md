@@ -6,6 +6,9 @@
 ページロードの Lighthouse score や Core Web Vitals を GPU solver の速度の代理指標にしない。
 変更手順と採否基準は [チューニングのロードマップ](./ROADMAP-MLS-MPM-PERFORMANCE.md)、
 材料・物理の論点は [４論点の調査](./RESEARCH-MLS-MPM-MATERIALS.md) を参照する。
+2026-10-14にsceneを3,674 active粒子へretuneした。以下の数値は各節の計測日・旧14,600〜20,000粒子sceneに対する
+歴史的baselineであり、現行sceneの性能を表さない。retuned sceneの単一`stages`診断結果は末尾に記録するが、
+通常batchの反復性能・持続性能・旧sceneとの比較を示すものではない。
 
 ## 1. 比較時に固定する条件
 
@@ -141,7 +144,7 @@ P2G median は GPU step median の約49%。個々の median は同一サンプ�
 
 この性能baselineと以下のA/Bは、水8,000・油6,000・粉体6,000の旧20,000粒子シーンで取得した。
 粉体置換直後の途中版は三粒子Neo-Hookean小石1個・14,003粒子であり、
-その測定値も現行の200個版との速度比較として解釈しない。
+その測定値も現行の50個版との速度比較として解釈しない。
 
 ## 5. 実装後に残す比較
 
@@ -393,17 +396,16 @@ absolute-plus-relative基準を用いる。１回のrandom-seed reloadでは最�
 
 ### 2026-10-13計測snapshot: 14,696粒子・破断solid込み（adaptive CFL変更前）
 
-`/labs/mpm/kernels` と同じ `createMpmGate4Scene(0x4d504d34)` を使い、水8,000・油6,000・
+`/labs/mpm/kernels` の旧 `createMpmGate4Scene(0x4d504d34)` を使い、水8,000・油6,000・
 三粒子小石200個（600粒子）・12×8 nodeの破断solid（96粒子、249 bond）を含む
 14,696 active / 1,000,000 capacityを計測した。220×150 cells (`h=10`)、`dt=1/240`、
 重力 `(0,90)`、描画なし。Headless Chrome 154 / macOS / Apple Metal 3
 （fallbackなし）/ `timestamp-query`。各runで600 msの重力ゼロ暖機、64 stepの重力暖機、
-12 batch×8 stepを計測した。現行sceneのGPU buffer確保量は `221,626,976 byte`。
+12 batch×8 stepを計測した。旧sceneのGPU buffer確保量は `221,626,976 byte`。
 
-この計測・下記のS3/S4 fixture・source hashは、作業treeにadaptive CFL
-microstep/recovery変更が入る前のsnapshotである。現在のdirty sourceは `cfl.ts`、`solver.ts`、
-`shaders.ts`、lab route等を変更しているため、この計測値を現行sourceの性能・物理結果として
-引用しない。M2のCFL実装を検証した後、同じ条件と新source hashでbatch、回帰、S3/S4 fixtureを再実行する。
+この計測・下記のS3/S4 fixture・source hashは、adaptive CFL microstep/recoveryと
+2026-10-14のscene retune前のsnapshotである。この計測値を現行sourceの性能・物理結果として
+引用しない。retuned sceneの診断計測・現行source hashは末尾に記録する。
 
 `batch` profileを独立に5回実行した。各runの12サンプルの中央値とp95は次のとおり。
 
@@ -440,7 +442,7 @@ GPU実行時間の代用にはしない。
 | commitParticles | 0.00446 / 0.02698 |
 
 最も時間の大きいstageは `buildTriangleField` と `solveBondedTriangles`。
-現行sceneで性能改善に着手する場合の候補だが、接触のscene-scale物理基準を先に固定し、
+当時の旧sceneで性能改善に着手する場合の候補だが、接触のscene-scale物理基準を先に固定し、
 最適化で接触結果が変わらないことを検証する。
 
 ### 接触候補の計算量と規模リスク
@@ -448,13 +450,16 @@ GPU実行時間の代用にはしない。
 現行のtriangle collider数を `B`、halo込みgrid node数を `G` とすると、
 full-scan時の `buildTriangleField` 上限は `G·B`。現行の512-body以下の経路では
 16×16-node tileごとにbody候補bitsetを作り、field passがtile候補だけを調べる。
-Gate 4の140 tile × 200 bodyではcandidate generationが最大28,000 body/tile checks/substep。
+旧Gate 4の140 tile × 200 bodyではcandidate generationが最大28,000 body/tile checks/substep。
 node-level candidate count自体はまだinstrumentationしていないため、dense worst caseは引き続き
 `G·B`。`gatherTrianglePairContacts` はcanonical unordered pairを `B·(B−1)/2` 個調べ、
 `applyTrianglePairContacts` はsparse caseでactive pairだけを、dense caseでは最大
 `B·(B−1)` 個のdirected contactを処理する。512 body超は従来full scanへfallbackする。
-現在の `G=34,119`、`B=200` ではfull-scan field上限が約6.82M checks、SAT candidateが
-19,900 unordered pairs/substep、dense directed contacts上限が39,800である。
+旧sceneの `G=34,119`、`B=200` ではfull-scan field上限が約6.82M checks、SAT candidateが
+19,900 unordered pairs/substep、dense directed contacts上限が39,800である。現行の `B=50` では
+full-scan上限約1.71M、unordered SAT候補1,225、dense directed contact上限2,450となるが、
+tile候補生成とGPU時間は末尾のretuned scene `stages` profileで1回計測した。node-level candidate
+countはinstrumentしていないため、dense worst caseと`G·B`上限は引き続き残る。
 
 | 三角形collider数 `B` | full-scan field上限 `G·B` | unordered SAT候補 `B·(B−1)/2` | dense apply上限 `B·(B−1)` |
 |---:|---:|---:|---:|
@@ -481,7 +486,7 @@ GPU step時間が約0.193秒/実時間1秒に相当する。一方32×は7,680 s
 発熱を含まない概算であり、実効時間倍率の実測ではない。32×を維持するなら、
 少なくとも計算だけで約`0.13021 ms/step`以下が必要になる。
 
-benchmark中に現行14,696粒子sceneのGPU実行と数値status確認は通過した。
+benchmark中に旧14,696粒子sceneのGPU実行と数値status確認は通過した。
 別途45粒子・５モデル・８ stepのCPU/GPU回帰は最大絶対差`1.3955e-5`、
 batch/単発差0。pick、drag、clone、render、rollback、永続numerical statusも確認した。
 同じ第5回実行では、小規模fixtureの物理受け入れも行った。水・油2粒子の8 stepすべてで、
@@ -495,7 +500,7 @@ bondがrest length時に2 step後もdamage 1 / brokenを保持した。破断fix
 製品品質の貫入・形状閾値ではない。
 
 これらは制御された小規模ケースのGPU確認であり、scene全体のCPU readbackは行っていない。
-14,696粒子sceneの界面貫入・反復接触・相別質量/運動量、実sceneの破断pattern、
+旧14,696粒子sceneの界面貫入・反復接触・相別質量/運動量、実sceneの破断pattern、
 長時間形状保持は未検証で、S3/S4物理受け入れゲートの合格とはしない。
 layout / shaders / solverのSHA-256はそれぞれ
 `1655a7f65f4dc37bc57b673f1e4b1661f70f90b2da907cb56705149f7e5559d5`、
@@ -504,7 +509,7 @@ layout / shaders / solverのSHA-256はそれぞれ
 
 ### 2026-10-13: canonical triangle-pair cache A/B
 
-現行14,696粒子sceneで、contact cache導入直前の作業treeとcanonical pair cache導入後を
+旧14,696粒子sceneで、contact cache導入直前の作業treeとcanonical pair cache導入後を
 同じHeadless Chrome 155 / macOS / Apple Metal 3 adapterで比較した。fallbackなし、
 `timestamp-query`あり。220×150 cells、cellSize 10、`dt=1/240`、重力 `(0,90)`、
 描画なし、14,696 active / 1,000,000 capacity。各runは64 step warmup後に600 msの
@@ -539,14 +544,14 @@ GPU acceptanceでは、三角形3 body / 9粒子の重なりfixtureを4 step実�
 最大0.000380862、運動量残差0.000018731、kinetic energy 1.2から0.080418への低下を確認した。
 既存の5材料45粒子/8 step parity最大差は0.000013955、水・油contactとfracture fixtureも通過した。
 これは小規模fixtureの受け入れであり、scene全体のCPU比較、mobile/長時間性能や
-全sceneのcontact品質を保証しない。200 pebbleのSAT narrow phaseは削減したがpair candidate列挙と
+全sceneのcontact品質を保証しない。旧200-pebbleのSAT narrow phaseは削減したがpair candidate列挙と
 triangle fieldの `O(G·B)` 探索は残る。spatial broad-phaseは
 [ロードマップP5](./ROADMAP-MLS-MPM-PERFORMANCE.md)で別途扱う。
 
 ### 2026-10-14: tile field candidates and pair traversal
 
 Headless Chrome 154 / macOS / Apple Metal 3、fallbackなし、`timestamp-query`あり。
-Gate 4の14,696 active / 1,000,000 capacity、220×150 cells、cellSize 10、`dt=1/240`、
+旧Gate 4の14,696 active / 1,000,000 capacity、220×150 cells、cellSize 10、`dt=1/240`、
 重力 `(0,90)`、描画なし。各runは64 warmup steps、600 ms stationary warmup後に
 12×8-step batchesを測定した。`profile=batch`は通常の1 compute pass/batch。
 初期値は既存のcanonical pair/gather最適化後、zero-degree skip・workgroup field cache・
@@ -579,6 +584,38 @@ layout / shaders / solverのSHA-256は変更前
 `4629aba6dd57eafddcb65347f5fcbc1e1d92758e7645cfa934c93086bbec2ed5` /
 `f7d344a157d2e7bb4b86a3939265d95f2e6fd0752d371636ff19b329907bb846` /
 `f11c6e55b520ca314060b2c1a5bf0b571264881c4d7a3a9fe220237171083b30`。
+
+### 2026-10-14: retuned 3,674-particle scene `stages` smoke
+
+現行Gate 4 scene（水2,000・油1,500・50個の三粒子小石・24粒子破断solid）を
+1,000,000 capacity、220×150 cells、cellSize 10、`dt=1/240`、重力 `(0,90)`、
+描画なしで1回計測した。Headless Chrome 155 / macOS / Apple Metal 3
+（fallbackなし、`timestamp-query`）。64 warmup steps後に600 msのstationary warmup、
+12 batch×8 stepを測定した。`profile=stages`はpassを112へ分けるため、
+通常の`profile=batch`や旧14,696 particle測定と時間を直接比較しない。
+
+| 指標 | 結果 |
+|---|---:|
+| active particles / capacity | 3,674 / 1,000,000 |
+| allocated GPU buffers | 231,188,500 byte |
+| GPU step median / p95 / max | 0.229376 / 0.286720 / 0.294912 ms |
+| `buildTriangleFieldCandidates` median | 0.016384 ms/step |
+| `buildTriangleField` median | 0.016384 ms/step |
+| `applyTrianglePairContacts` median | 0.073728 ms/step |
+| queue wait median / p95 | 2.6 / 3.0 ms/batch |
+
+50 body・140 tileではcandidate bitsetが2 word/tile、合計1,120 byteとなる。
+GPU regressionは45粒子・5材料・8 stepで最大絶対差0.0000139553、batch/single差0。
+小規模water/oil contact、triangle pair contact、fracture fixtureも通過した。
+ブラウザーsmokeではscene 3,674粒子の起動、canvas描画、揺れボタンの停止0→開始±240→停止0、
+console errorなしを確認した。
+
+これは`stages` profileの単一runで、GPU buffer capacityは1,000,000のまま。
+反復`batch`計測、描画・CFL/readback込みのruntime latency、mobile GPU、scene全体の接触・
+破断品質、速度上限付近の長時間挙動を評価した結果ではない。source hashes:
+layout `57b00a93775a75dbfb71739f7331701d27a1898088b3c84107096932aaea50e7`,
+shaders `29cd62ffa0303ebf72f38b7376d226e266c5303bb41897096874382bf23e0dad`,
+solver `882eb942baa834c032dea10232c4d0a172016c7e2ce6e9e0eb2e9dc116762b0c`.
 
 ## 6. 参照
 

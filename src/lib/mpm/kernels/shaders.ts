@@ -154,9 +154,6 @@ const TRIANGLE_CONTACT_IMPULSE_RELAXATION: f32 = 0.25;
 const TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT: u32 = 512u;
 const TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS: u32 = 32u;
 const TRIANGLE_FIELD_CANDIDATE_TILE_SIZE: u32 = 16u;
-const TRIANGLE_FIELD_CANDIDATE_WORDS_PER_TILE: u32 =
-	(TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT + TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS - 1u) /
-	TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS;
 const TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS: u32 = 32u;
 const SURFACE_ERROR_BUCKET: u32 = 1u;
 const SURFACE_ERROR_PARTICLE_AREA: u32 = 2u;
@@ -706,7 +703,8 @@ fn gatherSurfaceOccupancy(@builtin(global_invocation_id) invocation: vec3<u32>) 
 
 			let determinant = determinant2x2(particle.f);
 			let currentArea = particle.volume * determinant;
-			let normalizedArea = currentArea * weight /
+			let displayArea = currentArea * 2.0;
+			let normalizedArea = displayArea * weight /
 				(params.physical.x * params.physical.x);
 			if (
 				!finiteFloat(determinant) ||
@@ -1038,14 +1036,21 @@ fn buildTriangleFieldCandidates(@builtin(global_invocation_id) invocation: vec3<
 	let tileRows =
 		(params.grid.w + TRIANGLE_FIELD_CANDIDATE_TILE_SIZE - 1u) /
 		TRIANGLE_FIELD_CANDIDATE_TILE_SIZE;
+	let candidateBodyCount = min(
+		params.counts.w,
+		TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT,
+	);
+	let candidateWordsPerTile =
+		(candidateBodyCount + TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS - 1u) /
+		TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS;
 	let candidateWordCount =
-		tileColumns * tileRows * TRIANGLE_FIELD_CANDIDATE_WORDS_PER_TILE;
+		tileColumns * tileRows * candidateWordsPerTile;
 	if (outputIndex >= candidateWordCount) {
 		return;
 	}
 
-	let tileIndex = outputIndex / TRIANGLE_FIELD_CANDIDATE_WORDS_PER_TILE;
-	let bodyWord = outputIndex % TRIANGLE_FIELD_CANDIDATE_WORDS_PER_TILE;
+	let tileIndex = outputIndex / candidateWordsPerTile;
+	let bodyWord = outputIndex % candidateWordsPerTile;
 	let tileColumn = tileIndex % tileColumns;
 	let tileRow = tileIndex / tileColumns;
 	let tileStorageMinimum = vec2<u32>(
@@ -1073,7 +1078,7 @@ fn buildTriangleFieldCandidates(@builtin(global_invocation_id) invocation: vec3<
 		) {
 			let bodyIndex =
 				bodyWord * TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS + bodyLane;
-			if (bodyIndex >= params.counts.w) {
+			if (bodyIndex >= candidateBodyCount) {
 				break;
 			}
 
@@ -1167,8 +1172,11 @@ fn buildTriangleField(
 			var candidateWord0 = 0xffffffffu;
 			var candidateWord1 = 0xffffffffu;
 			if (params.counts.w <= TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT) {
+				let candidateWordsPerTile =
+					(params.counts.w + TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS - 1u) /
+					TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS;
 				let candidateWordIndex =
-					candidateTileIndex * TRIANGLE_FIELD_CANDIDATE_WORDS_PER_TILE +
+					candidateTileIndex * candidateWordsPerTile +
 					bodyChunkStart / TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS;
 				candidateWord0 = triangleFieldCandidates[candidateWordIndex];
 				candidateWord1 = 0u;
@@ -2806,6 +2814,9 @@ struct SurfaceRenderParams {
 @group(0) @binding(2) var<storage, read> surfaceFields: array<vec2<f32>>;
 @group(0) @binding(3) var<uniform> surfaceParams: SurfaceRenderParams;
 
+const PARTICLE_MARKER_REFERENCE_AREA: f32 = 25.0;
+const PARTICLE_MARKER_AREA_SCALE: f32 = 2.0;
+
 struct VertexOutput {
 	@builtin(position) position: vec4<f32>,
 	@location(0) localPosition: vec2<f32>,
@@ -2845,7 +2856,13 @@ fn vertexMain(
 		return hidden;
 	}
 	let worldPosition =
-		particle.position + local * params.domainAndRadius.z;
+		particle.position +
+		local *
+		params.domainAndRadius.z *
+		sqrt(
+			particle.volume * PARTICLE_MARKER_AREA_SCALE /
+				PARTICLE_MARKER_REFERENCE_AREA,
+		);
 	let clipPosition = vec2<f32>(
 		2.0 * worldPosition.x / params.domainAndRadius.x - 1.0,
 		1.0 - 2.0 * worldPosition.y / params.domainAndRadius.y,
@@ -2928,21 +2945,28 @@ fn sampleSurfaceField(uv: vec2<f32>) -> vec2<f32> {
 @fragment
 fn surfaceFragmentMain(input: SurfaceVertexOutput) -> @location(0) vec4<f32> {
 	let occupancy = sampleSurfaceField(input.uv);
-	// V0 / spacing^2 = 25 / 9^2 ~= 0.309; the display iso-level is near half
-	// of that initial interior area density. It is a visual threshold, not physics.
-	let waterCoverage = smoothstep(0.115, 0.195, max(occupancy.x, 0.0));
-	let oilCoverage = smoothstep(0.115, 0.195, max(occupancy.y, 0.0));
-	let totalCoverage = waterCoverage + oilCoverage;
+	// Surface fields are display-scaled; the physical phase fields remain separate.
+	let waterArea = max(occupancy.x, 0.0);
+	let oilArea = max(occupancy.y, 0.0);
+	let totalArea = waterArea + oilArea;
+	let totalCoverage = smoothstep(0.115, 0.195, totalArea);
 	if (totalCoverage <= 1.0e-5) {
 		return vec4<f32>(0.035, 0.047, 0.063, 1.0);
 	}
 
 	let waterColor = vec3<f32>(0.12, 0.48, 0.88);
 	let oilColor = vec3<f32>(0.91, 0.62, 0.18);
-	let mixedColor =
-		(waterColor * waterCoverage + oilColor * oilCoverage) / totalCoverage;
+	let waterShare = waterArea / max(totalArea, 1.0e-5);
+	let dominantPhaseColor = mix(oilColor, waterColor, smoothstep(0.35, 0.65, waterShare));
+	let interfaceHighlight =
+		(1.0 - smoothstep(0.06, 0.24, abs(waterShare - 0.5))) * 0.18;
+	let materialColor = mix(
+		dominantPhaseColor,
+		vec3<f32>(0.96, 0.89, 0.68),
+		interfaceHighlight,
+	);
 	let opacity = clamp(totalCoverage, 0.0, 1.0);
 	let background = vec3<f32>(0.035, 0.047, 0.063);
-	return vec4<f32>(mix(background, mixedColor, opacity), 1.0);
+	return vec4<f32>(mix(background, materialColor, opacity), 1.0);
 }
 `;

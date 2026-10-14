@@ -17,10 +17,10 @@
 | 1. 傾き重力 | センサー変換、許可状態、手動重力fallbackを実装 | センサー変換の単体テスト、手動重力UI | Android/iOS実機で許可・拒否・画面向き・センサー欠落を確認 |
 | 2. emitter / outlet | 決定論的batch追加、連続追加、停止、outletと容量報告を実装 | ブラウザーで水64粒子を追加し、受入64・拒否0・容量超過0を確認 | 油・固体・連続停止・容量境界・outlet除去の一連の実行を確認 |
 | 3. 水・油界面 | 相別格子状態、相別法線接触、面積場の表示を実装 | 2粒子・8 stepの実GPU接触fixtureでCPU/GPU差3.87e-5、相別mass各0.25、最大運動量残差1.19e-7、全step非交差 | scene-scale界面貫入、層状・斜め界面、任意初期条件での分離、曲率力・表面張力 |
-| 4. 固体破断 | 12×8 node・249 bondのGPU damage/broken prototypeを実装 | 4粒子・3 bondの実GPU fixtureで閾値下/上/無負荷を比較しbond 1だけ破断。rest lengthの初期破断stateも2 step保持 | 12×8 sceneへの負荷・流体連成でのpattern、fragment挙動、解像度・性能の評価 |
+| 4. 固体破断 | 6×4 node・53 bondのGPU damage/broken prototypeを実装 | 4粒子・3 bondの実GPU fixtureで閾値下/上/無負荷を比較しbond 1だけ破断。rest lengthの初期破断stateも2 step保持 | 6×4 sceneへの負荷・流体連成でのpattern、fragment挙動、解像度・性能の評価 |
 
 自動検証の過去の基準点は `npm test` 20 files / 170 tests、`npm run check` 0 errors / 0 warnings、`npm run build` 成功。これは各物理ゲートの合格や、実機WebGPUでの完全な検証を意味しない。その後、作業treeにCFL microstep/recoveryの未commit変更があるため、このテスト数と以下のGPU結果は変更前sourceの記録であり、現行treeでは再実行が必要。
-変更前sourceでは、2026-10-13に14,696粒子sceneの実GPU benchmarkを5回実行し、GPU step medianの中央値0.40109 ms/step、p95中央値0.43035 ms/stepを記録した。小規模S3/S4 GPU fixtureの結果もCPU referenceとの制御比較であり、scene-scaleや長時間の受け入れではない。詳細は[性能計測資料](./PERFORMANCE-MLS-MPM.md)を参照する。
+旧14,696粒子sceneについて、2026-10-13に実GPU benchmarkを5回実行し、GPU step medianの中央値0.40109 ms/step、p95中央値0.43035 ms/stepを記録した。2026-10-14にsceneを3,674粒子へretuneしたため、これらは歴史的baselineであり現行sceneの性能値ではない。小規模S3/S4 GPU fixtureの結果もCPU referenceとの制御比較であり、scene-scaleや長時間の受け入れではない。詳細は[性能計測資料](./PERFORMANCE-MLS-MPM.md)を参照する。
 
 ## 2. Stage別の実装状況と受け入れ条件
 
@@ -79,7 +79,7 @@
 
 ### S4 — 固体の損傷・破断を再現可能にする
 
-**実装済みprototype**: 12×8 nodeのconnected Neo-Hookean bodyと249本のbondを持つ。引張strainの探索閾値0.12を用いてGPU上でdamage/brokenを更新し、damageを可視化する。破断後はbond stateを維持し、bond bodyのcloneは拒否する。
+**実装済みprototype**: 6×4 nodeのconnected Neo-Hookean bodyと53本のbondを持つ。引張strainの探索閾値0.12を用いてGPU上でdamage/brokenを更新し、damageを可視化する。破断後はbond stateを維持し、bond bodyのcloneは拒否する。
 
 2026-10-13の制御GPU fixtureでは、failure strain`0.1`に対し入力strain`0.05 / 0.11 / 0`の3 bondを2 step実行し、
 閾値上のbond index 1だけがbroken、閾値下のbond damageは約`0.5`、無負荷bondは未破断となった。
@@ -89,7 +89,7 @@
 
 **残作業**
 
-1. 12×8 bodyに負荷を段階的に加え、期待pattern・damage局所化・fragmentの相対移動をGPUで確認する。
+1. 6×4 bodyに負荷を段階的に加え、期待pattern・damage局所化・fragmentの相対移動をGPUで確認する。
 2. 破断前後のmass/momentum、有限値、grid境界をこのsceneで確認する。
 3. 粗密複数の解像度、step幅、材料係数でfailure patternを比較し、threshold、stress fade、bond stiffnessを分離して校正する。
 4. 水・油の接触荷重を加えたcaseを作り、contact impulseとfracture passの順序・結果を比較する。
@@ -102,7 +102,7 @@
 個別テスト通過後に、センサーまたは手動重力、連続emitter、水油interface、固体への流体荷重、破断、outletを同一sceneで順に操作する。
 
 - Android/iOSの対象実機・ブラウザー、画面向き、許可状態、GPU/driverを記録する。
-- 14,696粒子の初期sceneと、追加後の代表粒子数の両方で連続動作・停止・再開を行う。
+- 3,674粒子の現行初期sceneと、追加後の代表粒子数の両方で連続動作・停止・再開を行う。
 - 実WebGPU shader compile/dispatch、数値status、GPU parity、renderとcomputeを確認する。CPU referenceやfake-GPU testを実機結果として扱わない。
 - mobileでの持続FPS、処理時間、メモリ、熱、容量上限を測り、目標未達なら容量・pass・sceneを調整して再測定する。
 - 各gateの結果と未確認を記録してからStage 5–6のruntime設計に進む。
@@ -110,10 +110,13 @@
 ## 3. ゲーム規模へ進む前の接触拡張性ゲート
 
 現在の衝突方式は少数の三角形collider向けprototypeである。grid node数 `G=34,119`、
-collider数 `B=200` では、三角形field構築は最大 `G·B ≈ 6.82M` node/body候補/substep、
-小石同士のSAT候補列挙は `B·(B−1) ≈ 39,800` pair/substepとなる。1,000 colliderでは
-約34.12M node/body候補と999k pair候補まで増える。AABB rejectionは詳細判定を省くが、
-現在は候補生成自体を空間的に絞っていない。実測条件と式は
+現行collider数 `B=50` では、三角形field構築のfull-scan上限は
+`G·B ≈ 1.71M` node/body候補/substep、SATのunordered候補列挙は
+`B·(B−1)/2 = 1,225` pair/substepとなる。dense時のdirected contact上限は2,450。
+2026-10-13までの旧200-collider sceneではfull-scan上限6.82Mだった。1,000 colliderでは
+約34.12M node/body候補と499,500 unordered pair候補まで増える。tile bitsetは疎な領域の
+候補bodyをskipするが、dense worst caseは依然 `G·B` である。現行50-collider sceneはまだ未計測。
+実測条件と式は
 [性能計測資料](./PERFORMANCE-MLS-MPM.md)、最適化案は
 [性能チューニングロードマップP5](./ROADMAP-MLS-MPM-PERFORMANCE.md)を参照。
 
@@ -123,7 +126,7 @@ collider数 `B=200` では、三角形field構築は最大 `G·B ≈ 6.82M` node
 
 **製品規模へ進む前の作業**
 
-1. 200 / 400 / 800 / 1,000以上のcollider、並びに96 / 384 / 1,536以上のparticleから成る
+1. 50 / 100 / 200 / 400 / 800以上のcollider、並びに96 / 384 / 1,536以上のparticleから成る
    疎な大構造を作り、grid・step・seedを固定したsparse sceneとdense sceneを計測する。
 2. node/body候補数、body pair数、詳細判定数、cell list長とoverflow、contact pass p50/p95、
    CFL substep数、全体frame時間、memoryをGPUで記録する。

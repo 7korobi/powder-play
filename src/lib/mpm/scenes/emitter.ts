@@ -18,6 +18,7 @@ export interface MpmEmitterConfig {
 	readonly spacing: number;
 	readonly velocity: MpmVector2;
 	readonly material: MpmEmitterMaterial;
+	readonly particleVolume?: number;
 	readonly grid: MpmGridParameters;
 }
 
@@ -66,6 +67,7 @@ export function createMpmEmitterParticles(config: MpmEmitterConfig): readonly Mp
 	const velocity = readVector(config.velocity, 'velocity');
 	const grid = validateGrid(config.grid);
 	const spacing = finitePositive(config.spacing, 'spacing');
+	const particleVolume = finitePositive(config.particleVolume ?? 25, 'particleVolume');
 	const width = grid.cellsX * grid.cellSize;
 	const height = grid.cellsY * grid.cellSize;
 	if (center.x < 0 || center.x > width || center.y < 0 || center.y > height) {
@@ -112,7 +114,7 @@ export function createMpmEmitterParticles(config: MpmEmitterConfig): readonly Mp
 			C: ZERO_MATRIX,
 			F: IDENTITY,
 			plasticVolume: 1,
-			volume: 25,
+			volume: particleVolume,
 			material: MATERIALS[config.material]
 		});
 	}

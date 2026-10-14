@@ -17,6 +17,7 @@
 	import {
 		DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE,
 		HORIZONTAL_OSCILLATION_FREQUENCY_HZ,
+		INITIAL_HORIZONTAL_OSCILLATION_AMPLITUDE,
 		MAX_HORIZONTAL_OSCILLATION_AMPLITUDE,
 		meanSinusoidalAcceleration
 	} from '#lib/mpm/kernels/oscillation.js';
@@ -42,13 +43,23 @@
 		createMpmGate4Scene,
 		GATE4_CLONE_OFFSET,
 		GATE4_FRACTURE_BOND_COUNT,
+		GATE4_FRACTURE_COLUMNS,
 		GATE4_FRACTURE_FAILURE_STRAIN,
 		GATE4_FRACTURE_OBJECT_ID,
 		GATE4_FRACTURE_PARTICLE_COUNT,
+		GATE4_FRACTURE_ROWS,
 		GATE4_GRID,
+		GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX,
+		GATE4_LIQUID_PARTICLE_SPACING,
 		GATE4_PARTICLE_CAPACITY,
 		GATE4_PARTICLE_COUNT,
-		GATE4_PEBBLE_EDGE_LENGTH
+		GATE4_PARTICLE_AREA,
+		GATE4_PEBBLE_COUNT,
+		GATE4_PEBBLE_EDGE_LENGTH,
+		GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX,
+		GATE4_SOLID_PARTICLE_MASS,
+		GATE4_WATER_PARTICLE_COUNT,
+		GATE4_OIL_PARTICLE_COUNT
 	} from '#lib/mpm/scenes/gate4.js';
 	import {
 		createMpmEmitterParticles,
@@ -80,8 +91,8 @@
 	const GPU_PARTICLE_CAPACITY = GATE4_PARTICLE_CAPACITY;
 	const PICK_RADIUS = 14;
 	const BRUSH_RADIUS = 24;
-	const PARTICLE_MASS = 1;
-	const PARTICLE_VOLUME = 25;
+	const PARTICLE_MASS = GATE4_SOLID_PARTICLE_MASS;
+	const PARTICLE_VOLUME = GATE4_PARTICLE_AREA;
 	const MATERIAL = { lambda: 20, mu: 10, model: 'neo-hookean' } as const;
 	const PARITY_ABSOLUTE_TOLERANCE = 0.02;
 	const PARITY_VELOCITY_ABSOLUTE_TOLERANCE = 0.025;
@@ -141,6 +152,13 @@
 			gravity,
 			...(fractureBonds === undefined ? {} : { fractureBonds })
 		};
+	}
+
+	function toggleHorizontalOscillation(): void {
+		horizontalOscillationAmplitude =
+			horizontalOscillationAmplitude > 0
+				? 0
+				: DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE;
 	}
 
 	let submittedMacroStepCount = 0;
@@ -411,7 +429,7 @@
 	let hasSensorGravity = $state(false);
 	let simulationSpeed = $state(DEFAULT_SIMULATION_SPEED);
 	let renderTargetFps: MpmRenderFps = $state(DEFAULT_RENDER_FPS);
-	let horizontalOscillationAmplitude = $state(DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE);
+	let horizontalOscillationAmplitude = $state(INITIAL_HORIZONTAL_OSCILLATION_AMPLITUDE);
 	let paused = $state(false);
 	let parityMessage = $state('');
 	let parityPassed = $state<boolean | null>(null);
@@ -438,9 +456,9 @@
 	let emitterCount = $state(64);
 	let emitterSeed = $state(0x5eed_1234);
 	let emitterSequence = $state(0);
-	let emitterX = $state(1_100);
+	let emitterX = $state(700);
 	let emitterY = $state(200);
-	let emitterSpacing = $state(9);
+	let emitterSpacing = $state(GATE4_LIQUID_PARTICLE_SPACING);
 	let emitterVelocityX = $state(0);
 	let emitterVelocityY = $state(30);
 	let continuousEmission = $state(false);
@@ -806,6 +824,7 @@
 				spacing: emitterSpacing,
 				velocity: { x: emitterVelocityX, y: emitterVelocityY },
 				material: emitterMaterial,
+				particleVolume: PARTICLE_VOLUME,
 				grid: GRID
 			});
 		} catch (error) {
@@ -1451,7 +1470,8 @@
 			<p class="intro">
 				水・油・Neo-Hookean 固体を repeatable / continuous emitter から追加し、傾きまたは手動の2D重力で操作します。
 				水と油は相別速度場・node-owned normal contact で接触し、各相の mass と接触 impulse を小規模 CPU reference で検証します。
-				既存の三粒子小石に加え、12×8ノード・{GATE4_FRACTURE_BOND_COUNT} bond の固体を GPU 上で損傷・局所破断させます。
+				初期シーンは{GATE4_PARTICLE_COUNT.toLocaleString()}粒子（旧14,696粒子の1/4）で、参照面積を4倍・見た目の面積を約8倍にし、総量を保ちます。小石を液体中に配置し、初期速度と揺れは弱めています。
+				50個の三粒子小石に加え、{GATE4_FRACTURE_COLUMNS}×{GATE4_FRACTURE_ROWS}ノード・{GATE4_FRACTURE_BOND_COUNT} bond の固体を GPU 上で損傷・局所破断させます。
 				これは制御可能な研究用 vertical slice であり、一般用途の流体・破壊エンジンや物理精度保証ではありません。
 			</p>
 		</div>
@@ -1599,20 +1619,31 @@
 						</select>
 						<output>{renderTargetFps} fps</output>
 					</label>
-					<label class="rocking-control">
-						<span>左右揺れ · {HORIZONTAL_OSCILLATION_FREQUENCY_HZ} Hz</span>
-						<input
-							type="range"
-							min="0"
-							max={MAX_HORIZONTAL_OSCILLATION_AMPLITUDE}
-							step="10"
-							bind:value={horizontalOscillationAmplitude}
+					<div class="rocking-group">
+						<label class="rocking-control">
+							<span>左右揺れ · {HORIZONTAL_OSCILLATION_FREQUENCY_HZ} Hz</span>
+							<input
+								type="range"
+								min="0"
+								max={MAX_HORIZONTAL_OSCILLATION_AMPLITUDE}
+								step="10"
+								bind:value={horizontalOscillationAmplitude}
+								disabled={phase !== 'ready'}
+								aria-label="左右揺れの加速度"
+								aria-valuetext={`±${horizontalOscillationAmplitude} world units/s²`}
+							/>
+							<output>±{horizontalOscillationAmplitude}</output>
+						</label>
+						<button
+							type="button"
+							class="secondary rocking-toggle"
+							onclick={toggleHorizontalOscillation}
 							disabled={phase !== 'ready'}
-							aria-label="左右揺れの加速度"
-							aria-valuetext={`±${horizontalOscillationAmplitude} world units/s²`}
-						/>
-						<output>±{horizontalOscillationAmplitude}</output>
-					</label>
+							aria-pressed={horizontalOscillationAmplitude > 0}
+						>
+							{horizontalOscillationAmplitude > 0 ? '左右揺れを停止' : '既定の左右揺れを開始（±240）'}
+						</button>
+					</div>
 					<div class="buttons">
 						<button
 							type="button"
@@ -1831,7 +1862,7 @@
 					</p>
 				</section>
 				<p id="render-mode-description" class="render-mode-note">
-					自由表面は粒子の現在面積から GPU 上で作る表示専用フィールドです。青は水、金色は油を示し、表面表示では液体の粒子マーカーを重ねません。粒子マーカー（診断）では全材料の粒子位置を表示します。表示色・境界は物理的な表面張力や界面曲率を表しません。材料間接触は表示場とは別の物理 pass で解きます。
+					自由表面は粒子の現在面積から GPU 上で作る表示専用フィールドです。各画素は優勢な相の色で表示し、水と油の占有が同程度の境界だけを明るく示します。これは描画上の色分けであり、物理的な完全分離を意味しません。粒子マーカー（診断）では全材料の粒子位置を表示し、参照面積に応じて半径を拡大します。材料間接触は表示場とは別の物理 pass で解きます。
 				</p>
 			</section>
 
@@ -1870,11 +1901,11 @@
 		</div>
 
 		<p class="material-legend">
-			<span><i class="water-swatch"></i> 水（密度 0.02・圧縮係数 40,000）</span>
-			<span><i class="oil-swatch"></i> 油（密度 0.016・圧縮係数 30,000）</span>
-			<span><i class="pebble-swatch"></i> 弾性小石200個（各3粒子・Neo-Hookean・λ 20・μ 10）</span>
-			<span><i class="fracture-swatch"></i> GPU fracture body（96 node・249 bond・赤は damage）</span>
-			初期シーンは水8,000・油6,000・小石600・連結固体96 particle です。小石の初期速度は頂点ごとに独立した擬似乱数（各成分±120）で回転運動も初期化されます。小石は一辺66 world units の正三角形が200 object あり、頂点間隔約6.6 grid cells の離散形状です。水と油は材料 ID と相別 grid field を保ち、相別密度から求める法線接触を node-owned impulse で解きます。接触・質量保存の小規模 controlled reference test は通りますが、幅広い速度・解像度・長時間挙動を保証しません。表面張力、濡れ、接線摩擦、連続衝突検出、界面の微視的物理は未実装です。
+			<span><i class="water-swatch"></i> 水 {GATE4_WATER_PARTICLE_COUNT.toLocaleString()}粒子（密度 0.02・圧縮係数 40,000）</span>
+			<span><i class="oil-swatch"></i> 油 {GATE4_OIL_PARTICLE_COUNT.toLocaleString()}粒子（密度 0.016・圧縮係数 30,000）</span>
+			<span><i class="pebble-swatch"></i> 弾性小石{GATE4_PEBBLE_COUNT}個（各3粒子・Neo-Hookean・λ 20・μ 10）</span>
+			<span><i class="fracture-swatch"></i> GPU fracture body（{GATE4_FRACTURE_PARTICLE_COUNT} node・{GATE4_FRACTURE_BOND_COUNT} bond・赤は damage）</span>
+			参照粒子面積は旧25から100へ4倍にし、水・油の粒子間隔も9から18へ拡大しました。液体・固体の総質量と参照面積は維持し、表面・粒子マーカーの表示面積は旧scene比約8倍です。小石は一辺132 world units、中心間隔150の正三角形で、液体の上から内部に広がります。液体の初速は各成分±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石頂点は±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX} world units/s、左右揺れの初期値は0です。水と油は相別grid field・相別密度による法線接触を保ちますが、界面の優勢相表示は実際の混合状態を隠しません。接触・質量保存の小規模 controlled reference test は通りますが、幅広い速度・解像度・長時間挙動を保証しません。表面張力、濡れ、接線摩擦、連続衝突検出、界面の微視的物理は未実装です。
 		</p>
 
 		<section class="performance" aria-labelledby="performance-title">
@@ -2427,6 +2458,13 @@
 		gap: 0.75rem;
 	}
 
+	.rocking-group {
+		display: grid;
+		grid-column: 1 / -1;
+		gap: 0.5rem;
+		min-width: 0;
+	}
+
 	.rocking-control,
 	.simulation-speed-control,
 	.display-mode-control,
@@ -2458,6 +2496,10 @@
 
 	.rocking-control input {
 		margin: 0;
+	}
+
+	.rocking-toggle {
+		width: 100%;
 	}
 
 	.rocking-control output,

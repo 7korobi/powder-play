@@ -8,13 +8,27 @@ import type {
 export const GATE4_GRID = { cellsX: 220, cellsY: 150, cellSize: 10 } as const;
 export const GATE4_PARTICLE_CAPACITY = 1_000_000;
 export const GATE4_CLONE_OFFSET: MpmVector2 = { x: 72, y: 0 };
-export const GATE4_PEBBLE_COUNT = 200;
+export const GATE4_WATER_PARTICLE_COLUMNS = 50;
+export const GATE4_WATER_PARTICLE_ROWS = 40;
+export const GATE4_WATER_PARTICLE_COUNT =
+	GATE4_WATER_PARTICLE_COLUMNS * GATE4_WATER_PARTICLE_ROWS;
+export const GATE4_OIL_PARTICLE_COLUMNS = 50;
+export const GATE4_OIL_PARTICLE_ROWS = 30;
+export const GATE4_OIL_PARTICLE_COUNT =
+	GATE4_OIL_PARTICLE_COLUMNS * GATE4_OIL_PARTICLE_ROWS;
+export const GATE4_LIQUID_PARTICLE_SPACING = 18;
+export const GATE4_LIQUID_START_X = 100;
+export const GATE4_WATER_START_Y = 640;
+export const GATE4_OIL_START_Y = 100;
+export const GATE4_PARTICLE_AREA = 100;
+export const GATE4_SOLID_PARTICLE_MASS = 4;
+export const GATE4_PEBBLE_COUNT = 50;
 export const GATE4_PEBBLE_PARTICLES_PER_OBJECT = 3;
 export const GATE4_PEBBLE_PARTICLE_COUNT =
 	GATE4_PEBBLE_COUNT * GATE4_PEBBLE_PARTICLES_PER_OBJECT;
-export const GATE4_FRACTURE_COLUMNS = 12;
-export const GATE4_FRACTURE_ROWS = 8;
-export const GATE4_FRACTURE_SPACING = 9;
+export const GATE4_FRACTURE_COLUMNS = 6;
+export const GATE4_FRACTURE_ROWS = 4;
+export const GATE4_FRACTURE_SPACING = 20;
 export const GATE4_FRACTURE_PARTICLE_COUNT =
 	GATE4_FRACTURE_COLUMNS * GATE4_FRACTURE_ROWS;
 export const GATE4_FRACTURE_BOND_COUNT =
@@ -23,13 +37,13 @@ export const GATE4_FRACTURE_BOND_COUNT =
 	(GATE4_FRACTURE_COLUMNS - 1) * (GATE4_FRACTURE_ROWS - 1);
 export const GATE4_FRACTURE_OBJECT_ID = 3 + GATE4_PEBBLE_COUNT;
 export const GATE4_FRACTURE_FAILURE_STRAIN = 0.12;
-export const GATE4_PEBBLE_COLUMNS = 14;
-export const GATE4_PEBBLE_ROWS = 15;
-export const GATE4_PEBBLE_SPACING = 68;
-export const GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX = 60;
-export const GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX = 120;
+export const GATE4_PEBBLE_COLUMNS = 8;
+export const GATE4_PEBBLE_ROWS = Math.ceil(GATE4_PEBBLE_COUNT / GATE4_PEBBLE_COLUMNS);
+export const GATE4_PEBBLE_SPACING = 150;
+export const GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX = 8;
+export const GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX = 30;
 const PEBBLE_BASE_WIDTH_RATIO = 0.005;
-const PEBBLE_SIZE_MULTIPLIER = 6;
+const PEBBLE_SIZE_MULTIPLIER = 12;
 const UINT32_RANGE = 0x1_0000_0000;
 export const GATE4_PEBBLE_EDGE_LENGTH =
 	GATE4_GRID.cellsX *
@@ -37,10 +51,12 @@ export const GATE4_PEBBLE_EDGE_LENGTH =
 	PEBBLE_BASE_WIDTH_RATIO *
 	PEBBLE_SIZE_MULTIPLIER;
 export const GATE4_PARTICLE_COUNT =
-	14_000 + GATE4_PEBBLE_PARTICLE_COUNT + GATE4_FRACTURE_PARTICLE_COUNT;
+	GATE4_WATER_PARTICLE_COUNT +
+	GATE4_OIL_PARTICLE_COUNT +
+	GATE4_PEBBLE_PARTICLE_COUNT +
+	GATE4_FRACTURE_PARTICLE_COUNT;
 
-const PARTICLE_SPACING = 9;
-const PEBBLE_CENTER: MpmVector2 = { x: 1_520, y: 750 };
+const PEBBLE_CENTER: MpmVector2 = { x: 700, y: 569 };
 const PEBBLE_FIRST_OBJECT_ID = 3;
 const FRACTURE_CENTER: MpmVector2 = { x: 1_520, y: 1_380 };
 const PEBBLE_MATERIAL = {
@@ -65,22 +81,22 @@ const OIL_MATERIAL = {
 const OBJECTS = [
 	{
 		objectId: 1,
-		startX: 100,
-		startY: 640,
-		columns: 100,
-		rows: 80,
+		startX: GATE4_LIQUID_START_X,
+		startY: GATE4_WATER_START_Y,
+		columns: GATE4_WATER_PARTICLE_COLUMNS,
+		rows: GATE4_WATER_PARTICLE_ROWS,
 		probeRow: 0,
-		probeColumn: 50,
+		probeColumn: Math.floor(GATE4_WATER_PARTICLE_COLUMNS / 2),
 		material: WATER_MATERIAL
 	},
 	{
 		objectId: 2,
-		startX: 100,
-		startY: 100,
-		columns: 100,
-		rows: 60,
-		probeRow: 59,
-		probeColumn: 50,
+		startX: GATE4_LIQUID_START_X,
+		startY: GATE4_OIL_START_Y,
+		columns: GATE4_OIL_PARTICLE_COLUMNS,
+		rows: GATE4_OIL_PARTICLE_ROWS,
+		probeRow: GATE4_OIL_PARTICLE_ROWS - 1,
+		probeColumn: Math.floor(GATE4_OIL_PARTICLE_COLUMNS / 2),
 		material: OIL_MATERIAL
 	},
 ] as const;
@@ -146,8 +162,8 @@ export function createMpmGate4Scene(
 			for (let column = 0; column < object.columns; column += 1) {
 				particles.push({
 					position: {
-						x: object.startX + column * PARTICLE_SPACING,
-						y: object.startY + row * PARTICLE_SPACING
+						x: object.startX + column * GATE4_LIQUID_PARTICLE_SPACING,
+						y: object.startY + row * GATE4_LIQUID_PARTICLE_SPACING
 					},
 					velocity: createRandomVelocity(
 						random,
@@ -157,6 +173,7 @@ export function createMpmGate4Scene(
 					F: INITIAL_DEFORMATION,
 					objectId: object.objectId,
 					plasticVolume: 1,
+					volume: GATE4_PARTICLE_AREA,
 					material: object.material
 				});
 			}
@@ -202,6 +219,7 @@ export function createMpmGate4Scene(
 				objectId,
 				bondedTriangleVertex: vertex as 0 | 1 | 2,
 				plasticVolume: 1,
+				volume: GATE4_PARTICLE_AREA,
 				material: PEBBLE_MATERIAL
 			});
 		}
@@ -226,6 +244,7 @@ export function createMpmGate4Scene(
 				F: INITIAL_DEFORMATION,
 				objectId: GATE4_FRACTURE_OBJECT_ID,
 				plasticVolume: 1,
+				volume: GATE4_PARTICLE_AREA,
 				material: PEBBLE_MATERIAL
 			});
 		}
@@ -294,7 +313,8 @@ export function createMpmCpuParitySample(
 		}
 		return particles[index];
 	});
-	const interactionRadius = gridCellSize * 7;
+	// Keep the parity neighborhood closed across enlarged pebble/liquid contacts over multiple microsteps.
+	const interactionRadius = gridCellSize * 20;
 	const sourceIndices = new Set<number>();
 	for (let index = 0; index < particles.length; index += 1) {
 		const particle = particles[index];

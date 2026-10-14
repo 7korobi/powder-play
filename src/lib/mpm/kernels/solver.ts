@@ -344,8 +344,8 @@ interface MpmMlsGpuStepBindings {
 	readonly gatherSurfaceOccupancy: GPUBindGroup;
 	readonly prepareParticles: GPUBindGroup;
 	readonly buildBuckets: GPUBindGroup;
-	readonly buildTriangleFieldCandidates: GPUBindGroup;
-	readonly buildTriangleField: GPUBindGroup;
+	buildTriangleFieldCandidates: GPUBindGroup;
+	buildTriangleField: GPUBindGroup;
 	readonly p2g: GPUBindGroup;
 	readonly updateGrid: GPUBindGroup;
 	readonly g2p: GPUBindGroup;
@@ -373,6 +373,7 @@ const OUTLET_COUNTER_BYTES = Uint32Array.BYTES_PER_ELEMENT;
 const SURFACE_STATUS_WORD_INDEX = 7;
 const SURFACE_PARAMETER_DT = 1;
 const MAX_U32 = 0xffff_ffff;
+const TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS = 32;
 export const MPM_MLS_GPU_DRAG_STIFFNESS = 20;
 export const MPM_MLS_GPU_DRAG_DAMPING = 8;
 const BUFFER_USAGE = {
@@ -515,7 +516,7 @@ interface MpmMlsGpuRuntime {
 		readonly bucketNext: GPUBuffer;
 		readonly gridNodes: GPUBuffer;
 		readonly surfaceFields: GPUBuffer;
-		readonly triangleFieldCandidates: GPUBuffer;
+		triangleFieldCandidates: GPUBuffer;
 		readonly triangleFieldNodes: GPUBuffer;
 		readonly bondedBodyStarts: GPUBuffer;
 		readonly triangleContactStates: GPUBuffer;
@@ -539,9 +540,44 @@ interface MpmMlsGpuRuntime {
 	readonly clearGrid: GPUBindGroup;
 	readonly clearSurfaceOccupancy: GPUBindGroup;
 	readonly surfaceRender: GPUBindGroup;
-	readonly bindings: readonly [MpmMlsGpuStepBindings, MpmMlsGpuStepBindings];
+	readonly bindings: [MpmMlsGpuStepBindings, MpmMlsGpuStepBindings];
 	readonly cloneBindings: readonly [GPUBindGroup, GPUBindGroup];
 	readonly reduceParticleSpeedPartials: GPUBindGroup;
+}
+
+function createTriangleFieldBindings(
+	device: GPUDevice,
+	pipelines: MpmMlsGpuPipelines,
+	simulationParams: GPUBuffer,
+	input: GPUBuffer,
+	stateError: GPUBuffer,
+	triangleFieldNodes: GPUBuffer,
+	bondedBodyStarts: GPUBuffer,
+	triangleFieldCandidates: GPUBuffer
+): Pick<
+	MpmMlsGpuStepBindings,
+	'buildTriangleFieldCandidates' | 'buildTriangleField'
+> {
+	return {
+		buildTriangleFieldCandidates: createBindGroup(
+			device,
+			pipelines.buildTriangleFieldCandidates,
+			[
+				bufferEntry(0, simulationParams),
+				bufferEntry(1, input),
+				bufferEntry(17, bondedBodyStarts),
+				bufferEntry(28, triangleFieldCandidates)
+			]
+		),
+		buildTriangleField: createBindGroup(device, pipelines.buildTriangleField, [
+			bufferEntry(0, simulationParams),
+			bufferEntry(1, input),
+			bufferEntry(6, stateError),
+			bufferEntry(16, triangleFieldNodes),
+			bufferEntry(17, bondedBodyStarts),
+			bufferEntry(28, triangleFieldCandidates)
+		])
+	};
 }
 
 async function createRuntime(
@@ -902,27 +938,15 @@ async function createRuntime(
 			bufferEntry(4, buffers.bucketNext),
 			bufferEntry(6, buffers.stateError)
 		]);
-		const buildTriangleFieldCandidates = createBindGroup(
+		const triangleFieldBindings = createTriangleFieldBindings(
 			device,
-			pipelines.buildTriangleFieldCandidates,
-			[
-				bufferEntry(0, buffers.simulationParams),
-				bufferEntry(1, input),
-				bufferEntry(17, buffers.bondedBodyStarts),
-				bufferEntry(28, buffers.triangleFieldCandidates)
-			]
-		);
-		const buildTriangleField = createBindGroup(
-			device,
-			pipelines.buildTriangleField,
-			[
-				bufferEntry(0, buffers.simulationParams),
-				bufferEntry(1, input),
-				bufferEntry(6, buffers.stateError),
-				bufferEntry(16, buffers.triangleFieldNodes),
-				bufferEntry(17, buffers.bondedBodyStarts),
-				bufferEntry(28, buffers.triangleFieldCandidates)
-			]
+			pipelines,
+			buffers.simulationParams,
+			input,
+			buffers.stateError,
+			buffers.triangleFieldNodes,
+			buffers.bondedBodyStarts,
+			buffers.triangleFieldCandidates
 		);
 		const gatherSurfaceOccupancy = createBindGroup(
 			device,
@@ -1098,8 +1122,7 @@ async function createRuntime(
 			gatherSurfaceOccupancy,
 			prepareParticles,
 			buildBuckets,
-			buildTriangleFieldCandidates,
-			buildTriangleField,
+			...triangleFieldBindings,
 			p2g,
 			updateGrid,
 			g2p,
@@ -1125,10 +1148,10 @@ async function createRuntime(
 			bufferEntry(13, buffers.cloneParams),
 			bufferEntry(17, buffers.bondedBodyStarts)
 		]);
-	const bindings: readonly [
-		MpmMlsGpuStepBindings,
-		MpmMlsGpuStepBindings
-	] = [createStepBindings(0), createStepBindings(1)];
+	const bindings: [MpmMlsGpuStepBindings, MpmMlsGpuStepBindings] = [
+		createStepBindings(0),
+		createStepBindings(1)
+	];
 	const cloneBindings: readonly [GPUBindGroup, GPUBindGroup] = [
 		createCloneBinding(0),
 		createCloneBinding(1)
@@ -1181,6 +1204,8 @@ function createSolver(
 	let latestCompletedCflMeasurementSequence = 0;
 	let currentRenderMode: MpmMlsGpuRenderMode = 'particles';
 	let bondedBodyCount = state.bondedBodyStarts.length;
+	let triangleFieldCandidateWordsPerTile =
+		layout.triangleFieldCandidateWordsPerTile;
 	const temporaryReadbacks = new Set<GPUBuffer>();
 	const objectRanges = new Map<number, MpmMlsGpuObjectRange>(
 		state.objectRanges.map((range) => [range.objectId, range])
@@ -1191,6 +1216,85 @@ function createSolver(
 	for (const range of state.objectRanges) {
 		nextObjectId = Math.max(nextObjectId, range.objectId + 1);
 	}
+
+	function ensureTriangleFieldCandidateCapacity(bodyCount: number): void {
+		const wordsPerTile = Math.ceil(
+			Math.min(bodyCount, layout.triangleFieldCandidateBodyLimit) /
+				TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS
+		);
+		if (wordsPerTile <= triangleFieldCandidateWordsPerTile) return;
+
+		const wordCount = layout.triangleFieldCandidateTileCount * wordsPerTile;
+		const bytes = wordCount * Uint32Array.BYTES_PER_ELEMENT;
+		if (!Number.isSafeInteger(wordCount) || !Number.isSafeInteger(bytes)) {
+			throw new RangeError('triangle field candidate bitset size exceeds the safe integer range');
+		}
+
+		const nextBuffer = session.device.createBuffer({
+			label: 'MLS-MPM triangle field candidate bitset',
+			size: Math.max(Uint32Array.BYTES_PER_ELEMENT, bytes),
+			usage: BUFFER_USAGE.STORAGE
+		});
+		ownedBuffers.add(nextBuffer);
+		try {
+			const nextCandidateBindings0 = createTriangleFieldBindings(
+				session.device,
+				runtime.pipelines,
+				runtime.buffers.simulationParams,
+				runtime.buffers.particles[0],
+				runtime.buffers.stateError,
+				runtime.buffers.triangleFieldNodes,
+				runtime.buffers.bondedBodyStarts,
+				nextBuffer
+			);
+			const nextCandidateBindings1 = createTriangleFieldBindings(
+				session.device,
+				runtime.pipelines,
+				runtime.buffers.simulationParams,
+				runtime.buffers.particles[1],
+				runtime.buffers.stateError,
+				runtime.buffers.triangleFieldNodes,
+				runtime.buffers.bondedBodyStarts,
+				nextBuffer
+			);
+			const previousBuffer = runtime.buffers.triangleFieldCandidates;
+			const previousWorkComplete = session.device.queue.onSubmittedWorkDone();
+
+			runtime.buffers.triangleFieldCandidates = nextBuffer;
+			runtime.bindings[0] = {
+				...runtime.bindings[0],
+				...nextCandidateBindings0
+			};
+			runtime.bindings[1] = {
+				...runtime.bindings[1],
+				...nextCandidateBindings1
+			};
+			triangleFieldCandidateWordsPerTile = wordsPerTile;
+
+			void previousWorkComplete
+				.then(() => {
+					if (!ownedBuffers.has(previousBuffer)) return;
+					try {
+						previousBuffer.destroy();
+						ownedBuffers.delete(previousBuffer);
+					} catch {
+						// Keep the old buffer tracked so dispose can retry cleanup.
+					}
+				})
+				.catch(() => {
+					// Device teardown will release the retired buffer if the queue is lost.
+				});
+		} catch (cause) {
+			try {
+				nextBuffer.destroy();
+				ownedBuffers.delete(nextBuffer);
+			} catch {
+				// Keep the buffer tracked so dispose can retry cleanup.
+			}
+			throw cause;
+		}
+	}
+
 	const deviceLost = session.lost;
 	void deviceLost.then((info) => {
 		lostInfo = info;
@@ -1328,7 +1432,11 @@ function createSolver(
 							pass,
 							runtime.pipelines.buildTriangleFieldCandidates,
 							groups.buildTriangleFieldCandidates,
-							layout.triangleFieldCandidateWordCount
+							layout.triangleFieldCandidateTileCount *
+								Math.ceil(
+									bondedBodyCount /
+										TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS
+								)
 						);
 					}
 					dispatchCompute(
@@ -2712,6 +2820,10 @@ function createSolver(
 		if (nextObjectId > MAX_U32) {
 			throw new RangeError('No unsigned 32-bit object ids remain for MLS-MPM cloning.');
 		}
+		const nextBondedBodyCount = bondedBodyCount + sourceBondedBodyCount;
+		if (nextBondedBodyCount <= layout.triangleFieldCandidateBodyLimit) {
+			ensureTriangleFieldCandidateCapacity(nextBondedBodyCount);
+		}
 
 		const destinationStart = particleSlotCount;
 		const clonedObjectId = nextObjectId;
@@ -2765,7 +2877,7 @@ function createSolver(
 		fractureBondCountsByObjectId.set(clonedObjectId, 0);
 		particleSlotCount += source.count;
 		activeParticleCount += source.count;
-		bondedBodyCount += sourceBondedBodyCount;
+		bondedBodyCount = nextBondedBodyCount;
 		nextObjectId++;
 		try {
 			// Refresh only live gather counts; preserve step and material parameters.

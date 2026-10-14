@@ -40,6 +40,29 @@ function makeParticle(overrides: Partial<MpmParticle> = {}): MpmParticle {
 	};
 }
 
+function makeBondedTriangleParticles(bodyCount: number): MpmParticle[] {
+	return Array.from({ length: bodyCount }, (_, bodyIndex) => {
+		const objectId = 100 + bodyIndex;
+		return [
+			makeParticle({
+				objectId,
+				position: { x: 0.1, y: 4 },
+				bondedTriangleVertex: 0
+			}),
+			makeParticle({
+				objectId,
+				position: { x: 0.7, y: 4 },
+				bondedTriangleVertex: 1
+			}),
+			makeParticle({
+				objectId,
+				position: { x: 0.4, y: 4.519615242270663 },
+				bondedTriangleVertex: 2
+			})
+		];
+	}).flat();
+}
+
 describe('GPU MLS-MPM input and buffer layout', () => {
 	it('validates and packs the complete particle state, including both domain edges', () => {
 		const state = validateMpmMlsGpuInput(
@@ -87,9 +110,9 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			triangleFieldBytes: 6_688,
 			triangleFieldCandidateBodyLimit: 512,
 			triangleFieldCandidateTileCount: 2,
-			triangleFieldCandidateWordsPerTile: 16,
-			triangleFieldCandidateWordCount: 32,
-			triangleFieldCandidateBytes: 128,
+			triangleFieldCandidateWordsPerTile: 0,
+			triangleFieldCandidateWordCount: 0,
+			triangleFieldCandidateBytes: Uint32Array.BYTES_PER_ELEMENT,
 			bondedBodyStartBytes: 4,
 			triangleContactStateBytes: 16,
 			trianglePairContactCacheCapacity: 0,
@@ -113,8 +136,8 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(layout.objectIdBufferBytes).toBe(4);
 		expect(layout.gridStateBytes).toBe(16_720);
 		expect(layout.triangleFieldBytes).toBe(6_688);
-		expect(layout.triangleFieldCandidateWordCount).toBe(32);
-		expect(layout.triangleFieldCandidateBytes).toBe(128);
+		expect(layout.triangleFieldCandidateWordCount).toBe(0);
+		expect(layout.triangleFieldCandidateBytes).toBe(Uint32Array.BYTES_PER_ELEMENT);
 		expect(layout.bondedBodyStartBytes).toBe(4);
 		expect(layout.triangleContactStateBytes).toBe(16);
 		expect(layout.trianglePairContactCacheCapacity).toBe(0);
@@ -164,9 +187,9 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(layout.bucketNextBytes).toBe(36_000_000);
 		expect(layout.gridStateBytes).toBe(2_729_520);
 		expect(layout.triangleFieldBytes).toBe(1_091_808);
+		expect(layout.triangleFieldCandidateWordCount).toBe(0);
+		expect(layout.triangleFieldCandidateBytes).toBe(Uint32Array.BYTES_PER_ELEMENT);
 		expect(layout.triangleFieldCandidateTileCount).toBe(140);
-		expect(layout.triangleFieldCandidateWordCount).toBe(2_240);
-		expect(layout.triangleFieldCandidateBytes).toBe(8_960);
 		expect(layout.bondedBodyStartBytes).toBe(1_333_332);
 		expect(layout.triangleContactStateBytes).toBe(5_333_328);
 		expect(layout.bondedBodyCapacity).toBe(333_333);
@@ -179,9 +202,11 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 
 	it('bounds triangle field candidate storage for a maximum-aspect-ratio grid', () => {
 		const state = validateMpmMlsGpuInput(
-			[makeParticle({ position: { x: 0.5, y: 4 } })],
+			makeBondedTriangleParticles(512),
 			makeConfig({
-				grid: { cellsX: 1, cellsY: 419_427, cellSize: 1 }
+				grid: { cellsX: 1, cellsY: 419_427, cellSize: 1 },
+				bondRestLength: 0.6,
+				capacity: 1536
 			})
 		);
 		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
@@ -213,6 +238,33 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(layout.triangleFieldCandidateBytes).toBeLessThanOrEqual(
 			4 * layout.nodeCount
 		);
+	});
+
+	it('sizes candidate tile strides at the 32-bit body boundaries', () => {
+		const grid = { cellsX: 220, cellsY: 150, cellSize: 1 };
+		const tileCount = 140;
+
+		for (const bodyCount of [1, 31, 32, 33, 200, 512]) {
+			const state = validateMpmMlsGpuInput(
+				makeBondedTriangleParticles(bodyCount),
+				makeConfig({
+					grid,
+					bondRestLength: 0.6,
+					capacity: bodyCount * 3
+				})
+			);
+			const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
+			const wordsPerTile = Math.ceil(bodyCount / 32);
+
+			expect(state.bondedBodyStarts).toHaveLength(bodyCount);
+			expect(layout.triangleFieldCandidateBodyLimit).toBe(512);
+			expect(layout.triangleFieldCandidateTileCount).toBe(tileCount);
+			expect(layout.triangleFieldCandidateWordsPerTile).toBe(wordsPerTile);
+			expect(layout.triangleFieldCandidateWordCount).toBe(tileCount * wordsPerTile);
+			expect(layout.triangleFieldCandidateBytes).toBe(
+				tileCount * wordsPerTile * Uint32Array.BYTES_PER_ELEMENT
+			);
+		}
 	});
 
 	it('packs each particle material and snow plastic history with the GPU layout', () => {
@@ -331,7 +383,7 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(Array.from(state.bondedBodyStarts)).toEqual([0]);
 		expect(state.bondedBodyCountsByObjectId.get(7)).toBe(1);
 		expect(layout.triangleFieldCandidateBodyLimit).toBe(512);
-		expect(layout.triangleFieldCandidateWordsPerTile).toBe(16);
+		expect(layout.triangleFieldCandidateWordsPerTile).toBe(1);
 		expect(layout.trianglePairContactCacheCapacity).toBe(2);
 		expect(layout.trianglePairContactCacheBytes).toBe(
 			2 * 2 * 4 * Float32Array.BYTES_PER_ELEMENT

@@ -44,7 +44,11 @@ function setupDevice() {
 		copyBufferToBuffer: vi.fn(),
 		finish: vi.fn(() => ({}))
 	};
-	const queue = { writeBuffer: vi.fn(), submit: vi.fn() };
+	const queue = {
+		writeBuffer: vi.fn(),
+		submit: vi.fn(),
+		onSubmittedWorkDone: vi.fn(async () => {})
+	};
 	const getCompilationInfo = vi.fn(async () => ({ messages: [] }));
 	const context = {
 		getCurrentTexture: vi.fn(() => ({ createView: vi.fn(() => ({})) }))
@@ -156,6 +160,16 @@ const BONDED_TRIANGLE_PARTICLES: readonly MpmParticle[] = [
 		bondedTriangleVertex: 2
 	}
 ];
+
+function makeBondedTriangleParticles(bodyCount: number): MpmParticle[] {
+	return Array.from({ length: bodyCount }, (_, objectIndex) =>
+		BONDED_TRIANGLE_PARTICLES.map((particle) => ({
+			...particle,
+			objectId: 100 + objectIndex
+		}))
+	).flat();
+}
+
 const FRACTURE_PARTICLES: readonly MpmParticle[] = [
 	{
 		...PARTICLE,
@@ -770,7 +784,7 @@ describe('GPU MLS-MPM batch encoding', () => {
 		);
 		expect(
 			gpu.buffers.find(({ label }) => label.includes('triangle field candidate bitset'))?.size
-		).toBe(128);
+		).toBe(2 * Uint32Array.BYTES_PER_ELEMENT);
 		expect(gpu.buffers.find(({ label }) => label.includes('bonded triangle body indices'))?.size).toBe(
 			2 * Uint32Array.BYTES_PER_ELEMENT
 		);
@@ -783,14 +797,107 @@ describe('GPU MLS-MPM batch encoding', () => {
 		solver.dispose();
 	});
 
+	it('sizes candidate storage and dispatches from each active bonded-body count', async () => {
+		const grid = { cellsX: 220, cellsY: 150, cellSize: 1 };
+		const tileCount = 140;
+
+		for (const bodyCount of [1, 31, 32, 33, 200, 512]) {
+			const gpu = setupDevice();
+			const particles = makeBondedTriangleParticles(bodyCount);
+			const solver = await createMpmMlsGpuSolver(CANVAS, particles, {
+				...CONFIG,
+				grid,
+				capacity: bodyCount * 3,
+				bondRestLength: 0.6
+			});
+
+			solver.step(0.001, { x: 0, y: 0 });
+
+			const wordsPerTile = Math.ceil(bodyCount / 32);
+			const candidateWordCount = tileCount * wordsPerTile;
+			expect(
+				gpu.buffers.find(({ label }) =>
+					label.includes('triangle field candidate bitset')
+				)?.size
+			).toBe(candidateWordCount * Uint32Array.BYTES_PER_ELEMENT);
+			expect(
+				gpu.dispatches.find(
+					({ pipeline }) =>
+						pipeline === 'MLS-MPM buildTriangleFieldCandidates pipeline'
+				)?.workgroups
+			).toBe(Math.ceil(candidateWordCount / 64));
+			solver.dispose();
+		}
+	});
+
+	it('grows candidate storage and rebinds when cloning crosses a body-word boundary', async () => {
+		const initialBodyCount = 32;
+		const gpu = setupDevice();
+		const solver = await createMpmMlsGpuSolver(
+			CANVAS,
+			makeBondedTriangleParticles(initialBodyCount),
+			{
+				...CONFIG,
+				grid: { cellsX: 220, cellsY: 150, cellSize: 1 },
+				capacity: (initialBodyCount + 1) * 3,
+				bondRestLength: 0.6
+			}
+		);
+
+		solver.step(0.001, { x: 0, y: 0 });
+		expect(
+			gpu.buffers.find(({ label }) => label.includes('triangle field candidate bitset'))?.size
+		).toBe(140 * Uint32Array.BYTES_PER_ELEMENT);
+		expect(
+			solver.clone(
+				{
+					particleIndex: 0,
+					objectId: 100,
+					anchor: BONDED_TRIANGLE_PARTICLES[0].position
+				},
+				{ x: 0.1, y: 0 }
+			)
+		).toBe(true);
+
+		const candidateBuffers = gpu.buffers.filter(({ label }) =>
+			label.includes('triangle field candidate bitset')
+		);
+		expect(candidateBuffers.map(({ size }) => size)).toEqual([
+			140 * Uint32Array.BYTES_PER_ELEMENT,
+			140 * 2 * Uint32Array.BYTES_PER_ELEMENT
+		]);
+
+		gpu.dispatches.length = 0;
+		solver.step(0.001, { x: 0, y: 0 });
+		expect(
+			gpu.dispatches.find(
+				({ pipeline }) =>
+					pipeline === 'MLS-MPM buildTriangleFieldCandidates pipeline'
+			)?.workgroups
+		).toBe(Math.ceil((140 * 2) / 64));
+		type CandidateBindingGroup = {
+			readonly entries: readonly {
+				readonly binding: number;
+				readonly resource: { readonly buffer: unknown };
+			}[];
+		};
+		const candidateBindingCalls = gpu.pass.setBindGroup.mock
+			.calls as unknown as readonly (readonly [number, CandidateBindingGroup])[];
+		const boundCandidateBuffers = candidateBindingCalls.flatMap(([, bindGroup]) =>
+			bindGroup.entries
+				.filter(({ binding }) => binding === 28)
+				.map(({ resource }) => resource.buffer)
+		);
+		expect(boundCandidateBuffers.slice(-2)).toEqual([
+			candidateBuffers[1],
+			candidateBuffers[1]
+		]);
+		solver.dispose();
+	});
+
 	it('falls back to a full field scan above the explicit spatial-candidate body limit', async () => {
 		const bodyCount = 513;
-		const particles = Array.from({ length: bodyCount }, (_, objectIndex) =>
-			BONDED_TRIANGLE_PARTICLES.map((particle) => ({
-				...particle,
-				objectId: 100 + objectIndex
-			}))
-		).flat();
+		const particles = makeBondedTriangleParticles(bodyCount);
 		const gpu = setupDevice();
 		const solver = await createMpmMlsGpuSolver(CANVAS, particles, {
 			...CONFIG,
@@ -845,6 +952,10 @@ describe('GPU MLS-MPM batch encoding', () => {
 		expect(MLS_MPM_COMPUTE_WGSL).toContain(
 			'const TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT: u32 = 512u;'
 		);
+		expect(candidateShader).toContain('let candidateBodyCount = min(');
+		expect(candidateShader).toContain('let candidateWordsPerTile =');
+		expect(candidateShader).toContain('outputIndex / candidateWordsPerTile');
+		expect(candidateShader).toContain('outputIndex % candidateWordsPerTile');
 		expect(candidateShader).toContain(
 			'dot(outside, outside) <= params.bonding.z * params.bonding.z'
 		);
@@ -869,6 +980,10 @@ describe('GPU MLS-MPM batch encoding', () => {
 		expect(fieldShader).toContain('if (bodyIndex >= params.counts.w) {');
 		expect(fieldShader).toContain(
 			'if (params.counts.w <= TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT) {'
+		);
+		expect(fieldShader).toContain('candidateTileIndex * candidateWordsPerTile +');
+		expect(fieldShader).toContain(
+			'if (bodyChunkStart + TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS < params.counts.w) {'
 		);
 		expect(fieldShader).toContain('var candidateWord0 = 0xffffffffu;');
 		expect(fieldShader).toContain('var candidateWord1 = 0xffffffffu;');

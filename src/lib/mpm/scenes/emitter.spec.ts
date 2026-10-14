@@ -20,6 +20,7 @@ describe('deterministic GPU MPM emitter', () => {
 		expect(first).toEqual(second);
 		expect(first).toHaveLength(BASE_CONFIG.count);
 		expect(first.every((particle) => particle.material?.model === 'water')).toBe(true);
+		expect(first.every((particle) => particle.volume === 25)).toBe(true);
 		expect(first.every((particle) => particle.velocity.x === 2 && particle.velocity.y === -3)).toBe(true);
 		expect(first.every((particle) => particle.position.x >= 0 && particle.position.y >= 0)).toBe(true);
 	});
@@ -29,11 +30,13 @@ describe('deterministic GPU MPM emitter', () => {
 		const solid = createMpmEmitterParticles({
 			...BASE_CONFIG,
 			material: 'neo-hookean',
-			shape: 'rectangle'
+			shape: 'rectangle',
+			particleVolume: 100
 		});
 
 		expect(oil.every((particle) => particle.material?.model === 'oil')).toBe(true);
 		expect(solid.every((particle) => particle.material?.model === 'neo-hookean')).toBe(true);
+		expect(solid.every((particle) => particle.volume === 100)).toBe(true);
 		expect(new Set(solid.map(({ position }) => `${position.x}:${position.y}`)).size).toBe(
 			BASE_CONFIG.count
 		);
@@ -46,6 +49,9 @@ describe('deterministic GPU MPM emitter', () => {
 		expect(() =>
 			createMpmEmitterParticles({ ...BASE_CONFIG, seed: -1 })
 		).toThrow(/seed/);
+		expect(() =>
+			createMpmEmitterParticles({ ...BASE_CONFIG, particleVolume: 0 })
+		).toThrow(/particleVolume/);
 		expect(() =>
 			createMpmEmitterParticles({
 				...BASE_CONFIG,

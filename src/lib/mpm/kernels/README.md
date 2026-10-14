@@ -112,14 +112,19 @@ CFL batch and its compact readback may be pending; later frame time remains in
 the accumulator until it completes. Work-cap overflow is deferred rather than
 treated as a fatal solver error or silently dropping simulated time.
 
-The Gate 4 sample starts with 8,000 water, 6,000 oil, 200 Neo-Hookean
-elastic pebbles built from three particles each, and a 96-particle connected
-solid (14,696 active particles total). The pebbles form a 14-column × 15-row array with 68-world-unit center
-spacing; the last row is centered and contains four pebbles. Each is an
-equilateral triangle with 66-world-unit edges and width, about 3% of the
-simulation-domain width. Each triangle spans roughly 6.6 grid cells and has
-its own `objectId`. Each pebble uses lambda 20 and mu 10; its three edges also
-use position constraints. The GPU solves these constraints in triangle-local
+The retuned Gate 4 sample starts with 2,000 water, 1,500 oil, 50 Neo-Hookean
+elastic pebbles built from three particles each, and a 24-particle connected
+solid (3,674 active particles total, one quarter of the previous 14,696).
+The water and oil each keep their previous total reference area and mass:
+particle reference area grows from 25 to 100 while liquid spacing grows from
+9 to 18 world units. Solid particle mass grows from 1 to 4 with the same
+reference-area scaling. The pebbles form an 8-column × 7-row array with
+150-world-unit center spacing; the last row contains two centered pebbles.
+Each is an equilateral triangle with 132-world-unit edges and width, about
+6% of the simulation-domain width. The array overlaps the liquid region
+instead of starting outside it. Each triangle has its own `objectId` and uses
+lambda 20 and mu 10; its three edges also use position constraints. The GPU
+solves these constraints in triangle-local
 offsets and derives velocity corrections from those small displacements before
 reconstructing world positions, avoiding precision loss from subtracting
 near-equal large coordinates. Constraint stiffness scales with the square of
@@ -152,19 +157,20 @@ tile. The original per-node AABB and triangle-distance tests still decide field
 values, and candidates are visited in body order. Above 512 bodies it falls
 back to the full field scan; dense overlap remains the worst case.
 At scene initialization, water and oil velocity components are sampled
-independently from ±60 world units/s and each pebble vertex from ±120 world
-units/s. A fixed scene seed reproduces the same velocities for tests and
-benchmarks; the lab chooses a fresh seed on initialization.
-The 16×16 tile candidate bitset reduces sparse field scans for up to 512 bodies;
-the full-scan fallback and dense-overlap worst case can still reach about
-6.82 million node/body candidate checks per step in the current 200-pebble
-scene. This GPU pass and the pairwise SAT solver are profiled in
-`docs/PERFORMANCE-MLS-MPM.md`; larger scenes and sustained stability remain
-unverified. Contact friction, surface tension, wetting, complete water/oil
-separation in arbitrary flows, and swept collision detection are not
-implemented.
+independently from ±8 world units/s and each pebble vertex from ±30 world
+units/s. Horizontal oscillation starts disabled; a button starts/stops the
+default ±240 world-units/s², 0.16 Hz motion, and the slider adjusts its
+amplitude up to 360. A fixed scene seed reproduces particle velocities for
+tests and benchmarks; the lab chooses a fresh seed on initialization.
+The 16×16 tile candidate bitset reduces sparse field scans for up to 512 bodies.
+With 50 active pebble bodies, the full-scan upper bound is about 1.71 million
+node/body candidates per step and unordered SAT pairs fall from 19,900 to
+1,225. A single diagnostic `stages` profile is recorded, but repeated `batch`
+performance and node-level candidate counts remain unverified. Contact
+friction, surface tension, wetting, complete water/oil separation in arbitrary
+flows, and swept collision detection are not implemented.
 
-The additional solid is a 12 × 8 node Neo-Hookean object with 249 initial
+The additional solid is a 6 × 4 node Neo-Hookean object with 53 initial
 horizontal, vertical, and diagonal bonds. GPU bond damage accumulates from
 tensile strain against the configured 0.12 threshold; broken edges remain
 broken and damage fades particle stress and changes diagnostic color. The
@@ -174,23 +180,24 @@ recreating broken topology. This is a grid-dependent discrete demo, not a
 calibrated continuum fracture model; GPU numerical accuracy and sustained
 damage loading have not been measured across devices/resolutions.
 
-Water and oil reference densities are 0.02 and 0.016, half the previous
-values. Their reference volumes and EOS stiffnesses are unchanged. The liquid
-particle spacing is 9 world units instead of 8, reducing initial liquid areal
-density by about 21%. The grid is 220 × 150 cells at the same 10-unit cell
-size; grid-wide passes dispatch 34,119 rather than 49,959 nodes, about 31.7%
-fewer. A previous 20,000-particle scene used 6,000 powder particles; the
-initial powder patch has now been replaced by 200 elastic pebble objects. The sample
-still reserves capacity for 1,000,000 particles. The smaller domain keeps the
-liquid objects and all pebbles inside the eight-cell wall cushion.
+Water and oil reference densities remain 0.02 and 0.016, with EOS stiffnesses
+40,000 and 30,000. Their count is one quarter of the previous scene and each
+particle's reference area is four times larger, preserving per-phase reference
+mass and total area. The 18-unit spacing preserves the previous liquid
+reference area per unit domain area (`100 / 18²` equals `25 / 9²`). The grid
+remains 220 × 150 cells at 10-unit cell size. A previous 20,000-particle scene
+used 6,000 powder particles; the later 200-pebble and 14,696-particle layouts
+are historical. The current sample reserves capacity for 1,000,000 particles,
+so reducing active count does not materially reduce the fixed GPU allocation.
 
-The lab applies a horizontal sinusoidal acceleration with default amplitude
-±240 world units/s² and frequency 0.16 Hz. The UI can disable or adjust its
-amplitude up to 360. To preserve batching, each batch applies the time-average
-acceleration over its simulation-time interval; the simulation clock advances
-only after the batch's compact CFL speed/status readback succeeds. The
-performance panel reports this asynchronous scalar-readback latency separately
-from queue completion time.
+The surface and particle-marker renderers apply an additional 2× display-area
+scale independently of physical particle area, making each particle appear
+about 8× larger in area than the previous layout. Surface pixels use the
+dominant water/oil phase color with a narrow interface highlight; this is a
+visual cue, not a guarantee of physical separation. The sinusoidal horizontal
+acceleration averages over each batch's simulation-time interval; the
+performance panel reports asynchronous scalar-readback latency separately from
+queue completion time.
 
 ## Interaction and capacity
 
@@ -304,24 +311,27 @@ to 64 substeps; P2G and grid-velocity update remain explicit.
   single source burst is bounded at 100,000 candidates; emitted batches are
   all-or-nothing for validation, while a valid prefix is accepted when only
   part of the remaining capacity is available.
-- Particle rendering color-codes the constitutive model and uses a radius
-  proportional to `cellSize`. The lab route should size the canvas to match the
+- Particle rendering color-codes the constitutive model and scales marker
+  radius with the square root of reference area in addition to the base
+  `cellSize` radius. The lab route should size the canvas to match the
   configured world aspect ratio.
-- The Gate 4 lab starts with 14,696 mixed-material particles and reserves
+- The Gate 4 lab starts with 3,674 mixed-material particles and reserves
   capacity for 1,000,000. Summing the current fixed buffer layout gives about
   221.7 MB (211.4 MiB) before an on-demand full-state readback, which can
-  allocate about 84 MB more. This is a layout-derived estimate, not measured
+  allocate about 84 MB more. This is a layout-derived estimate based on the
+  prior fixed-capacity layout, not a measurement of the retuned scene's
   adapter/process peak memory. The affine scratch adds 16 MB at this capacity.
   A scene with bonded triangles also allocates up to 4 MiB for the bounded pair
   cache, a pair-candidate bitset, and a grid-sized field-candidate bitset. The
-  14,696-particle benchmark measured 231,196,340 total buffer bytes with
-  1,000,000 capacity, 4,236,032 bytes above the pre-cache benchmark allocation;
-  the field-candidate bitset used 8,960 bytes in that grid.
+  The historical 14,696-particle benchmark measured 231,196,340 total buffer
+  bytes with 1,000,000 capacity, 4,236,032 bytes above the pre-cache benchmark
+  allocation; the field-candidate bitset used 8,960 bytes in that grid.
   Active particles and allocated slots are reported separately.
   This large capacity is intended for PC performance testing and may fail on
   devices without enough GPU memory. Its initial CPU/GPU parity check uses a
-  small local neighborhood around one probe per fluid and legacy triangle
-  pebble; it does not measure fracture GPU accuracy. The explicit paused-state
+  small local neighborhood around one probe per fluid and the central triangle
+  pebble, now positioned at the liquid interface; it does not measure fracture
+  GPU accuracy or scene-scale mixing. The explicit paused-state
   check remains a full readback.
 
 The pure config/layout and batch-encoding tests run without WebGPU. A historical

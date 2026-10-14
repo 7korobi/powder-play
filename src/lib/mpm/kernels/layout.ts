@@ -113,9 +113,6 @@ const TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT = 512;
 const TRIANGLE_FIELD_CANDIDATE_TILE_SIZE = 16;
 const TRIANGLE_FIELD_CANDIDATE_WORD_BITS = 32;
 const TRIANGLE_FIELD_CANDIDATE_WORD_BYTES = Uint32Array.BYTES_PER_ELEMENT;
-const TRIANGLE_FIELD_CANDIDATE_WORDS_PER_TILE = Math.ceil(
-	TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT / TRIANGLE_FIELD_CANDIDATE_WORD_BITS
-);
 const MAX_TRIANGLE_PAIR_CONTACT_CACHE_BODIES = 512;
 const TRIANGLE_PAIR_CONTACT_CACHE_ENTRY_BYTES = 4 * Float32Array.BYTES_PER_ELEMENT;
 const TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS = 32;
@@ -664,17 +661,22 @@ export function calculateMpmMlsGpuBufferLayout(
 		triangleFieldCandidateTileRows,
 		'triangle field candidate tile count'
 	);
-	const triangleFieldCandidateWordsPerTile =
-		TRIANGLE_FIELD_CANDIDATE_WORDS_PER_TILE;
+	const triangleFieldCandidateWordsPerTile = Math.ceil(
+		Math.min(state.bondedBodyStarts.length, TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT) /
+			TRIANGLE_FIELD_CANDIDATE_WORD_BITS
+	);
 	const triangleFieldCandidateWordCount = safeProduct(
 		triangleFieldCandidateTileCount,
 		triangleFieldCandidateWordsPerTile,
 		'triangle field candidate bitset word count'
 	);
-	const triangleFieldCandidateBytes = safeProduct(
-		triangleFieldCandidateWordCount,
+	const triangleFieldCandidateBytes = Math.max(
 		TRIANGLE_FIELD_CANDIDATE_WORD_BYTES,
-		'triangle field candidate bitset buffer size'
+		safeProduct(
+			triangleFieldCandidateWordCount,
+			TRIANGLE_FIELD_CANDIDATE_WORD_BYTES,
+			'triangle field candidate bitset buffer size'
+		)
 	);
 	// With both halo dimensions >= 4, 16 words per 16x16 tile fit within nodeCount.
 	if (triangleFieldCandidateWordCount > nodeCount) {
