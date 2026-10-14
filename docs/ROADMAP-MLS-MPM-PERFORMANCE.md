@@ -171,24 +171,55 @@ rest lengthの初期破断bondも2 step保持した。scene-scale接触・運動
 ## 後続: 今回実装しない調査
 
 - mobile で capacity と機能 profile を見直し、５分以上の持続性能を測る。
-- 接触候補の広域探索は下記P5で計画する。物理baselineを固定するまで本最適化を先行実装しない。
+- canonical pair cacheはSAT再計算を減らすが、`O(G·B)` triangle-field探索と`O(B²)` pair列挙は残る。
+  triangle-field用の16×16-node tile candidate bitsetは512 body以下で実装済みだが、
+  brute-force oracle、dense/boundary case、mobileでのscene-scale受け入れは未完了。
+  body-pairの広域候補索引は下記P5.3で引き続き計画する。
 - dense node の list 長・偏りを収集して sort/tile gather を比較する。
 - active node/tile と full-grid の crossover を測る。
 - physics と render の decoupling、queue gate、pick の大粒子数 search を比較する。
 - SoA、workgroup size、subgroup、`f16` は精度と対応端末を確認するまで採用しない。
 - CFL と体積保存・界面機能は材料ロードマップで別に進める。
 
-## P5 — 接触候補の空間索引（提案・未実装）
+## 2026-10-13 canonical triangle-pair cache A/B
+
+状態: 実装・実GPU検証済み。P4の10% median改善基準を満たし採用する。
+
+同じ14,696粒子sceneで、cache導入前5 runのGPU median中央値は0.679936 ms/step、
+導入後5 runは0.557056 ms/stepで **18.1%短縮**。run p95の中央値は0.696320から
+0.565248 ms/stepへ18.8%短縮した。通常batchの1 compute passは維持し、GPU bufferは
+4 MiB増えた。環境・warmup・source hashes・stage profileは
+[性能資料のA/B記録](./PERFORMANCE-MLS-MPM.md#2026-10-13-canonical-triangle-pair-cache-ab)を参照。
+
+最大512 active bonded bodiesでは、`gatherTrianglePairContacts`がunordered pairごとに
+SATを一度だけ計算してbounded cacheへ格納する。contact countは両bodyへatomic加算し、
+後段のimpulse passが同じrecordを再利用する。512 bodiesを超える場合は従来のdirect pair
+scanへfallbackするため、全体の二次candidate enumerationは解消しない。追加dispatchと
+4 MiB bufferを含めて測定し、小規模三角形衝突fixtureは4 stepのCPU/GPU差0.000381以内、
+運動量残差0.000019以内だった。大規模dense pile、scene全体の貫入、長時間物理品質は未検証。
+
+## P5 — 接触候補の空間索引（field部分実装、pair未実装）
+
+状態: `buildTriangleField` は512 body以下で16×16-node tile candidate bitsetを使用する。
+512 body超では従来の全走査にfallbackする。body-pairのspatial broad-phaseは未実装であり、
+P5全体の採用ゲートも未通過である。測定条件と現状のA/B値は
+[性能資料](./PERFORMANCE-MLS-MPM.md#2026-10-14-tile-field-candidates-and-pair-traversal)を参照。
 
 **問題**: 現行sceneの `G=34,119` halo込みgrid nodes、`B=200` 三角形colliderでは、
-`buildTriangleField` が最大 `G·B ≈ 6.82M` node/body候補をsubstepごとに調べる。
-`solveBondedTriangles` は `B·(B−1) ≈ 39,800` body-pair候補を列挙する。
-1,000 colliderならそれぞれ約34.12Mと999kへ増える。現行AABB testは候補生成後の
-narrow phaseを省略するだけで、この計算量を変えない。
+full scan時およびdense overlapのworst caseでは `buildTriangleField` が最大
+`G·B ≈ 6.82M` node/body候補をsubstepごとに調べる。tile bitsetはsparse caseの候補を絞るが、
+実際のnode/body candidate countはまだ計測していない。
+`gatherTrianglePairContacts` は最大 `B·(B−1)/2 = 19,900` unordered SAT候補を評価し、
+`applyTrianglePairContacts` はactive contact bitsetを使い、sparse caseでは接触候補のみを処理する。
+全pairが接触するdense caseの上限は `B·(B−1) = 39,800` directed contactsである。
+1,000 colliderならfull-scan fieldは約34.12M、unordered SATは499.5k、dense directed contactsは999k。
+pair cacheはSAT再計算を省き、active-contact bitsetはsparse apply走査を減らすが、
+pair-gatherの候補列挙は二次のまま残る。
 
 ### P5.1 — 同条件の計測・小規模oracleを固定
 
-- collider数を200 / 400 / 800 / 1,000以上へ増やす。grid resolution、材料係数、
+- Gate 4の200-body測定は完了。candidate数を記録するinstrumentationと小規模brute-force oracleは未完了。
+- collider数を400 / 800 / 1,000以上へ増やす。grid resolution、材料係数、
   particle count、dt、seedを固定し、uniform sparse配置とdense pileを別々に測る。
 - 大きなsolidは粒子数 `P` と疎なbond数 `E` を独立に変え、既存の小石collider数 `B`
   の試験と混同しない。
@@ -198,23 +229,18 @@ narrow phaseを省略するだけで、この計算量を変えない。
 - 小さいsceneでは全件走査のbrute-force結果をoracleとして保存する。
   spatial broad-phaseはfalse positiveを許容するが、false negativeを許容しない。
 
-### P5.2 — triangle field用GPU cell list
+### P5.2 — triangle field tile bitset（部分実装）
 
-1. substepごとに各変形colliderのAABBを計算し、contact skinとそのsubstepで許される
-   最大移動量だけ膨張する。長い・大きいcolliderは後述の階層方式へ分ける。
-2. AABBと交差するcellの参照数を数え、GPU prefix scanでoffsetを作り、
-   triangle IDをcellごとのCSR/bucket listへscatterする。
-3. `buildTriangleField` は各grid nodeから同じcell/隣接cellの候補だけを読み、
-   現在の三角形距離・normal・barycentric narrow phaseを保つ。
-4. cell候補listのcapacityを明示してoverflow statusを持つ。overflow時に接触を黙って
-   省かず、対象batchをrollback/failまたは小規模fallbackへ送る。
-5. topologyは再利用し、位置依存AABB/listは必要なphysics substepで更新する。
-   既存particle bucketはpoint particle用なので、triangle AABBを登録するbody index構造を
-   自動的に再利用できると仮定しない。
-
-期待するsparse/有界密度時の仕事量は `O(G + R + K)` の形に近づく。
-ここで `R` はbody-cell参照数、`K` は局所node-candidate数。これはworst-case保証ではなく、
-巨大AABB、偏ったcell、dense pileではcandidate数が増える。
+- `buildTriangleFieldCandidates` が16×16 node tileごとに、field marginへ届き得るbodyを
+  512-bit bitsetへ記録する。各nodeでは従来のAABBとtriangle-distance判定を再実行し、
+  body ID昇順を保つ。固定候補listの上限や候補切り捨てはない。
+- 512 body超ではcandidate passをdispatchせず、`buildTriangleField` が全bodyを走査する。
+- Gate 4ではcandidate生成stage 0.028062 ms/step、field stage 0.022609 ms/stepのmedian。
+  索引前のfield stage 0.120710 ms/stepと比べ、両stage合計medianは約58%低下した。
+  `profile=batch` medianは0.290955から0.231175 ms/stepへ約20.5%低下した。
+- 受け入れ未完了: GPU field全node出力のbrute-force differential oracle、
+  tile境界・退化形状・dense overlap・512超fallbackのshader実行確認、candidate数counter、
+  target mobile GPUでの計測。現時点では固定Gate 4のbenchmarkと既存物理acceptanceまで。
 
 ### P5.3 — body pairのbroad phase
 

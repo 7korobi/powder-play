@@ -90,14 +90,18 @@ P2G の atomic list 順は不定なので bitwise 一致は要求しない。
 3. **メモリ: active と capacity の差（継続課題）**。
    旧 Gate 4 scene は20,000 active に対して1,000,000 capacity、M1 後の確保量は約217 MB。
    capacity の削減は今回の計算高速化とは別の検証が必要。
-4. **GPU: 三角形 contact field の全 node × body 探索（未計測）**。
-   現在の Gate 4 は grid node ごとに200小石を走査し、最大約6.82M candidate checks/step。
-   AABB rejection 後の narrow-phase 量だけではなく、候補全走査自体の費用を計測する。
-5. **GPU: 小石同士の SAT（未計測）**。
-   200 bodies の body pass は最大約39,800 pair checks/step。field builder と合わせて stage timing を取る。
+4. **GPU: 三角形 contact field（tile candidate bitsetを実装）**。
+   full scanとdense overlapの上限は引き続き `G·B`。512 body以下では16×16 node tileごとの
+   conservative bitsetを使い、sparse caseのbody走査を減らす。Gate 4では索引前のfield stage
+   0.120710からcandidate generation 0.028062 + field 0.022609 ms/stepへ低下した。
+   candidate数counter、brute-force field oracle、dense/mobile受け入れは未完了。
+5. **GPU: 小石同士のSATとpair apply（計測済み）**。
+   canonical cacheでunordered pairのSAT結果を共有し、active-contact bitsetでsparse applyを短縮する。
+   Gate 4の `applyTrianglePairContacts` は0.142011から0.013213 ms/step medianへ低下した。
+   512 body超では従来pair scanへfallbackし、pair-gatherの全候補列挙は `O(B²)` のまま。
 
-新しい contact pass の GPU 時間、密な node bucket、実機の rAF/queue gate、
-操作 latency はまだ定量測定していない。仮説と計測済み bottleneck を混ぜない。
+contact cache passは計測済み。密なnode bucket、実機のrAF/queue gate、操作latency、
+scene全体の接触・長時間安定性はまだ定量測定していない。仮説と計測済みbottleneckを混ぜない。
 
 ## 4. 実装前の baseline
 
@@ -442,27 +446,31 @@ GPU実行時間の代用にはしない。
 ### 接触候補の計算量と規模リスク
 
 現行のtriangle collider数を `B`、halo込みgrid node数を `G` とすると、
-`buildTriangleField` は各node invocationから全colliderを走査するため候補数の上限は
-`G·B`、`solveBondedTriangles` は各bodyから他bodyを走査するため `B·(B−1)` となる。
-現在の `G=34,119`、`B=200` では、それぞれ約6.82M node/body checksと39,800 body-pair
-checks/substepである。AABB rejectionはnarrow phaseを減らすが、これらの候補列挙は減らさない。
+full-scan時の `buildTriangleField` 上限は `G·B`。現行の512-body以下の経路では
+16×16-node tileごとにbody候補bitsetを作り、field passがtile候補だけを調べる。
+Gate 4の140 tile × 200 bodyではcandidate generationが最大28,000 body/tile checks/substep。
+node-level candidate count自体はまだinstrumentationしていないため、dense worst caseは引き続き
+`G·B`。`gatherTrianglePairContacts` はcanonical unordered pairを `B·(B−1)/2` 個調べ、
+`applyTrianglePairContacts` はsparse caseでactive pairだけを、dense caseでは最大
+`B·(B−1)` 個のdirected contactを処理する。512 body超は従来full scanへfallbackする。
+現在の `G=34,119`、`B=200` ではfull-scan field上限が約6.82M checks、SAT candidateが
+19,900 unordered pairs/substep、dense directed contacts上限が39,800である。
 
-| 三角形collider数 `B` | node/body候補 `G·B` | body pair候補 `B·(B−1)` |
-|---:|---:|---:|
-| 200 | 6.82M | 39,800 |
-| 400 | 13.65M | 159,600 |
-| 1,000 | 34.12M | 999,000 |
-| 5,000 | 170.60M | 24.995M |
-| 10,000 | 341.19M | 99.99M |
+| 三角形collider数 `B` | full-scan field上限 `G·B` | unordered SAT候補 `B·(B−1)/2` | dense apply上限 `B·(B−1)` |
+|---:|---:|---:|---:|
+| 200 | 6.82M | 19,900 | 39,800 |
+| 400 | 13.65M | 79,800 | 159,600 |
+| 1,000 | 34.12M | 499,500 | 999,000 |
+| 5,000 | 170.60M | 12.4975M | 24.995M |
+| 10,000 | 341.19M | 49.995M | 99.99M |
 
 この表は演算時間ではなく、1 physics substep当たりの候補チェック上限である。
-CFLでsubstep数が増えれば接触処理も比例して繰り返される。実行時はAABBで詳細判定を
-省略する一方、近接・密集sceneでは広域候補数自体が増える。全体が同じ狭い場所に重なる
-dense worst caseは、正確なpair contactをすべて解く限り `O(B²)` が残り得る。
+CFLでsubstep数が増えれば接触処理も比例して繰り返される。tile bitsetとactive pair maskは
+sparse caseで候補を絞るが、密集sceneではfield `O(G·B)`、pair gather `O(B²)` のworst caseが残る。
 
-2026-10-13の200小石scene診断では `buildTriangleField` が0.13882 ms/step、
-`solveBondedTriangles` が0.09796 ms/stepだった。dispatch別stage profileの値であり、
-通常batchや別GPUへの時間予測ではないが、総当たり部分が既に計測上のhot spotである根拠になる。
+2026-10-13の旧66-unit scene診断では `buildTriangleField` が0.13882 ms/step、
+`solveBondedTriangles` が0.09796 ms/stepだった。これは現行solverへ置換される前のdispatch別profileであり、
+通常batchや別GPUへの時間予測には使わない。現行sourceのfield/SAT計測値は下記A/B記録を参照する。
 従って1M particle buffer capacityを、そのまま実用的なcollider数の保証と解釈しない。
 具体的なbroad-phase方式とscale acceptance gateは
 [性能チューニングロードマップ](./ROADMAP-MLS-MPM-PERFORMANCE.md)のP5に記録する。
@@ -493,6 +501,84 @@ layout / shaders / solverのSHA-256はそれぞれ
 `1655a7f65f4dc37bc57b673f1e4b1661f70f90b2da907cb56705149f7e5559d5`、
 `5d5dc93fd7a92e1dffdf07f31309822067dc305de72c95590741c6d3d8d6af57`、
 `e98c0cd5f2f340bc016f9c889addfdd2d378820cd6d6fbf0df8666dd7a79a7c8`。
+
+### 2026-10-13: canonical triangle-pair cache A/B
+
+現行14,696粒子sceneで、contact cache導入直前の作業treeとcanonical pair cache導入後を
+同じHeadless Chrome 155 / macOS / Apple Metal 3 adapterで比較した。fallbackなし、
+`timestamp-query`あり。220×150 cells、cellSize 10、`dt=1/240`、重力 `(0,90)`、
+描画なし、14,696 active / 1,000,000 capacity。各runは64 step warmup後に600 msの
+無重力stationary warmupを行い、12個の8-step batchを測定した。stationary warmupのstep数は
+runごとに異なるため、median-of-runsで比較する。通常batchは固定 `dt` の `stepBatch()` を直接測り、
+interactive pageのCFL scheduler、描画、end-to-end frame rateは含まない。
+
+| 指標 | cache導入前 | canonical cache後 |
+|---|---:|---:|
+| 5 runのGPU median (ms/step) | 0.688128, 0.663552, 0.688128, 0.679936, 0.679936 | 0.557056 × 5 |
+| run medianの中央値 (ms/step) | 0.679936 | 0.557056 |
+| run p95の中央値 (ms/step) | 0.696320 | 0.565248 |
+| GPU buffer確保量 | 226,960,308 byte | 231,154,612 byte (+4,194,304 byte) |
+| 通常batchのcompute pass / 8-step batch | 1 | 1 |
+
+通常batch medianは **18.1%**、run p95 medianは **18.8%**短縮した。診断用 `stages`
+profileはdispatchごとにpassを分けるため通常batch時間と直接比較しない。そのprofileでは
+8-step当たり96から104 passへ増え、step interval medianは0.745472から0.614400 ms。
+contact関連stageの合計は、gather 0.163840 + apply 0.188416 = 0.352256 ms/stepから、
+state gather 0.008192 + canonical pair gather 0.131072 + apply 0.147456 =
+0.286720 ms/stepへ減った。`buildTriangleField`は変更前0.155648、変更後0.139264 ms/stepで、
+全node×body探索は残る。
+
+cacheは最大512 active bonded bodies、4 MiBのbounded storage bufferを使う。接触式・skin・
+impulse relaxationは変えず、各unordered pairのSAT結果を一度だけ計算し、cacheへ保存する。
+pair passはcontact countを両bodyへatomic加算し、後続passが同じcontact recordを反対向きの
+normalへ変換して再利用する。512 bodies超または初期triangle bodyなしではcacheを使わず、
+従来のdirect pair scanへfallbackする。cache利用時のstorage binding要件は7 buffers/stage。
+本sceneの追加確保量は4 MiBだった。
+
+GPU acceptanceでは、三角形3 body / 9粒子の重なりfixtureを4 step実行し、CPU参照との差
+最大0.000380862、運動量残差0.000018731、kinetic energy 1.2から0.080418への低下を確認した。
+既存の5材料45粒子/8 step parity最大差は0.000013955、水・油contactとfracture fixtureも通過した。
+これは小規模fixtureの受け入れであり、scene全体のCPU比較、mobile/長時間性能や
+全sceneのcontact品質を保証しない。200 pebbleのSAT narrow phaseは削減したがpair candidate列挙と
+triangle fieldの `O(G·B)` 探索は残る。spatial broad-phaseは
+[ロードマップP5](./ROADMAP-MLS-MPM-PERFORMANCE.md)で別途扱う。
+
+### 2026-10-14: tile field candidates and pair traversal
+
+Headless Chrome 154 / macOS / Apple Metal 3、fallbackなし、`timestamp-query`あり。
+Gate 4の14,696 active / 1,000,000 capacity、220×150 cells、cellSize 10、`dt=1/240`、
+重力 `(0,90)`、描画なし。各runは64 warmup steps、600 ms stationary warmup後に
+12×8-step batchesを測定した。`profile=batch`は通常の1 compute pass/batch。
+初期値は既存のcanonical pair/gather最適化後、zero-degree skip・workgroup field cache・
+active-pair bitset・tile field indexを加える前の測定である。
+
+| 指標 | 追加最適化前 | 最終worktree |
+|---|---:|---:|
+| `profile=batch` GPU median / p95 (ms/step) | 0.443565 / 0.445080 | 0.231175 / 0.258003 |
+| `applyTrianglePairContacts` median (ms/step) | 0.142011 | 0.013213 |
+| field-related stages median (ms/step) | `buildTriangleField` 0.139653 | candidates 0.028062 + field 0.022609 |
+| allocated GPU buffers | 231,154,612 byte | 231,196,340 byte |
+
+通常batchのmedianは約47.9%低下した。field候補生成＋fieldのstage median合計は
+索引前のfield stageより約63.7%低下し、pair applyは約90.7%低下した。
+診断用 `profile=stages` はpassを104から112へ分割したため、profile合計同士は比較しない。
+stageごとのp95には実行環境のばらつきがあり、batch p95も反復run間で一貫していない。
+
+tile indexは16×16 node tileあたり512 body bitsetを使用し、Gate 4では8,960 bytesを追加する。
+512 body超はfull field scanへfallbackする。pair cacheは最大4 MiB、pair-candidate bitsetは
+最大32 KiB。小規模water/oil、triangle-pair、fracture acceptanceと188 unit tests、
+`npm run check`、`npm run build`は通過した。ただし全field nodeのbrute-force differential oracle、
+scene-scale接触品質、mobile GPU、CFL/readback/render込みのruntime queue latencyは未検証。
+
+ベンチマーク前のbase revisionは `c44ba71`（clean worktree）、最適化後は同revision上の変更済みworktree。
+layout / shaders / solverのSHA-256は変更前
+`8d25eb5f47867b544094b0c5b4d6ab244da0cee480169d59fccacb2eb9d63129` /
+`ac2cd787923d047d4b7517f29c500b00771f4b08395d8c6a88c8f6617581f92e` /
+`4271f5d909c7d4c190683e36590ae8c1017a3b44c5236220d77663966666b3e7`、
+変更後
+`4629aba6dd57eafddcb65347f5fcbc1e1d92758e7645cfa934c93086bbec2ed5` /
+`f7d344a157d2e7bb4b86a3939265d95f2e6fd0752d371636ff19b329907bb846` /
+`f11c6e55b520ca314060b2c1a5bf0b571264881c4d7a3a9fe220237171083b30`。
 
 ## 6. 参照
 

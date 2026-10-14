@@ -355,12 +355,14 @@ describe('GPU MLS-MPM batch encoding', () => {
 				'prepareParticles',
 				'buildBuckets',
 				'p2g',
+				'buildTriangleFieldCandidates',
 				'buildTriangleField',
 				'updateGrid',
 				'g2p',
 				'applyTriangleContactImpulses',
 				'solveBondedTriangles',
 				'gatherTriangleContactStates',
+				'gatherTrianglePairContacts',
 				'applyTrianglePairContacts',
 				'validateCflParticles',
 				'commitParticles',
@@ -752,25 +754,217 @@ describe('GPU MLS-MPM batch encoding', () => {
 			'MLS-MPM prepareParticles pipeline',
 			'MLS-MPM buildBuckets pipeline',
 			'MLS-MPM p2g pipeline',
+			'MLS-MPM buildTriangleFieldCandidates pipeline',
 			'MLS-MPM buildTriangleField pipeline',
 			'MLS-MPM updateGrid pipeline',
 			'MLS-MPM g2p pipeline',
 			'MLS-MPM applyTriangleContactImpulses pipeline',
 			'MLS-MPM solveBondedTriangles pipeline',
 			'MLS-MPM gatherTriangleContactStates pipeline',
+			'MLS-MPM gatherTrianglePairContacts pipeline',
 			'MLS-MPM applyTrianglePairContacts pipeline',
 			'MLS-MPM commitParticles pipeline'
 		]);
 		expect(gpu.buffers.find(({ label }) => label.includes('triangle contact field'))?.size).toBe(
 			209 * 32
 		);
+		expect(
+			gpu.buffers.find(({ label }) => label.includes('triangle field candidate bitset'))?.size
+		).toBe(128);
 		expect(gpu.buffers.find(({ label }) => label.includes('bonded triangle body indices'))?.size).toBe(
 			2 * Uint32Array.BYTES_PER_ELEMENT
 		);
 		expect(gpu.buffers.find(({ label }) => label.includes('triangle-pair contact states'))?.size).toBe(
 			2 * 4 * Float32Array.BYTES_PER_ELEMENT
 		);
+		expect(gpu.buffers.find(({ label }) => label.includes('triangle-pair contact cache'))?.size).toBe(
+			2 * 2 * 4 * Float32Array.BYTES_PER_ELEMENT
+		);
 		solver.dispose();
+	});
+
+	it('falls back to a full field scan above the explicit spatial-candidate body limit', async () => {
+		const bodyCount = 513;
+		const particles = Array.from({ length: bodyCount }, (_, objectIndex) =>
+			BONDED_TRIANGLE_PARTICLES.map((particle) => ({
+				...particle,
+				objectId: 100 + objectIndex
+			}))
+		).flat();
+		const gpu = setupDevice();
+		const solver = await createMpmMlsGpuSolver(CANVAS, particles, {
+			...CONFIG,
+			capacity: particles.length,
+			bondRestLength: 0.6
+		});
+
+		solver.step(0.001, { x: 0, y: 0 });
+
+		expect(
+			gpu.dispatches.some(
+				({ pipeline }) => pipeline === 'MLS-MPM buildTriangleFieldCandidates pipeline'
+			)
+		).toBe(false);
+		expect(
+			gpu.dispatches.some(
+				({ pipeline }) => pipeline === 'MLS-MPM buildTriangleField pipeline'
+			)
+		).toBe(true);
+		solver.dispose();
+	});
+
+	it('shares triangle geometry per workgroup and scans conservative field candidates in body order', () => {
+		const candidateStart = MLS_MPM_COMPUTE_WGSL.indexOf(
+			'fn buildTriangleFieldCandidates('
+		);
+		const fieldStart = MLS_MPM_COMPUTE_WGSL.indexOf('fn buildTriangleField(');
+		const fieldEnd = MLS_MPM_COMPUTE_WGSL.indexOf('\nfn applyWallCushion(', fieldStart);
+		const candidateShader = MLS_MPM_COMPUTE_WGSL.slice(candidateStart, fieldStart);
+		const fieldShader = MLS_MPM_COMPUTE_WGSL.slice(fieldStart, fieldEnd);
+		const publishBarrier = fieldShader.indexOf('workgroupBarrier();');
+		const candidateScan = fieldShader.indexOf(
+			'while (candidateWord != 0u && !failed)'
+		);
+		const candidateIndexExtraction = fieldShader.indexOf(
+			'countTrailingZeros(candidateWord)'
+		);
+		const candidateMaskClear = fieldShader.indexOf(
+			'candidateWord = candidateWord & (candidateWord - 1u);'
+		);
+		const nodeAabbTest = fieldShader.indexOf(
+			'if (dot(outside, outside) > params.bonding.z * params.bonding.z)'
+		);
+		const reuseBarrier = fieldShader.indexOf(
+			'workgroupBarrier();',
+			publishBarrier + 1
+		);
+
+		expect(candidateStart).toBeGreaterThanOrEqual(0);
+		expect(fieldStart).toBeGreaterThanOrEqual(0);
+		expect(fieldEnd).toBeGreaterThan(fieldStart);
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			'const TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT: u32 = 512u;'
+		);
+		expect(candidateShader).toContain(
+			'dot(outside, outside) <= params.bonding.z * params.bonding.z'
+		);
+		expect(candidateShader).toContain(
+			'triangleFieldCandidates[outputIndex] = candidateWord;'
+		);
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			'var<workgroup> triangleFieldBodyCache: array<TriangleFieldBody, 64>;'
+		);
+		expect(fieldShader).toContain(
+			'@builtin(local_invocation_index) localIndex: u32'
+		);
+		expect(fieldShader).toContain('let cachedBodyIndex = bodyChunkStart + localIndex;');
+		expect(fieldShader).toContain('triangleFieldBodyCache[localIndex] = TriangleFieldBody(');
+		expect(publishBarrier).toBeGreaterThanOrEqual(0);
+		expect(candidateScan).toBeGreaterThan(publishBarrier);
+		expect(candidateIndexExtraction).toBeGreaterThan(candidateScan);
+		expect(candidateMaskClear).toBeGreaterThan(candidateIndexExtraction);
+		expect(nodeAabbTest).toBeGreaterThan(candidateMaskClear);
+		expect(reuseBarrier).toBeGreaterThan(candidateScan);
+		expect(fieldShader).toContain('let bodyIndex = bodyChunkStart + bodyOffset;');
+		expect(fieldShader).toContain('if (bodyIndex >= params.counts.w) {');
+		expect(fieldShader).toContain(
+			'if (params.counts.w <= TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT) {'
+		);
+		expect(fieldShader).toContain('var candidateWord0 = 0xffffffffu;');
+		expect(fieldShader).toContain('var candidateWord1 = 0xffffffffu;');
+		expect(fieldShader).toContain('triangleDistanceSample(');
+		expect(fieldShader).toContain('if (sample.signedDistance < bestDistance) {');
+	});
+
+	it('dispatches pair contact gathering across the full bounded body-pair grid', async () => {
+		const bodyCount = 9;
+		const particles = Array.from({ length: bodyCount }, (_, objectIndex) =>
+			BONDED_TRIANGLE_PARTICLES.map((particle) => ({
+				...particle,
+				objectId: 100 + objectIndex
+			}))
+		).flat();
+		const gpu = setupDevice();
+		const solver = await createMpmMlsGpuSolver(CANVAS, particles, {
+			...CONFIG,
+			capacity: particles.length,
+			bondRestLength: 0.6
+		});
+
+		solver.step(0.001, { x: 0, y: 0 });
+
+		expect(
+			gpu.dispatches.find(
+				({ pipeline }) => pipeline === 'MLS-MPM gatherTrianglePairContacts pipeline'
+			)
+		).toMatchObject({
+			workgroups: Math.ceil((bodyCount * bodyCount) / 64)
+		});
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			'if (pairIndex >= bodyCount * bodyCount) {'
+		);
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			'let bodyIndex = pairIndex / bodyCount;'
+		);
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			'let otherIndex = pairIndex % bodyCount;'
+		);
+		expect(MLS_MPM_COMPUTE_WGSL).toContain('bodyIndex >= otherIndex');
+		solver.dispose();
+	});
+
+	it('traverses exact cached contacts in order and skips zero-degree pair scans', () => {
+		const applyStart = MLS_MPM_COMPUTE_WGSL.indexOf(
+			'fn applyTrianglePairContacts('
+		);
+		const applyEnd = MLS_MPM_COMPUTE_WGSL.indexOf('\n@compute', applyStart);
+		const applyShader = MLS_MPM_COMPUTE_WGSL.slice(applyStart, applyEnd);
+		const ownBodyValidation = applyShader.indexOf(
+			'particlesOut[bodyStart].bondedTriangleVertex != 1u'
+		);
+		const zeroDegreeFastPath = applyShader.indexOf(
+			'if (bodyContactCount == 0u) {'
+		);
+		const candidateMaskLoop = applyShader.indexOf(
+			'candidateWord == 0u'
+		);
+		const candidateIndexExtraction = applyShader.indexOf(
+			'countTrailingZeros(candidateWord)'
+		);
+		const uncachedFallback = applyShader.indexOf(
+			'fallbackIndex >= params.counts.w'
+		);
+		const cachedNonContact = applyShader.indexOf(
+			'if (cachedContact.z <= 0.0) {'
+		);
+		const peerBodyValidation = applyShader.indexOf(
+			'let otherStart = bondedBodyStarts[otherIndex];'
+		);
+
+		expect(applyStart).toBeGreaterThanOrEqual(0);
+		expect(applyEnd).toBeGreaterThan(applyStart);
+		expect(ownBodyValidation).toBeGreaterThanOrEqual(0);
+		expect(zeroDegreeFastPath).toBeGreaterThan(ownBodyValidation);
+		expect(candidateMaskLoop).toBeGreaterThan(zeroDegreeFastPath);
+		expect(candidateIndexExtraction).toBeGreaterThan(candidateMaskLoop);
+		expect(uncachedFallback).toBeGreaterThan(candidateIndexExtraction);
+		expect(cachedNonContact).toBeGreaterThanOrEqual(0);
+		expect(peerBodyValidation).toBeGreaterThan(cachedNonContact);
+		expect(applyShader).toContain(
+			'candidateWord = candidateWord & (candidateWord - 1u);'
+		);
+		expect(applyShader).toContain('contactDegree == 0u');
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			'trianglePairContactCandidates[bodyIndex * candidateWordCount + wordIndex]'
+		);
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			'trianglePairContactCandidates[bodyCandidateWord]'
+		);
+		expect(applyShader).toContain(
+			'if (particleObjectIds[otherStart] == objectId) {'
+		);
+		expect(applyShader).toContain('!finiteVec2(particles[vertex].position)');
+		expect(applyShader).toContain('confineAxis(');
 	});
 
 	describe('GPU MLS-MPM free-surface rendering', () => {

@@ -316,6 +316,7 @@ interface MpmMlsGpuPipelines {
 	readonly clearSurfaceOccupancy: GPUComputePipeline;
 	readonly prepareParticles: GPUComputePipeline;
 	readonly buildBuckets: GPUComputePipeline;
+	readonly buildTriangleFieldCandidates: GPUComputePipeline;
 	readonly buildTriangleField: GPUComputePipeline;
 	readonly gatherSurfaceOccupancy: GPUComputePipeline;
 	readonly p2g: GPUComputePipeline;
@@ -327,6 +328,7 @@ interface MpmMlsGpuPipelines {
 	readonly applyTriangleContactImpulses: GPUComputePipeline;
 	readonly solveBondedTriangles: GPUComputePipeline;
 	readonly gatherTriangleContactStates: GPUComputePipeline;
+	readonly gatherTrianglePairContacts: GPUComputePipeline;
 	readonly applyTrianglePairContacts: GPUComputePipeline;
 	readonly updateFractureBonds: GPUComputePipeline;
 	readonly applyFractureParticleDamage: GPUComputePipeline;
@@ -342,6 +344,7 @@ interface MpmMlsGpuStepBindings {
 	readonly gatherSurfaceOccupancy: GPUBindGroup;
 	readonly prepareParticles: GPUBindGroup;
 	readonly buildBuckets: GPUBindGroup;
+	readonly buildTriangleFieldCandidates: GPUBindGroup;
 	readonly buildTriangleField: GPUBindGroup;
 	readonly p2g: GPUBindGroup;
 	readonly updateGrid: GPUBindGroup;
@@ -351,6 +354,7 @@ interface MpmMlsGpuStepBindings {
 	readonly applyTriangleContactImpulses: GPUBindGroup;
 	readonly solveBondedTriangles: GPUBindGroup;
 	readonly gatherTriangleContactStates: GPUBindGroup;
+	readonly gatherTrianglePairContacts: GPUBindGroup;
 	readonly applyTrianglePairContacts: GPUBindGroup;
 	readonly updateFractureBonds: GPUBindGroup;
 	readonly applyFractureParticleDamage: GPUBindGroup;
@@ -511,9 +515,12 @@ interface MpmMlsGpuRuntime {
 		readonly bucketNext: GPUBuffer;
 		readonly gridNodes: GPUBuffer;
 		readonly surfaceFields: GPUBuffer;
+		readonly triangleFieldCandidates: GPUBuffer;
 		readonly triangleFieldNodes: GPUBuffer;
 		readonly bondedBodyStarts: GPUBuffer;
 		readonly triangleContactStates: GPUBuffer;
+		readonly trianglePairContactCache: GPUBuffer;
+		readonly trianglePairContactCandidates: GPUBuffer;
 		readonly fractureBonds: GPUBuffer;
 		readonly fractureBondTopology: GPUBuffer;
 		readonly preparedAffines: GPUBuffer;
@@ -564,6 +571,11 @@ async function createRuntime(
 		),
 		prepareParticles: await createComputePipeline(device, computeModule, 'prepareParticles'),
 		buildBuckets: await createComputePipeline(device, computeModule, 'buildBuckets'),
+		buildTriangleFieldCandidates: await createComputePipeline(
+			device,
+			computeModule,
+			'buildTriangleFieldCandidates'
+		),
 		buildTriangleField: await createComputePipeline(
 			device,
 			computeModule,
@@ -606,6 +618,11 @@ async function createRuntime(
 			device,
 			computeModule,
 			'gatherTriangleContactStates'
+		),
+		gatherTrianglePairContacts: await createComputePipeline(
+			device,
+			computeModule,
+			'gatherTrianglePairContacts'
 		),
 		applyTrianglePairContacts: await createComputePipeline(
 			device,
@@ -696,6 +713,11 @@ async function createRuntime(
 			layout.surfaceFieldBytes,
 			BUFFER_USAGE.STORAGE
 		),
+		triangleFieldCandidates: createBuffer(
+			'MLS-MPM triangle field candidate bitset',
+			layout.triangleFieldCandidateBytes,
+			BUFFER_USAGE.STORAGE
+		),
 		triangleFieldNodes: createBuffer(
 			'MLS-MPM triangle contact field',
 			layout.triangleFieldBytes,
@@ -709,6 +731,16 @@ async function createRuntime(
 		triangleContactStates: createBuffer(
 			'MLS-MPM triangle-pair contact states',
 			layout.triangleContactStateBytes,
+			BUFFER_USAGE.STORAGE
+		),
+		trianglePairContactCache: createBuffer(
+			'MLS-MPM triangle-pair contact cache',
+			layout.trianglePairContactCacheBytes,
+			BUFFER_USAGE.STORAGE
+		),
+		trianglePairContactCandidates: createBuffer(
+			'MLS-MPM triangle-pair contact candidate bitset',
+			layout.trianglePairContactCandidateBytes,
 			BUFFER_USAGE.STORAGE
 		),
 		fractureBonds: createBuffer(
@@ -870,6 +902,16 @@ async function createRuntime(
 			bufferEntry(4, buffers.bucketNext),
 			bufferEntry(6, buffers.stateError)
 		]);
+		const buildTriangleFieldCandidates = createBindGroup(
+			device,
+			pipelines.buildTriangleFieldCandidates,
+			[
+				bufferEntry(0, buffers.simulationParams),
+				bufferEntry(1, input),
+				bufferEntry(17, buffers.bondedBodyStarts),
+				bufferEntry(28, buffers.triangleFieldCandidates)
+			]
+		);
 		const buildTriangleField = createBindGroup(
 			device,
 			pipelines.buildTriangleField,
@@ -878,7 +920,8 @@ async function createRuntime(
 				bufferEntry(1, input),
 				bufferEntry(6, buffers.stateError),
 				bufferEntry(16, buffers.triangleFieldNodes),
-				bufferEntry(17, buffers.bondedBodyStarts)
+				bufferEntry(17, buffers.bondedBodyStarts),
+				bufferEntry(28, buffers.triangleFieldCandidates)
 			]
 		);
 		const gatherSurfaceOccupancy = createBindGroup(
@@ -969,7 +1012,22 @@ async function createRuntime(
 				bufferEntry(6, buffers.stateError),
 				bufferEntry(8, buffers.particleObjectIds),
 				bufferEntry(17, buffers.bondedBodyStarts),
-				bufferEntry(25, buffers.triangleContactStates)
+				bufferEntry(25, buffers.triangleContactStates),
+				bufferEntry(27, buffers.trianglePairContactCandidates)
+			]
+		);
+		const gatherTrianglePairContacts = createBindGroup(
+			device,
+			pipelines.gatherTrianglePairContacts,
+			[
+				bufferEntry(0, buffers.simulationParams),
+				bufferEntry(1, input),
+				bufferEntry(6, buffers.stateError),
+				bufferEntry(8, buffers.particleObjectIds),
+				bufferEntry(17, buffers.bondedBodyStarts),
+				bufferEntry(25, buffers.triangleContactStates),
+				bufferEntry(26, buffers.trianglePairContactCache),
+				bufferEntry(27, buffers.trianglePairContactCandidates)
 			]
 		);
 		const applyTrianglePairContacts = createBindGroup(
@@ -982,7 +1040,9 @@ async function createRuntime(
 				bufferEntry(6, buffers.stateError),
 				bufferEntry(8, buffers.particleObjectIds),
 				bufferEntry(17, buffers.bondedBodyStarts),
-				bufferEntry(25, buffers.triangleContactStates)
+				bufferEntry(25, buffers.triangleContactStates),
+				bufferEntry(26, buffers.trianglePairContactCache),
+				bufferEntry(27, buffers.trianglePairContactCandidates)
 			]
 		);
 		const updateFractureBonds = createBindGroup(
@@ -1038,6 +1098,7 @@ async function createRuntime(
 			gatherSurfaceOccupancy,
 			prepareParticles,
 			buildBuckets,
+			buildTriangleFieldCandidates,
 			buildTriangleField,
 			p2g,
 			updateGrid,
@@ -1047,6 +1108,7 @@ async function createRuntime(
 			applyTriangleContactImpulses,
 			solveBondedTriangles,
 			gatherTriangleContactStates,
+			gatherTrianglePairContacts,
 			applyTrianglePairContacts,
 			updateFractureBonds,
 			applyFractureParticleDamage,
@@ -1261,11 +1323,19 @@ function createSolver(
 				);
 				dispatchCompute(pass, runtime.pipelines.p2g, groups.p2g, layout.nodeCount);
 				if (bondedBodyCount > 0) {
+					if (bondedBodyCount <= layout.triangleFieldCandidateBodyLimit) {
+						dispatchCompute(
+							pass,
+							runtime.pipelines.buildTriangleFieldCandidates,
+							groups.buildTriangleFieldCandidates,
+							layout.triangleFieldCandidateWordCount
+						);
+					}
 					dispatchCompute(
 						pass,
 						runtime.pipelines.buildTriangleField,
 						groups.buildTriangleField,
-						bondedBodyCount > 0 ? layout.nodeCount : 0
+						layout.nodeCount
 					);
 				}
 				dispatchCompute(
@@ -1299,6 +1369,14 @@ function createSolver(
 						groups.gatherTriangleContactStates,
 						bondedBodyCount
 					);
+					if (bondedBodyCount <= layout.trianglePairContactCacheCapacity) {
+						dispatchCompute(
+							pass,
+							runtime.pipelines.gatherTrianglePairContacts,
+							groups.gatherTrianglePairContacts,
+							bondedBodyCount * bondedBodyCount
+						);
+					}
 					dispatchCompute(
 						pass,
 						runtime.pipelines.applyTrianglePairContacts,

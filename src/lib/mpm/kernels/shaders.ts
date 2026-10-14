@@ -36,9 +36,19 @@ struct TriangleFieldNode {
 	impulse: vec2<f32>,
 }
 
+struct TriangleFieldBody {
+	first: vec2<f32>,
+	second: vec2<f32>,
+	third: vec2<f32>,
+	minimum: vec2<f32>,
+	maximum: vec2<f32>,
+	bodyStart: u32,
+	valid: u32,
+}
+
 struct TriangleContactState {
 	velocity: vec2<f32>,
-	contactCount: u32,
+	contactCount: atomic<u32>,
 	padding: u32,
 }
 
@@ -116,8 +126,12 @@ const WALL_CUSHION_CELLS: f32 = 8.0;
 @group(0) @binding(23) var<storage, read_write> outletRemovalCounter: array<atomic<u32>>;
 @group(0) @binding(24) var<storage, read_write> cflStepProgress: array<atomic<u32>>;
 @group(0) @binding(25) var<storage, read_write> triangleContactStates: array<TriangleContactState>;
+@group(0) @binding(26) var<storage, read_write> trianglePairContactCache: array<vec4<f32>>;
+@group(0) @binding(27) var<storage, read_write> trianglePairContactCandidates: array<atomic<u32>>;
+@group(0) @binding(28) var<storage, read_write> triangleFieldCandidates: array<u32>;
 
 var<workgroup> cflSpeedReduction: array<f32, 64>;
+var<workgroup> triangleFieldBodyCache: array<TriangleFieldBody, 64>;
 
 const ERROR_STENCIL: u32 = 1u;
 const ERROR_DEFORMATION: u32 = 2u;
@@ -137,6 +151,13 @@ const ERROR_FRACTURE_BOND: u32 = 32768u;
 const BONDED_TRIANGLE_SOLVER_ITERATIONS: u32 = 2u;
 const TRIANGLE_CONTACT_SKIN_CELLS: f32 = 0.1;
 const TRIANGLE_CONTACT_IMPULSE_RELAXATION: f32 = 0.25;
+const TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT: u32 = 512u;
+const TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS: u32 = 32u;
+const TRIANGLE_FIELD_CANDIDATE_TILE_SIZE: u32 = 16u;
+const TRIANGLE_FIELD_CANDIDATE_WORDS_PER_TILE: u32 =
+	(TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT + TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS - 1u) /
+	TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS;
+const TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS: u32 = 32u;
 const SURFACE_ERROR_BUCKET: u32 = 1u;
 const SURFACE_ERROR_PARTICLE_AREA: u32 = 2u;
 const SURFACE_ERROR_ACCUMULATION: u32 = 4u;
@@ -1009,11 +1030,92 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 }
 
 @compute @workgroup_size(64)
-fn buildTriangleField(@builtin(global_invocation_id) invocation: vec3<u32>) {
-	let index = invocation.x;
-	if (index >= params.counts.y || atomicLoad(&stateError[0]) != 0u) {
+fn buildTriangleFieldCandidates(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let outputIndex = invocation.x;
+	let tileColumns =
+		(params.grid.z + TRIANGLE_FIELD_CANDIDATE_TILE_SIZE - 1u) /
+		TRIANGLE_FIELD_CANDIDATE_TILE_SIZE;
+	let tileRows =
+		(params.grid.w + TRIANGLE_FIELD_CANDIDATE_TILE_SIZE - 1u) /
+		TRIANGLE_FIELD_CANDIDATE_TILE_SIZE;
+	let candidateWordCount =
+		tileColumns * tileRows * TRIANGLE_FIELD_CANDIDATE_WORDS_PER_TILE;
+	if (outputIndex >= candidateWordCount) {
 		return;
 	}
+
+	let tileIndex = outputIndex / TRIANGLE_FIELD_CANDIDATE_WORDS_PER_TILE;
+	let bodyWord = outputIndex % TRIANGLE_FIELD_CANDIDATE_WORDS_PER_TILE;
+	let tileColumn = tileIndex % tileColumns;
+	let tileRow = tileIndex / tileColumns;
+	let tileStorageMinimum = vec2<u32>(
+		tileColumn * TRIANGLE_FIELD_CANDIDATE_TILE_SIZE,
+		tileRow * TRIANGLE_FIELD_CANDIDATE_TILE_SIZE,
+	);
+	let tileStorageMaximum =
+		min(
+			tileStorageMinimum + vec2<u32>(TRIANGLE_FIELD_CANDIDATE_TILE_SIZE),
+			params.grid.zw,
+		) - vec2<u32>(1u);
+	let tileNodeMinimum = vec2<i32>(tileStorageMinimum) - vec2<i32>(1);
+	let tileNodeMaximum = vec2<i32>(tileStorageMaximum) - vec2<i32>(1);
+	let tileMinimum =
+		vec2<f32>(tileNodeMinimum) * params.physical.x;
+	let tileMaximum =
+		vec2<f32>(tileNodeMaximum) * params.physical.x;
+	var candidateWord = 0u;
+
+	if (params.counts.w <= TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT) {
+		for (
+			var bodyLane = 0u;
+			bodyLane < TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS;
+			bodyLane += 1u
+		) {
+			let bodyIndex =
+				bodyWord * TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS + bodyLane;
+			if (bodyIndex >= params.counts.w) {
+				break;
+			}
+
+			let bodyStart = bondedBodyStarts[bodyIndex];
+			if (bodyStart + 2u >= params.counts.x) {
+				candidateWord |= 1u << bodyLane;
+				continue;
+			}
+
+			let first = particlesIn[bodyStart].position;
+			let second = particlesIn[bodyStart + 1u].position;
+			let third = particlesIn[bodyStart + 2u].position;
+			if (!finiteVec2(first) || !finiteVec2(second) || !finiteVec2(third)) {
+				candidateWord |= 1u << bodyLane;
+				continue;
+			}
+
+			let minimum = min(first, min(second, third));
+			let maximum = max(first, max(second, third));
+			// The tile interval encloses every node point, so its AABB distance is conservative.
+			let outside = max(
+				max(minimum - tileMaximum, vec2<f32>(0.0)),
+				tileMinimum - maximum,
+			);
+			if (dot(outside, outside) <= params.bonding.z * params.bonding.z) {
+				candidateWord |= 1u << bodyLane;
+			}
+		}
+	}
+
+	// One invocation owns each tile/body-word entry, so every consumed word is fully overwritten.
+	triangleFieldCandidates[outputIndex] = candidateWord;
+}
+
+@compute @workgroup_size(64)
+fn buildTriangleField(
+	@builtin(global_invocation_id) invocation: vec3<u32>,
+	@builtin(local_invocation_index) localIndex: u32,
+) {
+	let index = invocation.x;
+	let fieldActive =
+		index < params.counts.y && atomicLoad(&stateError[0]) == 0u;
 	let nodeStorage = vec2<u32>(index % params.grid.z, index / params.grid.z);
 	let nodeCoordinate = vec2<i32>(i32(nodeStorage.x) - 1, i32(nodeStorage.y) - 1);
 	let point = vec2<f32>(nodeCoordinate) * params.physical.x;
@@ -1021,41 +1123,125 @@ fn buildTriangleField(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	var bestBodyStartPlusOne = 0u;
 	var bestNormal = vec2<f32>(0.0, 0.0);
 	var bestBarycentric = vec2<f32>(0.0, 0.0);
+	var failed = false;
+	let candidateTileColumns =
+		(params.grid.z + TRIANGLE_FIELD_CANDIDATE_TILE_SIZE - 1u) /
+		TRIANGLE_FIELD_CANDIDATE_TILE_SIZE;
+	let candidateTileIndex =
+		(nodeStorage.y / TRIANGLE_FIELD_CANDIDATE_TILE_SIZE) * candidateTileColumns +
+		nodeStorage.x / TRIANGLE_FIELD_CANDIDATE_TILE_SIZE;
 
-	for (var bodyIndex = 0u; bodyIndex < params.counts.w; bodyIndex += 1u) {
-		let bodyStart = bondedBodyStarts[bodyIndex];
-		if (bodyStart + 2u >= params.counts.x) {
-			atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
-			return;
-		}
-		let first = particlesIn[bodyStart].position;
-		let second = particlesIn[bodyStart + 1u].position;
-		let third = particlesIn[bodyStart + 2u].position;
-		let minimum = min(first, min(second, third));
-		let maximum = max(first, max(second, third));
-		let outside = max(max(minimum - point, vec2<f32>(0.0)), point - maximum);
-		if (dot(outside, outside) > params.bonding.z * params.bonding.z) {
-			continue;
+	// Stage each chunk once per workgroup; candidate words retain ascending body order.
+	for (var bodyChunkStart = 0u; bodyChunkStart < params.counts.w; bodyChunkStart += 64u) {
+		let cachedBodyIndex = bodyChunkStart + localIndex;
+		if (cachedBodyIndex < params.counts.w) {
+			let bodyStart = bondedBodyStarts[cachedBodyIndex];
+			if (bodyStart + 2u >= params.counts.x) {
+				triangleFieldBodyCache[localIndex] = TriangleFieldBody(
+					vec2<f32>(0.0),
+					vec2<f32>(0.0),
+					vec2<f32>(0.0),
+					vec2<f32>(0.0),
+					vec2<f32>(0.0),
+					bodyStart,
+					0u,
+				);
+			} else {
+				let first = particlesIn[bodyStart].position;
+				let second = particlesIn[bodyStart + 1u].position;
+				let third = particlesIn[bodyStart + 2u].position;
+				triangleFieldBodyCache[localIndex] = TriangleFieldBody(
+					first,
+					second,
+					third,
+					min(first, min(second, third)),
+					max(first, max(second, third)),
+					bodyStart,
+					1u,
+				);
+			}
 		}
 
-		let sample = triangleDistanceSample(point, first, second, third);
-		if (sample.valid == 0u) {
-			atomicMin(&stateError[1], bodyStart);
-			atomicOr(&stateError[0], ERROR_TRIANGLE_CONTACT);
-			return;
+		workgroupBarrier();
+		if (fieldActive && !failed) {
+			var candidateWord0 = 0xffffffffu;
+			var candidateWord1 = 0xffffffffu;
+			if (params.counts.w <= TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT) {
+				let candidateWordIndex =
+					candidateTileIndex * TRIANGLE_FIELD_CANDIDATE_WORDS_PER_TILE +
+					bodyChunkStart / TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS;
+				candidateWord0 = triangleFieldCandidates[candidateWordIndex];
+				candidateWord1 = 0u;
+				if (bodyChunkStart + TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS < params.counts.w) {
+					candidateWord1 = triangleFieldCandidates[candidateWordIndex + 1u];
+				}
+			}
+
+			for (
+				var candidateWordOffset = 0u;
+				candidateWordOffset < 2u && !failed;
+				candidateWordOffset += 1u
+			) {
+				var candidateWord = select(
+					candidateWord0,
+					candidateWord1,
+					candidateWordOffset == 1u,
+				);
+				while (candidateWord != 0u && !failed) {
+					let bodyOffset =
+						candidateWordOffset * TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS +
+						countTrailingZeros(candidateWord);
+					candidateWord = candidateWord & (candidateWord - 1u);
+					let bodyIndex = bodyChunkStart + bodyOffset;
+					if (bodyIndex >= params.counts.w) {
+						break;
+					}
+
+					let body = triangleFieldBodyCache[bodyOffset];
+					if (body.valid == 0u) {
+						atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
+						failed = true;
+						break;
+					}
+					let outside = max(
+						max(body.minimum - point, vec2<f32>(0.0)),
+						point - body.maximum,
+					);
+					if (dot(outside, outside) > params.bonding.z * params.bonding.z) {
+						continue;
+					}
+
+					let sample = triangleDistanceSample(
+						point,
+						body.first,
+						body.second,
+						body.third,
+					);
+					if (sample.valid == 0u) {
+						atomicMin(&stateError[1], body.bodyStart);
+						atomicOr(&stateError[0], ERROR_TRIANGLE_CONTACT);
+						failed = true;
+						break;
+					}
+					if (sample.signedDistance < bestDistance) {
+						bestDistance = sample.signedDistance;
+						bestBodyStartPlusOne = body.bodyStart + 1u;
+						bestNormal = sample.normal;
+						bestBarycentric = sample.barycentric;
+					}
+				}
+			}
 		}
-		if (sample.signedDistance < bestDistance) {
-			bestDistance = sample.signedDistance;
-			bestBodyStartPlusOne = bodyStart + 1u;
-			bestNormal = sample.normal;
-			bestBarycentric = sample.barycentric;
-		}
+		workgroupBarrier();
 	}
-	triangleFieldNodes[index].signedDistance = bestDistance;
-	triangleFieldNodes[index].bodyStartPlusOne = bestBodyStartPlusOne;
-	triangleFieldNodes[index].normal = bestNormal;
-	triangleFieldNodes[index].barycentric = bestBarycentric;
-	triangleFieldNodes[index].impulse = vec2<f32>(0.0, 0.0);
+
+	if (fieldActive && !failed) {
+		triangleFieldNodes[index].signedDistance = bestDistance;
+		triangleFieldNodes[index].bodyStartPlusOne = bestBodyStartPlusOne;
+		triangleFieldNodes[index].normal = bestNormal;
+		triangleFieldNodes[index].barycentric = bestBarycentric;
+		triangleFieldNodes[index].impulse = vec2<f32>(0.0, 0.0);
+	}
 }
 
 fn applyWallCushion(velocity: f32, coordinate: i32, extent: i32) -> f32 {
@@ -1506,6 +1692,56 @@ fn triangleBodyContact(bodyIndex: u32, otherIndex: u32) -> vec3<f32> {
 }
 
 @compute @workgroup_size(64)
+fn gatherTrianglePairContacts(
+	@builtin(global_invocation_id) invocation: vec3<u32>,
+) {
+	let bodyCount = params.counts.w;
+	if (bodyCount == 0u || params.fracture.w == 0u) {
+		return;
+	}
+	let pairIndex = invocation.x;
+	if (pairIndex >= bodyCount * bodyCount) {
+		return;
+	}
+	let bodyIndex = pairIndex / bodyCount;
+	let otherIndex = pairIndex % bodyCount;
+	if (bodyIndex >= otherIndex || atomicLoad(&stateError[0]) != 0u) {
+		return;
+	}
+	// gatherTriangleContactStates validates every body before this pair pass.
+	let bodyStart = bondedBodyStarts[bodyIndex];
+	let otherStart = bondedBodyStarts[otherIndex];
+	let objectId = particleObjectIds[bodyStart];
+	if (particleObjectIds[otherStart] == objectId) {
+		return;
+	}
+	let contact = triangleBodyContact(bodyIndex, otherIndex);
+	let cacheIndex = bodyIndex * bodyCount + otherIndex;
+	trianglePairContactCache[cacheIndex] = vec4<f32>(contact, 0.0);
+	if (contact.z > 0.0) {
+		atomicAdd(&triangleContactStates[bodyIndex].contactCount, 1u);
+		atomicAdd(&triangleContactStates[otherIndex].contactCount, 1u);
+		let candidateWordCount =
+			(bodyCount + TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS - 1u) /
+			TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS;
+		let bodyCandidateWord =
+			bodyIndex * candidateWordCount +
+			otherIndex / TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS;
+		let otherCandidateWord =
+			otherIndex * candidateWordCount +
+			bodyIndex / TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS;
+		atomicOr(
+			&trianglePairContactCandidates[bodyCandidateWord],
+			1u << (otherIndex % TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS),
+		);
+		atomicOr(
+			&trianglePairContactCandidates[otherCandidateWord],
+			1u << (bodyIndex % TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS),
+		);
+	}
+}
+
+@compute @workgroup_size(64)
 fn gatherTriangleContactStates(
 	@builtin(global_invocation_id) invocation: vec3<u32>,
 ) {
@@ -1524,40 +1760,55 @@ fn gatherTriangleContactStates(
 		atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
 		return;
 	}
-	let objectId = particleObjectIds[bodyStart];
 	var contactCount = 0u;
-	for (var otherIndex = 0u; otherIndex < params.counts.w; otherIndex += 1u) {
-		if (otherIndex == bodyIndex) {
-			continue;
+	if (params.fracture.w == 0u) {
+		let objectId = particleObjectIds[bodyStart];
+		for (var otherIndex = 0u; otherIndex < params.counts.w; otherIndex += 1u) {
+			if (otherIndex == bodyIndex) {
+				continue;
+			}
+			let otherStart = bondedBodyStarts[otherIndex];
+			if (
+				otherStart + 2u >= params.counts.x ||
+				particlesIn[otherStart].bondedTriangleVertex != 1u ||
+				particlesIn[otherStart + 1u].bondedTriangleVertex != 2u ||
+				particlesIn[otherStart + 2u].bondedTriangleVertex != 3u
+			) {
+				atomicMin(&stateError[1], otherStart);
+				atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
+				return;
+			}
+			if (particleObjectIds[otherStart] == objectId) {
+				continue;
+			}
+			let contact = triangleBodyContact(bodyIndex, otherIndex);
+			if (contact.z > 0.0) {
+				contactCount += 1u;
+			}
 		}
-		let otherStart = bondedBodyStarts[otherIndex];
-		if (
-			otherStart + 2u >= params.counts.x ||
-			particlesIn[otherStart].bondedTriangleVertex != 1u ||
-			particlesIn[otherStart + 1u].bondedTriangleVertex != 2u ||
-			particlesIn[otherStart + 2u].bondedTriangleVertex != 3u
+	}
+	if (params.fracture.w != 0u) {
+		let candidateWordCount =
+			(params.counts.w + TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS - 1u) /
+			TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS;
+		for (
+			var wordIndex = 0u;
+			wordIndex < candidateWordCount;
+			wordIndex += 1u
 		) {
-			atomicMin(&stateError[1], otherStart);
-			atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
-			return;
-		}
-		if (particleObjectIds[otherStart] == objectId) {
-			continue;
-		}
-		let contact = triangleBodyContact(bodyIndex, otherIndex);
-		if (contact.z > 0.0) {
-			contactCount += 1u;
+			atomicStore(
+				&trianglePairContactCandidates[bodyIndex * candidateWordCount + wordIndex],
+				0u,
+			);
 		}
 	}
 	let velocity =
 		(particlesOut[bodyStart].velocity +
 			particlesOut[bodyStart + 1u].velocity +
 			particlesOut[bodyStart + 2u].velocity) / 3.0;
-	triangleContactStates[bodyIndex] = TriangleContactState(
-		velocity,
-		contactCount,
-		0u,
-	);
+	triangleContactStates[bodyIndex].velocity = velocity;
+	atomicStore(&triangleContactStates[bodyIndex].contactCount, contactCount);
+	triangleContactStates[bodyIndex].padding = 0u;
 }
 
 @compute @workgroup_size(64)
@@ -2185,13 +2436,70 @@ fn applyTrianglePairContacts(@builtin(global_invocation_id) invocation: vec3<u32
 		atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
 		return;
 	}
-	let bodyState = triangleContactStates[bodyIndex];
+	let bodyVelocity = triangleContactStates[bodyIndex].velocity;
+	let bodyContactCount = atomicLoad(&triangleContactStates[bodyIndex].contactCount);
 	let objectId = particleObjectIds[bodyStart];
 	let bodyMass = 3.0 * params.physical.y;
 	var collisionVelocityDelta = vec2<f32>(0.0, 0.0);
-	for (var otherIndex = 0u; otherIndex < params.counts.w; otherIndex += 1u) {
-		if (otherIndex == bodyIndex) {
-			continue;
+	var otherIndex = 0u;
+	var fallbackIndex = 0u;
+	var candidateWordIndex = 0u;
+	var candidateWord = 0u;
+	let candidateWordCount =
+		(params.counts.w + TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS - 1u) /
+		TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS;
+	// Exact cached contacts are visited in ascending body order; larger body sets
+	// retain the uncached full scan without imposing a candidate cap.
+	loop {
+		if (bodyContactCount == 0u) {
+			break;
+		}
+		if (params.fracture.w != 0u) {
+			if (candidateWord == 0u) {
+				if (candidateWordIndex >= candidateWordCount) {
+					break;
+				}
+				candidateWord = atomicLoad(
+					&trianglePairContactCandidates[
+						bodyIndex * candidateWordCount + candidateWordIndex
+					],
+				);
+				if (candidateWord == 0u) {
+					candidateWordIndex += 1u;
+					continue;
+				}
+			}
+			otherIndex =
+				candidateWordIndex * TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS +
+				countTrailingZeros(candidateWord);
+			candidateWord = candidateWord & (candidateWord - 1u);
+			if (candidateWord == 0u) {
+				candidateWordIndex += 1u;
+			}
+		} else {
+			if (fallbackIndex >= params.counts.w) {
+				break;
+			}
+			otherIndex = fallbackIndex;
+			fallbackIndex += 1u;
+			if (otherIndex == bodyIndex) {
+				continue;
+			}
+		}
+		var contact = vec3<f32>(0.0);
+		if (params.fracture.w != 0u) {
+			let firstIndex = min(bodyIndex, otherIndex);
+			let secondIndex = max(bodyIndex, otherIndex);
+			let cacheIndex = firstIndex * params.counts.w + secondIndex;
+			let cachedContact = trianglePairContactCache[cacheIndex].xyz;
+			// Avoid peer particle loads for the usual cached non-contact pair.
+			if (cachedContact.z <= 0.0) {
+				continue;
+			}
+			contact = vec3<f32>(
+				select(-cachedContact.xy, cachedContact.xy, bodyIndex < otherIndex),
+				cachedContact.z
+			);
 		}
 		let otherStart = bondedBodyStarts[otherIndex];
 		if (
@@ -2207,12 +2515,16 @@ fn applyTrianglePairContacts(@builtin(global_invocation_id) invocation: vec3<u32
 		if (particleObjectIds[otherStart] == objectId) {
 			continue;
 		}
-		let contact = triangleBodyContact(bodyIndex, otherIndex);
-		if (contact.z <= 0.0) {
-			continue;
+		if (params.fracture.w == 0u) {
+			contact = triangleBodyContact(bodyIndex, otherIndex);
+			if (contact.z <= 0.0) {
+				continue;
+			}
 		}
-		let otherState = triangleContactStates[otherIndex];
-		let contactDegree = max(bodyState.contactCount, otherState.contactCount);
+		let otherVelocity = triangleContactStates[otherIndex].velocity;
+		let otherContactCount =
+			atomicLoad(&triangleContactStates[otherIndex].contactCount);
+		let contactDegree = max(bodyContactCount, otherContactCount);
 		if (contactDegree == 0u) {
 			atomicMin(&stateError[1], bodyStart);
 			atomicOr(&stateError[0], ERROR_TRIANGLE_CONTACT);
@@ -2220,7 +2532,7 @@ fn applyTrianglePairContacts(@builtin(global_invocation_id) invocation: vec3<u32
 		}
 		let contactWeight = 1.0 / f32(contactDegree);
 		let relativeNormalVelocity =
-			dot(bodyState.velocity - otherState.velocity, contact.xy);
+			dot(bodyVelocity - otherVelocity, contact.xy);
 		if (relativeNormalVelocity < 0.0) {
 			let impulseMagnitude =
 				-relativeNormalVelocity / (2.0 / bodyMass);

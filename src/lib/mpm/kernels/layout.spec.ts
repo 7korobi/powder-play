@@ -7,6 +7,7 @@ import {
 	type MpmMlsGpuConfig,
 	type MpmMlsGpuDeviceLimits
 } from './layout.js';
+import { MLS_MPM_COMPUTE_WGSL } from './shaders.js';
 
 const LIMITS: MpmMlsGpuDeviceLimits = {
 	maxBufferSize: 256 * 1024 * 1024,
@@ -84,8 +85,16 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 			bucketNextBytes: 36,
 			gridStateBytes: 16_720,
 			triangleFieldBytes: 6_688,
+			triangleFieldCandidateBodyLimit: 512,
+			triangleFieldCandidateTileCount: 2,
+			triangleFieldCandidateWordsPerTile: 16,
+			triangleFieldCandidateWordCount: 32,
+			triangleFieldCandidateBytes: 128,
 			bondedBodyStartBytes: 4,
 			triangleContactStateBytes: 16,
+			trianglePairContactCacheCapacity: 0,
+			trianglePairContactCacheBytes: 16,
+			trianglePairContactCandidateBytes: 4,
 			bondedBodyCapacity: 1,
 			surfaceFieldBytes: 1672,
 			readbackBytes: 116
@@ -104,8 +113,13 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(layout.objectIdBufferBytes).toBe(4);
 		expect(layout.gridStateBytes).toBe(16_720);
 		expect(layout.triangleFieldBytes).toBe(6_688);
+		expect(layout.triangleFieldCandidateWordCount).toBe(32);
+		expect(layout.triangleFieldCandidateBytes).toBe(128);
 		expect(layout.bondedBodyStartBytes).toBe(4);
 		expect(layout.triangleContactStateBytes).toBe(16);
+		expect(layout.trianglePairContactCacheCapacity).toBe(0);
+		expect(layout.trianglePairContactCacheBytes).toBe(16);
+		expect(layout.trianglePairContactCandidateBytes).toBe(4);
 		expect(layout.bondedBodyCapacity).toBe(1);
 		expect(layout.surfaceFieldBytes).toBe(1672);
 		expect(layout.readbackBytes).toBe(36);
@@ -150,11 +164,55 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(layout.bucketNextBytes).toBe(36_000_000);
 		expect(layout.gridStateBytes).toBe(2_729_520);
 		expect(layout.triangleFieldBytes).toBe(1_091_808);
+		expect(layout.triangleFieldCandidateTileCount).toBe(140);
+		expect(layout.triangleFieldCandidateWordCount).toBe(2_240);
+		expect(layout.triangleFieldCandidateBytes).toBe(8_960);
 		expect(layout.bondedBodyStartBytes).toBe(1_333_332);
 		expect(layout.triangleContactStateBytes).toBe(5_333_328);
 		expect(layout.bondedBodyCapacity).toBe(333_333);
+		expect(layout.trianglePairContactCacheCapacity).toBe(0);
+		expect(layout.trianglePairContactCacheBytes).toBe(16);
+		expect(layout.trianglePairContactCandidateBytes).toBe(4);
 		expect(layout.surfaceFieldBytes).toBe(272_952);
 		expect(layout.readbackBytes).toBe(84_000_032);
+	});
+
+	it('bounds triangle field candidate storage for a maximum-aspect-ratio grid', () => {
+		const state = validateMpmMlsGpuInput(
+			[makeParticle({ position: { x: 0.5, y: 4 } })],
+			makeConfig({
+				grid: { cellsX: 1, cellsY: 419_427, cellSize: 1 }
+			})
+		);
+		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
+
+		expect(layout.nodeWidth).toBe(4);
+		expect(layout.nodeHeight).toBe(419_430);
+		expect(layout.nodeCount).toBe(1_677_720);
+		expect(layout.triangleFieldCandidateTileCount).toBe(26_215);
+		expect(layout.triangleFieldCandidateWordCount).toBe(419_440);
+		expect(layout.triangleFieldCandidateBytes).toBe(1_677_760);
+		expect(layout.triangleFieldCandidateWordCount).toBeLessThanOrEqual(
+			layout.nodeCount
+		);
+		expect(layout.triangleFieldCandidateWordsPerTile).toBe(
+			Math.ceil(layout.triangleFieldCandidateBodyLimit / 32)
+		);
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			`const TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT: u32 = ${layout.triangleFieldCandidateBodyLimit}u;`
+		);
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			'const TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS: u32 = 32u;'
+		);
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			'const TRIANGLE_FIELD_CANDIDATE_TILE_SIZE: u32 = 16u;'
+		);
+		expect(layout.triangleFieldCandidateBytes).toBeLessThanOrEqual(
+			LIMITS.maxStorageBufferBindingSize
+		);
+		expect(layout.triangleFieldCandidateBytes).toBeLessThanOrEqual(
+			4 * layout.nodeCount
+		);
 	});
 
 	it('packs each particle material and snow plastic history with the GPU layout', () => {
@@ -187,20 +245,21 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		]);
 	});
 
-	it('requires six storage bindings for cached P2G gather', () => {
+	it('requires eight storage bindings for cached triangle-pair contact traversal', () => {
 		const state = validateMpmMlsGpuInput([makeParticle()], makeConfig());
-		expect(() =>
-			calculateMpmMlsGpuBufferLayout(state, {
-				...LIMITS,
-				maxStorageBuffersPerShaderStage: 5
-			})
-		).toThrow(/six storage buffers/);
 		expect(() =>
 			calculateMpmMlsGpuBufferLayout(state, {
 				...LIMITS,
 				maxStorageBuffersPerShaderStage: 6
 			})
-		).not.toThrow();
+		).toThrow(/eight storage buffers/);
+		expect(() =>
+			calculateMpmMlsGpuBufferLayout(state, {
+				...LIMITS,
+				maxStorageBuffersPerShaderStage: 7
+			})
+		).toThrow(/eight storage buffers/);
+		expect(() => calculateMpmMlsGpuBufferLayout(state, LIMITS)).not.toThrow();
 	});
 
 	it('packs liquid density, per-particle volume, and powder friction', () => {
@@ -271,13 +330,47 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect([words[19], words[39], words[59]]).toEqual([1, 2, 3]);
 		expect(Array.from(state.bondedBodyStarts)).toEqual([0]);
 		expect(state.bondedBodyCountsByObjectId.get(7)).toBe(1);
+		expect(layout.triangleFieldCandidateBodyLimit).toBe(512);
+		expect(layout.triangleFieldCandidateWordsPerTile).toBe(16);
+		expect(layout.trianglePairContactCacheCapacity).toBe(2);
+		expect(layout.trianglePairContactCacheBytes).toBe(
+			2 * 2 * 4 * Float32Array.BYTES_PER_ELEMENT
+		);
+		expect(layout.trianglePairContactCandidateBytes).toBe(8);
 		expect(Array.from(new Uint32Array(parameters, 16, 4))).toEqual([
 			3,
 			layout.nodeCount,
 			27,
 			1
 		]);
+		expect(new Uint32Array(parameters, 112, 4)[3]).toBe(1);
 		expect(new Float32Array(parameters, 32, 16)[12]).toBe(Math.fround(0.6));
+	});
+
+	it('falls back to direct pair contact tests above the bounded cache capacity', () => {
+		const triangleParticles = [
+			makeParticle({ objectId: 7, bondedTriangleVertex: 0 }),
+			makeParticle({ objectId: 7, bondedTriangleVertex: 1 }),
+			makeParticle({ objectId: 7, bondedTriangleVertex: 2 })
+		];
+		const state = validateMpmMlsGpuInput(
+			triangleParticles,
+			makeConfig({ bondRestLength: 0.6, capacity: 1539 })
+		);
+		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
+		const parameters = packMpmMlsGpuStepParameters(
+			state,
+			layout,
+			0.001,
+			{ x: 0, y: 0 },
+			state.particleCount,
+			513
+		);
+
+		expect(layout.trianglePairContactCacheCapacity).toBe(512);
+		expect(layout.trianglePairContactCacheBytes).toBe(4 * 1024 * 1024);
+		expect(layout.trianglePairContactCandidateBytes).toBe(32 * 1024);
+		expect(new Uint32Array(parameters, 112, 4)[3]).toBe(0);
 	});
 
 	it('packs persistent fracture bonds, per-particle damage, and CSR endpoint adjacency', () => {

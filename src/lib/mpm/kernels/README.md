@@ -46,10 +46,13 @@ allowed by that float32 microstep after reserving the derived wave-speed bound.
 Every numerical microstep completes the entire solver stage sequence and
 particle-buffer ping-pong before the next begins. With bonded triangles and
 fracture bonds, that sequence includes clear grid, prepare particles, build
-particle buckets, P2G, build the triangle contact field, update grid, G2P,
-gather triangle reactions, solve bonded triangles, validate CFL bounds, update
-fracture bond damage, apply incident damage to particles, and commit. A batch
-still uses one compute pass. A final GPU reduction finds maximum particle
+particle buckets, P2G, build conservative tiled triangle-field candidates when
+the bounded path is active, build the triangle contact field, update grid, G2P,
+apply field-contact impulses, solve bonded triangles, gather body contact state,
+gather canonical pair contacts when the bounded cache is active, apply pair
+impulses, validate CFL bounds, update fracture bond damage, apply incident
+damage to particles, and commit. A batch still uses one compute pass. A final
+GPU reduction finds maximum particle
 speed; only its scalar, the completed-microstep counter, and the compact status
 buffer are asynchronously mapped on the CPU.
 
@@ -128,20 +131,34 @@ their phase-volume gradients.
 The triangle signed-distance field projects liquid particles out of the
 pebbles and gathers the opposing normal impulse back to the three vertices.
 Pebble pairs use triangle SAT contact to reduce approaching normal velocity;
-the pair pass does not translate triangle vertices. Repeated post-G2P position
-corrections destabilized the triangle contact field during CFL microsteps. The
-GPU snapshots body velocities and contact degrees before the pair pass, then
+the pair impulse pass does not translate triangle vertices. Repeated post-G2P
+position corrections destabilized the triangle contact field during CFL
+microsteps. The GPU snapshots body velocities and derives contact degrees
+before the pair impulse pass, then
 symmetrically relaxes each impulse by 0.25 divided by the larger contact degree
 of its endpoints. This prevents simultaneous contacts from over-accumulating
-Jacobi impulses. These are discrete, approximate contacts, not a continuous
-collider or continuum deformable mesh.
+Jacobi impulses. For up to 512 active bonded bodies, `gatherTrianglePairContacts`
+computes one contact result per unordered pair (AABB rejection followed by SAT
+when needed), and the pair impulse pass reuses that canonical contact with the
+opposite normal for the other body. Contact counts are accumulated for both
+endpoints. The cache is bounded to 4 MiB; above 512
+bodies the solver retains the direct all-pairs contact path. This removes
+duplicate narrow-phase work but does not reduce the `O(B²)` pair enumeration.
+These are discrete, approximate contacts, not a continuous collider or
+continuum deformable mesh.
+For up to 512 bonded bodies, the field builder also uses a conservative
+16×16-node tile bitset to skip bodies whose AABBs cannot reach any node in the
+tile. The original per-node AABB and triangle-distance tests still decide field
+values, and candidates are visited in body order. Above 512 bodies it falls
+back to the full field scan; dense overlap remains the worst case.
 At scene initialization, water and oil velocity components are sampled
 independently from ±60 world units/s and each pebble vertex from ±120 world
 units/s. A fixed scene seed reproduces the same velocities for tests and
 benchmarks; the lab chooses a fresh seed on initialization.
-The triangle field scans all bonded bodies for each grid node; the current
-200-pebble scene performs up to about 6.82 million node/body candidate checks
-per step. This GPU pass and the pairwise SAT solver are profiled in
+The 16×16 tile candidate bitset reduces sparse field scans for up to 512 bodies;
+the full-scan fallback and dense-overlap worst case can still reach about
+6.82 million node/body candidate checks per step in the current 200-pebble
+scene. This GPU pass and the pairwise SAT solver are profiled in
 `docs/PERFORMANCE-MLS-MPM.md`; larger scenes and sustained stability remain
 unverified. Contact friction, surface tension, wetting, complete water/oil
 separation in arbitrary flows, and swept collision detection are not
@@ -279,8 +296,9 @@ to 64 substeps; P2G and grid-velocity update remain explicit.
   retry the remaining duration with finer CFL-certified steps, but does not
   make an arbitrarily large step stable.
 - Buffer sizes and 1D dispatch counts are checked against the acquired device's
-  WebGPU limits. Devices that cannot hold the requested state fail setup with
-  an explicit error.
+  WebGPU limits. Triangle-contact pipelines require at least eight storage
+  buffers per compute stage. Devices that cannot hold the requested state fail
+  setup with an explicit error.
 - Capacity is fixed for the solver lifetime. Emitters use explicit
   accepted/refused/dropped counts. The lab initializes a million slots, so a
   single source burst is bounded at 100,000 candidates; emitted batches are
@@ -294,6 +312,11 @@ to 64 substeps; P2G and grid-velocity update remain explicit.
   221.7 MB (211.4 MiB) before an on-demand full-state readback, which can
   allocate about 84 MB more. This is a layout-derived estimate, not measured
   adapter/process peak memory. The affine scratch adds 16 MB at this capacity.
+  A scene with bonded triangles also allocates up to 4 MiB for the bounded pair
+  cache, a pair-candidate bitset, and a grid-sized field-candidate bitset. The
+  14,696-particle benchmark measured 231,196,340 total buffer bytes with
+  1,000,000 capacity, 4,236,032 bytes above the pre-cache benchmark allocation;
+  the field-candidate bitset used 8,960 bytes in that grid.
   Active particles and allocated slots are reported separately.
   This large capacity is intended for PC performance testing and may fail on
   devices without enough GPU memory. Its initial CPU/GPU parity check uses a

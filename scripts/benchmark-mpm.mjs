@@ -450,6 +450,121 @@ async function benchmark(profile) {
 		};
 		solver.dispose(); solver = null;
 
+		const triangleContactMaterial = { model: 'neo-hookean', lambda: 20, mu: 10 };
+		const makeTriangle = (centerX, velocity, objectId) => {
+			const centerY = 8;
+			const topY = centerY - Math.sqrt(3) / 6;
+			const bottomY = centerY + Math.sqrt(3) / 3;
+			return [
+				{
+					position: { x: centerX - 0.5, y: topY }, velocity,
+					C: zeroMatrix, F: identityMatrix, objectId,
+					material: triangleContactMaterial, bondedTriangleVertex: 0
+				},
+				{
+					position: { x: centerX + 0.5, y: topY }, velocity,
+					C: zeroMatrix, F: identityMatrix, objectId,
+					material: triangleContactMaterial, bondedTriangleVertex: 1
+				},
+				{
+					position: { x: centerX, y: bottomY }, velocity,
+					C: zeroMatrix, F: identityMatrix, objectId,
+					material: triangleContactMaterial, bondedTriangleVertex: 2
+				}
+			];
+		};
+		const triangleContactParticles = [
+			...makeTriangle(7, { x: 2, y: 0 }, 4),
+			...makeTriangle(7.75, { x: 0, y: 0 }, 5),
+			...makeTriangle(8.5, { x: -2, y: 0 }, 6)
+		];
+		const triangleContactConfig = {
+			grid: { cellsX: 16, cellsY: 16, cellSize: 1 },
+			particleMass: 0.1, particleVolume: 0.01,
+			material: triangleContactMaterial, bondRestLength: 1,
+			dt: 0.001, gravity: { x: 0, y: 0 }, capacity: 9
+		};
+		const triangleContactSteps = 4;
+		const inputTriangleMomentum = totalMomentum(
+			triangleContactParticles,
+			() => triangleContactConfig.particleMass
+		);
+		const inputTriangleEnergy = triangleContactParticles.reduce(
+			(energy, { velocity }) =>
+				energy +
+				0.5 *
+					triangleContactConfig.particleMass *
+					(velocity.x ** 2 + velocity.y ** 2),
+			0
+		);
+		let expectedTriangleContactParticles = triangleContactParticles;
+		let actualTriangleContactParticles = triangleContactParticles;
+		let triangleContactMaxAbsoluteError = 0;
+		solver = await createMpmMlsGpuSolver(
+			canvas,
+			triangleContactParticles,
+			triangleContactConfig
+		);
+		for (let step = 0; step < triangleContactSteps; step += 1) {
+			const expectedTriangleContact = stepMpm(
+				expectedTriangleContactParticles,
+				triangleContactConfig
+			);
+			solver.step(triangleContactConfig.dt, triangleContactConfig.gravity);
+			actualTriangleContactParticles = await solver.readParticles();
+			await solver.checkNumericalStatus();
+			const contactError = maxDifference(
+				actualTriangleContactParticles,
+				expectedTriangleContact.particles
+			);
+			if (contactError > physicsParityTolerance) {
+				throw new Error(
+					`Triangle-pair CPU/GPU parity exceeds tolerance at step ${step + 1}: ${contactError}`
+				);
+			}
+			triangleContactMaxAbsoluteError = Math.max(
+				triangleContactMaxAbsoluteError,
+				contactError
+			);
+			expectedTriangleContactParticles = expectedTriangleContact.particles;
+		}
+		const outputTriangleMomentum = totalMomentum(
+			actualTriangleContactParticles,
+			() => triangleContactConfig.particleMass
+		);
+		const triangleMomentumResidual = Math.hypot(
+			outputTriangleMomentum.x - inputTriangleMomentum.x,
+			outputTriangleMomentum.y - inputTriangleMomentum.y
+		);
+		const outputTriangleEnergy = actualTriangleContactParticles.reduce(
+			(energy, { velocity }) =>
+				energy +
+				0.5 *
+					triangleContactConfig.particleMass *
+					(velocity.x ** 2 + velocity.y ** 2),
+			0
+		);
+		if (
+			triangleMomentumResidual > physicsParityTolerance ||
+			outputTriangleEnergy > inputTriangleEnergy + physicsParityTolerance ||
+			!(actualTriangleContactParticles[0].velocity.x < triangleContactParticles[0].velocity.x) ||
+			!(actualTriangleContactParticles[6].velocity.x > triangleContactParticles[6].velocity.x)
+		) {
+			throw new Error('Triangle-pair contacts changed momentum, increased energy, or failed to reduce closing motion.');
+		}
+		const trianglePairContactAcceptance = {
+			particles: triangleContactParticles.length,
+			bodies: 3,
+			steps: triangleContactSteps,
+			maxAbsoluteError: triangleContactMaxAbsoluteError,
+			tolerance: physicsParityTolerance,
+			momentumResidual: triangleMomentumResidual,
+			inputKineticEnergy: inputTriangleEnergy,
+			outputKineticEnergy: outputTriangleEnergy,
+			closingMotionReduced: true
+		};
+		solver.dispose(); solver = null;
+
 		async function readFractureBondState(bondCount) {
 			const buffer = buffers.get('MLS-MPM persistent fracture bond state');
 			if (!buffer) throw new Error('GPU fracture-bond state buffer was not captured.');
@@ -675,6 +790,7 @@ async function benchmark(profile) {
 			physicsAcceptance: {
 				tolerance: physicsParityTolerance,
 				waterOilContact: liquidContactAcceptance,
+				trianglePairContact: trianglePairContactAcceptance,
 				fracture: fractureAcceptance
 			}
 		};

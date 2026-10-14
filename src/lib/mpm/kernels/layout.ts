@@ -39,8 +39,16 @@ export interface MpmMlsGpuBufferLayout {
 	readonly bucketNextBytes: number;
 	readonly gridStateBytes: number;
 	readonly triangleFieldBytes: number;
+	readonly triangleFieldCandidateBodyLimit: number;
+	readonly triangleFieldCandidateTileCount: number;
+	readonly triangleFieldCandidateWordsPerTile: number;
+	readonly triangleFieldCandidateWordCount: number;
+	readonly triangleFieldCandidateBytes: number;
 	readonly bondedBodyStartBytes: number;
 	readonly triangleContactStateBytes: number;
+	readonly trianglePairContactCacheCapacity: number;
+	readonly trianglePairContactCacheBytes: number;
+	readonly trianglePairContactCandidateBytes: number;
 	readonly bondedBodyCapacity: number;
 	readonly fractureBondBufferBytes: number;
 	readonly fractureBondTopologyBufferBytes: number;
@@ -101,6 +109,16 @@ const INT32_MAX = 0x7fff_ffff;
 const MAX_FLOAT32 = 3.4028234663852886e38;
 const GRID_NODE_STRIDE_BYTES = 80;
 const TRIANGLE_FIELD_NODE_STRIDE_BYTES = 32;
+const TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT = 512;
+const TRIANGLE_FIELD_CANDIDATE_TILE_SIZE = 16;
+const TRIANGLE_FIELD_CANDIDATE_WORD_BITS = 32;
+const TRIANGLE_FIELD_CANDIDATE_WORD_BYTES = Uint32Array.BYTES_PER_ELEMENT;
+const TRIANGLE_FIELD_CANDIDATE_WORDS_PER_TILE = Math.ceil(
+	TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT / TRIANGLE_FIELD_CANDIDATE_WORD_BITS
+);
+const MAX_TRIANGLE_PAIR_CONTACT_CACHE_BODIES = 512;
+const TRIANGLE_PAIR_CONTACT_CACHE_ENTRY_BYTES = 4 * Float32Array.BYTES_PER_ELEMENT;
+const TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS = 32;
 
 export function validateMpmMlsGpuInput(
 	particles: readonly MpmParticle[],
@@ -579,6 +597,7 @@ export function calculateMpmMlsGpuBufferLayout(
 		| 'config'
 		| 'particleCount'
 		| 'particleCapacity'
+		| 'bondedBodyStarts'
 		| 'fractureBondCount'
 		| 'fractureBondIncidenceCount'
 	>,
@@ -634,6 +653,35 @@ export function calculateMpmMlsGpuBufferLayout(
 		TRIANGLE_FIELD_NODE_STRIDE_BYTES,
 		'triangle contact field size'
 	);
+	const triangleFieldCandidateTileColumns = Math.ceil(
+		nodeWidth / TRIANGLE_FIELD_CANDIDATE_TILE_SIZE
+	);
+	const triangleFieldCandidateTileRows = Math.ceil(
+		nodeHeight / TRIANGLE_FIELD_CANDIDATE_TILE_SIZE
+	);
+	const triangleFieldCandidateTileCount = safeProduct(
+		triangleFieldCandidateTileColumns,
+		triangleFieldCandidateTileRows,
+		'triangle field candidate tile count'
+	);
+	const triangleFieldCandidateWordsPerTile =
+		TRIANGLE_FIELD_CANDIDATE_WORDS_PER_TILE;
+	const triangleFieldCandidateWordCount = safeProduct(
+		triangleFieldCandidateTileCount,
+		triangleFieldCandidateWordsPerTile,
+		'triangle field candidate bitset word count'
+	);
+	const triangleFieldCandidateBytes = safeProduct(
+		triangleFieldCandidateWordCount,
+		TRIANGLE_FIELD_CANDIDATE_WORD_BYTES,
+		'triangle field candidate bitset buffer size'
+	);
+	// With both halo dimensions >= 4, 16 words per 16x16 tile fit within nodeCount.
+	if (triangleFieldCandidateWordCount > nodeCount) {
+		throw new RangeError(
+			'triangle field candidate dispatch exceeds the halo grid node count'
+		);
+	}
 	const bondedBodyCapacity = Math.max(1, Math.floor(state.particleCapacity / 3));
 	const bondedBodyStartBytes = safeProduct(
 		bondedBodyCapacity,
@@ -644,6 +692,39 @@ export function calculateMpmMlsGpuBufferLayout(
 		bondedBodyCapacity,
 		4 * Float32Array.BYTES_PER_ELEMENT,
 		'triangle-pair contact state buffer size'
+	);
+	const trianglePairContactCacheCapacity =
+		state.bondedBodyStarts.length === 0
+			? 0
+			: Math.min(bondedBodyCapacity, MAX_TRIANGLE_PAIR_CONTACT_CACHE_BODIES);
+	const trianglePairContactCacheEntryCount = safeProduct(
+		trianglePairContactCacheCapacity,
+		trianglePairContactCacheCapacity,
+		'triangle-pair contact cache entry count'
+	);
+	const trianglePairContactCacheBytes = Math.max(
+		TRIANGLE_PAIR_CONTACT_CACHE_ENTRY_BYTES,
+		safeProduct(
+			trianglePairContactCacheEntryCount,
+			TRIANGLE_PAIR_CONTACT_CACHE_ENTRY_BYTES,
+			'triangle-pair contact cache buffer size'
+		)
+	);
+	const trianglePairContactCandidateWordsPerBody = Math.ceil(
+		trianglePairContactCacheCapacity / TRIANGLE_PAIR_CONTACT_CANDIDATE_WORD_BITS
+	);
+	const trianglePairContactCandidateWordCount = safeProduct(
+		trianglePairContactCacheCapacity,
+		trianglePairContactCandidateWordsPerBody,
+		'triangle-pair contact candidate bitset entry count'
+	);
+	const trianglePairContactCandidateBytes = Math.max(
+		Uint32Array.BYTES_PER_ELEMENT,
+		safeProduct(
+			trianglePairContactCandidateWordCount,
+			Uint32Array.BYTES_PER_ELEMENT,
+			'triangle-pair contact candidate bitset buffer size'
+		)
 	);
 	const fractureBondBufferBytes = Math.max(
 		24,
@@ -690,8 +771,8 @@ export function calculateMpmMlsGpuBufferLayout(
 	if (limits.maxUniformBufferBindingSize < SURFACE_RENDER_PARAMS_BYTES) {
 		throw new RangeError('GPU maxUniformBufferBindingSize is too small for surface render parameters');
 	}
-	if (limits.maxStorageBuffersPerShaderStage < 6) {
-		throw new RangeError('GPU supports fewer than six storage buffers per shader stage');
+	if (limits.maxStorageBuffersPerShaderStage < 8) {
+		throw new RangeError('GPU supports fewer than eight storage buffers per shader stage');
 	}
 
 	const buffers = [
@@ -702,8 +783,11 @@ export function calculateMpmMlsGpuBufferLayout(
 		['bucket links', bucketNextBytes],
 		['grid state', gridStateBytes],
 		['triangle contact field', triangleFieldBytes],
+		['triangle field candidate bitset', triangleFieldCandidateBytes],
 		['bonded triangle body indices', bondedBodyStartBytes],
 		['triangle-pair contact states', triangleContactStateBytes],
+		['triangle-pair contact cache', trianglePairContactCacheBytes],
+		['triangle-pair contact candidate bitset', trianglePairContactCandidateBytes],
 		['fracture bond state', fractureBondBufferBytes],
 		['fracture bond topology', fractureBondTopologyBufferBytes],
 		['water/oil surface field', surfaceFieldBytes],
@@ -727,8 +811,11 @@ export function calculateMpmMlsGpuBufferLayout(
 		['bucket links', bucketNextBytes],
 		['grid state', gridStateBytes],
 		['triangle contact field', triangleFieldBytes],
+		['triangle field candidate bitset', triangleFieldCandidateBytes],
 		['bonded triangle body indices', bondedBodyStartBytes],
 		['triangle-pair contact states', triangleContactStateBytes],
+		['triangle-pair contact cache', trianglePairContactCacheBytes],
+		['triangle-pair contact candidate bitset', trianglePairContactCandidateBytes],
 		['fracture bond state', fractureBondBufferBytes],
 		['fracture bond topology', fractureBondTopologyBufferBytes],
 		['water/oil surface field', surfaceFieldBytes],
@@ -745,6 +832,7 @@ export function calculateMpmMlsGpuBufferLayout(
 	const maxWorkgroups = limits.maxComputeWorkgroupsPerDimension;
 	for (const [name, count] of [
 		['grid nodes', nodeCount],
+		['triangle field candidate words', triangleFieldCandidateWordCount],
 		['particles', state.particleCapacity]
 	] as const) {
 		const workgroups = Math.ceil(count / COMPUTE_WORKGROUP_SIZE);
@@ -767,8 +855,16 @@ export function calculateMpmMlsGpuBufferLayout(
 		bucketNextBytes,
 		gridStateBytes,
 		triangleFieldBytes,
+		triangleFieldCandidateBodyLimit: TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT,
+		triangleFieldCandidateTileCount,
+		triangleFieldCandidateWordsPerTile,
+		triangleFieldCandidateWordCount,
+		triangleFieldCandidateBytes,
 		bondedBodyStartBytes,
 		triangleContactStateBytes,
+		trianglePairContactCacheCapacity,
+		trianglePairContactCacheBytes,
+		trianglePairContactCandidateBytes,
 		bondedBodyCapacity,
 		fractureBondBufferBytes,
 		fractureBondTopologyBufferBytes,
@@ -871,7 +967,10 @@ export function packMpmMlsGpuStepParameters(
 		state.fractureBondCount === 0 ? 0 : state.particleCount,
 		state.fractureBondCount,
 		state.fractureBondIncidenceCount,
-		0
+		bondedBodyCount > 0 &&
+		bondedBodyCount <= layout.trianglePairContactCacheCapacity
+			? 1
+			: 0
 	]);
 	return result;
 }
