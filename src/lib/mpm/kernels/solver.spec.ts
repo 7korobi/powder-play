@@ -3,7 +3,7 @@ import type { MpmParticle } from '../reference/solver.js';
 import { createMpmWebGpuSession } from '../platform/webgpu.js';
 import { createMpmMlsGpuSolver } from './solver.js';
 import { calculateMpmCflMicrosteps } from './cfl.js';
-import { MLS_MPM_COMPUTE_WGSL } from './shaders.js';
+import { MLS_MPM_COMPUTE_WGSL, MLS_MPM_RENDER_WGSL } from './shaders.js';
 
 vi.mock('../platform/webgpu.js', () => ({
 	createMpmWebGpuSession: vi.fn()
@@ -1083,6 +1083,53 @@ describe('GPU MLS-MPM batch encoding', () => {
 	});
 
 	describe('GPU MLS-MPM free-surface rendering', () => {
+		it('draws bonded pebble bodies as filled triangles with visible outlines', async () => {
+			const gpu = setupDevice();
+			const solver = await createMpmMlsGpuSolver(
+				CANVAS,
+				BONDED_TRIANGLE_PARTICLES,
+				{ ...CONFIG, bondRestLength: 0.6 }
+			);
+
+			solver.render('particles');
+
+			expect(
+				gpu.renderPass.setPipeline.mock.calls.map(([pipeline]) => pipeline.label)
+			).toEqual([
+				'MLS-MPM particle render pipeline',
+				'MLS-MPM pebble triangle render pipeline'
+			]);
+			expect(gpu.renderPass.draw.mock.calls).toEqual([
+				[6, BONDED_TRIANGLE_PARTICLES.length],
+				[3, 1]
+			]);
+			expect(MLS_MPM_RENDER_WGSL).toContain(
+				'let start = bondedBodyStarts[instanceIndex]'
+			);
+			expect(MLS_MPM_RENDER_WGSL).toContain(
+				'fn pebbleFragmentMain(input: PebbleVertexOutput)'
+			);
+			expect(MLS_MPM_RENDER_WGSL).toContain('fwidth(edgeDistance)');
+
+			gpu.renderPass.setPipeline.mockClear();
+			gpu.renderPass.draw.mockClear();
+			solver.render('surface');
+
+			expect(
+				gpu.renderPass.setPipeline.mock.calls.map(([pipeline]) => pipeline.label)
+			).toEqual([
+				'MLS-MPM water/oil surface render pipeline',
+				'MLS-MPM particle render pipeline',
+				'MLS-MPM pebble triangle render pipeline'
+			]);
+			expect(gpu.renderPass.draw.mock.calls).toEqual([
+				[3, 1],
+				[6, BONDED_TRIANGLE_PARTICLES.length],
+				[3, 1]
+			]);
+			solver.dispose();
+		});
+
 		it('updates live bucket counts after GPU-side clones', async () => {
 			const gpu = setupDevice();
 			const solver = await createMpmMlsGpuSolver(CANVAS, [PARTICLE], CONFIG);

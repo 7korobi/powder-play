@@ -115,10 +115,13 @@ treated as a fatal solver error or silently dropping simulated time.
 The retuned Gate 4 sample starts with 2,000 water, 1,500 oil, 50 Neo-Hookean
 elastic pebbles built from three particles each, and a 24-particle connected
 solid (3,674 active particles total, one quarter of the previous 14,696).
-The water and oil each keep their previous total reference area and mass:
-particle reference area grows from 25 to 100 while liquid spacing grows from
-9 to 18 world units. Solid particle mass grows from 1 to 4 with the same
-reference-area scaling. The pebbles form an 8-column × 7-row array with
+Relative to the preceding 3,674-particle tuning, water and oil particle
+reference area remains 100, and each liquid phase's reference volume and mass
+remain unchanged. Instead, the compressive EOS stiffness increases fourfold
+(water 40,000 → 160,000; oil 30,000 → 120,000) to resist volume collapse.
+Liquid particle counts, spacing (18 world units), and initial positions remain
+unchanged. Pebble and fracture-solid reference area remains 100, and solid
+particle mass remains 4. The pebbles form an 8-column × 7-row array with
 150-world-unit center spacing; the last row contains two centered pebbles.
 Each is an equilateral triangle with 132-world-unit edges and width, about
 6% of the simulation-domain width. The array overlaps the liquid region
@@ -132,7 +135,11 @@ the microstep/reference-step ratio (1/240 second in Gate 4), because positional
 corrections are converted into velocity changes. CFL subdivision therefore
 does not accumulate an oversized correction impulse. Water and oil have
 separate grid velocity/volume channels and receive normal contact impulses from
-their phase-volume gradients.
+their phase-volume gradients. The phase contact also applies an equal-and-
+opposite separation impulse scaled by local phase overlap and approach speed;
+its node-level target is the larger of `0.25 × overlap × cellSize / 0.05 s`
+and twice the closing normal speed. This is an approximate interface response,
+not full immiscibility.
 The triangle signed-distance field projects liquid particles out of the
 pebbles and gathers the opposing normal impulse back to the three vertices.
 Pebble pairs use triangle SAT contact to reduce approaching normal velocity;
@@ -157,16 +164,24 @@ tile. The original per-node AABB and triangle-distance tests still decide field
 values, and candidates are visited in body order. Above 512 bodies it falls
 back to the full field scan; dense overlap remains the worst case.
 At scene initialization, water and oil velocity components are sampled
-independently from ±8 world units/s and each pebble vertex from ±30 world
-units/s. Horizontal oscillation starts disabled; a button starts/stops the
+independently from ±64 world units/s, each pebble vertex from ±240 world
+units/s, and each fracture-solid particle from ±80 world units/s. Pebbles are
+rendered as filled triangles with a bright outline in both surface and
+particle-marker modes. Horizontal oscillation starts disabled; a button starts/stops the
 default ±240 world-units/s², 0.16 Hz motion, and the slider adjusts its
 amplitude up to 360. A fixed scene seed reproduces particle velocities for
 tests and benchmarks; the lab chooses a fresh seed on initialization.
 The 16×16 tile candidate bitset reduces sparse field scans for up to 512 bodies.
 With 50 active pebble bodies, the full-scan upper bound is about 1.71 million
 node/body candidates per step and unordered SAT pairs fall from 19,900 to
-1,225. A single diagnostic `stages` profile is recorded, but repeated `batch`
-performance and node-level candidate counts remain unverified. Contact
+1,225. A current no-render `batch` profile on Apple Metal 3 / Headless Chrome
+154 used 3,674 particles and 12 samples of eight steps: GPU step median was
+0.217 ms and p95 was 0.256 ms. One short run is not sustained or cross-device
+performance evidence. The diagnostic `stages` profile splits the batch into
+multiple passes and its times are not directly comparable. Node-level field
+candidate counts remain unmeasured. The GPU contact fixture also passed at
+opposed ±64 world-units/s with no particle crossing over eight 0.001-second
+steps, while preserving phase mass and momentum within the stated tolerance. Contact
 friction, surface tension, wetting, complete water/oil separation in arbitrary
 flows, and swept collision detection are not implemented.
 
@@ -181,11 +196,12 @@ calibrated continuum fracture model; GPU numerical accuracy and sustained
 damage loading have not been measured across devices/resolutions.
 
 Water and oil reference densities remain 0.02 and 0.016, with EOS stiffnesses
-40,000 and 30,000. Their count is one quarter of the previous scene and each
-particle's reference area is four times larger, preserving per-phase reference
-mass and total area. The 18-unit spacing preserves the previous liquid
-reference area per unit domain area (`100 / 18²` equals `25 / 9²`). The grid
-remains 220 × 150 cells at 10-unit cell size. A previous 20,000-particle scene
+160,000 and 120,000 (four times the preceding 40,000 and 30,000). Their count
+is one quarter of the previous scene and each particle's reference area is
+four times larger, preserving per-phase reference mass and total area. The
+18-unit spacing preserves the previous liquid reference area per unit domain
+area (`100 / 18²` equals `25 / 9²`). The grid remains 220 × 150 cells at
+10-unit cell size. A previous 20,000-particle scene
 used 6,000 powder particles; the later 200-pebble and 14,696-particle layouts
 are historical. The current sample reserves capacity for 1,000,000 particles,
 so reducing active count does not materially reduce the fixed GPU allocation.

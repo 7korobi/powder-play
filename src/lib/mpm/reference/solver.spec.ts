@@ -418,8 +418,11 @@ describe('CPU MLS-MPM reference', () => {
 		const oilDeformation = result.particles[1].F;
 		expect(waterDeformation.m00).toBeCloseTo(waterDeformation.m11, 12);
 		expect(waterDeformation.m01).toBeCloseTo(-waterDeformation.m10, 12);
-		expect(waterDeformation.m00 * waterDeformation.m11 - waterDeformation.m01 * waterDeformation.m10).toBeCloseTo(1, 12);
-		expect(oilDeformation).toEqual(waterDeformation);
+		expect(waterDeformation.m00 * waterDeformation.m11 - waterDeformation.m01 * waterDeformation.m10).toBeCloseTo(1, 11);
+		expect(oilDeformation.m00).toBeCloseTo(waterDeformation.m00, 12);
+		expect(oilDeformation.m01).toBeCloseTo(waterDeformation.m01, 12);
+		expect(oilDeformation.m10).toBeCloseTo(waterDeformation.m10, 12);
+		expect(oilDeformation.m11).toBeCloseTo(waterDeformation.m11, 12);
 		expect(result.particles[0].material?.model).toBe('water');
 		expect(result.particles[1].material?.model).toBe('oil');
 		expect(result.diagnostics.inputMass).toBeCloseTo(0.026, 12);
@@ -429,6 +432,38 @@ describe('CPU MLS-MPM reference', () => {
 		expect(result.diagnostics.inputMomentum.y).toBeCloseTo(-0.0065, 14);
 		expect(result.diagnostics.outputMomentum.x).toBeCloseTo(0.013, 14);
 		expect(result.diagnostics.outputMomentum.y).toBeCloseTo(-0.0065, 14);
+	});
+
+	it('restores compressed liquid volume more strongly with a stiffer EOS', () => {
+		const initialParticle = makeParticle({
+			position: { x: 8.37, y: 8.23 },
+			F: { m00: 0.8, m01: 0, m10: 0, m11: 0.8 },
+			volume: 0.25,
+			material: { lambda: 8, mu: 0, model: 'water', density: 1 }
+		});
+		const config = makeConfig({
+			dt: 0.0001,
+			grid: { cellsX: 16, cellsY: 16, cellSize: 1 },
+			particleVolume: 0.25,
+			gravity: { x: 0, y: 0 }
+		});
+		const simulate = (lambda: number): number => {
+			let particle: MpmParticle = {
+				...initialParticle,
+				material: { lambda, mu: 0 as const, model: 'water' as const, density: 1 }
+			};
+			for (let step = 0; step < 100; step += 1) {
+				particle = stepMpm([particle], config).particles[0];
+			}
+			return particle.F.m00 * particle.F.m11 - particle.F.m01 * particle.F.m10;
+		};
+
+		const baselineDeterminant = simulate(8);
+		const stiffDeterminant = simulate(32);
+
+		expect(baselineDeterminant).toBeGreaterThan(0.64);
+		expect(stiffDeterminant).toBeGreaterThan(baselineDeterminant);
+		expect(stiffDeterminant).toBeLessThanOrEqual(1);
 	});
 
 	it('moves denser liquid particles downward relative to lighter liquids in a mixed region', () => {
@@ -453,56 +488,85 @@ describe('CPU MLS-MPM reference', () => {
 		expect(result.particles[0].position.y).toBeGreaterThan(result.particles[1].position.y);
 	});
 
-	it('resolves water-oil contact with equal and opposite normal impulses', () => {
-		const particles = [
+	it.each([
+		{ dt: 0.0001, speed: 0.5 },
+		{ dt: 0.001, speed: 0.5 },
+		{ dt: 0.01, speed: 0.5 },
+		{ dt: 0.001, speed: 64 }
+	])(
+		'resolves water-oil contact with equal and opposite normal impulses ($dt s, $speed units/s)',
+		({ dt, speed }) => {
+			const particles = [
 			makeParticle({
 				position: { x: 7.5, y: 8 },
-				velocity: { x: 5, y: 0 },
+				velocity: { x: speed, y: 0 },
 				objectId: 1,
 				volume: 0.25,
 				material: { lambda: 8, mu: 0, model: 'water', density: 1 }
 			}),
 			makeParticle({
 				position: { x: 8.5, y: 8 },
-				velocity: { x: -5, y: 0 },
+				velocity: { x: -speed, y: 0 },
 				objectId: 2,
 				volume: 0.25,
 				material: { lambda: 8, mu: 0, model: 'oil', density: 1 }
 			})
-		];
-		const result = stepMpm(
-			particles,
-			makeConfig({
-				dt: 0.001,
-				particleVolume: 0.25,
-				gravity: { x: 0, y: 0 }
-			})
-		);
+			];
+			const result = stepMpm(
+				particles,
+				makeConfig({
+					dt,
+					particleVolume: 0.25,
+					gravity: { x: 0, y: 0 }
+				})
+			);
 
-		expect(result.particles[0].velocity.x).toBeLessThan(5);
-		expect(result.particles[1].velocity.x).toBeGreaterThan(-5);
-		expect(result.particles[0].material?.model).toBe('water');
-		expect(result.particles[1].material?.model).toBe('oil');
-		expect(result.particles[0].position.x).toBeLessThanOrEqual(
-			result.particles[1].position.x
-		);
-		expect(result.diagnostics.inputMass).toBe(0.5);
-		expect(result.diagnostics.outputMass).toBe(0.5);
-		expect(
-			result.particles
-				.filter((particle) => particle.material?.model === 'water')
-				.length * 0.25
-		).toBe(0.25);
-		expect(
-			result.particles
-				.filter((particle) => particle.material?.model === 'oil')
-				.length * 0.25
-		).toBe(0.25);
-		expect(result.diagnostics.outputMomentum.x).toBeCloseTo(
-			result.diagnostics.inputMomentum.x,
-			10
-		);
-	});
+			expect(result.particles[0].velocity.x).toBeLessThan(speed);
+			expect(result.particles[1].velocity.x).toBeGreaterThan(-speed);
+			expect(
+				result.particles[1].velocity.x - result.particles[0].velocity.x
+			).toBeGreaterThan(0);
+			expect(result.particles[0].material?.model).toBe('water');
+			expect(result.particles[1].material?.model).toBe('oil');
+			expect(result.particles[0].position.x).toBeLessThanOrEqual(
+				result.particles[1].position.x
+			);
+			expect(result.diagnostics.inputMass).toBe(0.5);
+			expect(result.diagnostics.outputMass).toBe(0.5);
+			expect(
+				result.particles
+					.filter((particle) => particle.material?.model === 'water')
+					.length * 0.25
+			).toBe(0.25);
+			expect(
+				result.particles
+					.filter((particle) => particle.material?.model === 'oil')
+					.length * 0.25
+			).toBe(0.25);
+			expect(result.diagnostics.outputMomentum.x).toBeCloseTo(
+				result.diagnostics.inputMomentum.x,
+				10
+			);
+			expect(
+				result.particles.every(
+					(particle) =>
+						Number.isFinite(particle.velocity.x) &&
+						Number.isFinite(particle.position.x)
+				)
+			).toBe(true);
+			if (speed > 1) {
+				const outputKineticEnergy = result.particles.reduce(
+					(energy, particle) =>
+						energy +
+						0.5 *
+							0.25 *
+							(particle.velocity.x ** 2 + particle.velocity.y ** 2),
+					0
+				);
+				expect(outputKineticEnergy).toBeLessThan(0.25 * speed ** 2);
+			}
+		}
+	);
 
 	it('returns liquid contact reaction to a bonded triangle and preserves vertex markers', () => {
 		const particles: MpmParticle[] = [

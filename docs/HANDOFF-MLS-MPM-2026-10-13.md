@@ -12,13 +12,19 @@
   実機受け入れやscene-scale物理受け入れを完了した状態ではない。
 - 現行初期scene: 水2,000、油1,500、Neo-Hookean小石50個（各3粒子、計150）、
   6×4 node・53 bondの破断solid（24粒子）、合計3,674 active粒子。旧14,696の1/4。
-- particle reference areaは25から100へ4倍、液体間隔は9から18へ2倍、固体粒子massは1から4へ4倍。
-  相ごとの質量・総参照面積を維持し、表示専用面積をさらに2倍にして粒子ごとの見かけを約8倍にした。
-  小石は液体範囲内へ配置し、液体／小石の初速は±8／±30へ弱めた。左右揺れは初期offで、
+- 固体 particle reference areaは旧25から100へ4倍、固体massは1から4へ4倍。液体参照面積は100のまま、
+  各相の総参照体積・massも前sceneから維持した。水・油のEOS係数は160,000・120,000
+  （従来の40,000・30,000から4倍）へ上げ、相別grid接触に重なり量・接近速度を使う
+  equal-and-opposite separation impulseを加えた。水・油burstにも同じ参照面積とEOSを適用する。
+- 小石を液体範囲内へ配置し、初期速度は水・油各成分±64、小石頂点±240、破断solid各成分±80。
+  小石はsurface・particle-marker両modeで塗り三角形と輪郭線を描画する。左右揺れは初期offで、
   UIボタンから既定±240 world units/s²・0.16 Hzを開始／停止できる。
-- GPU capacityは1,000,000。retuned sceneはApple Metal 3 / Headless Chrome 155の
-  `stages` profileで1回計測し、GPU buffer確保量231,188,500 byte、GPU step median
-  0.229376 ms / p95 0.286720 msだった。これは描画なしの診断profileで、batchの持続性能を代表しない。
+- GPU capacityは1,000,000。現構成のApple Metal 3 / Headless Chrome 154
+  `batch` profile（3,674粒子、描画なし、12 sample×8 step）ではGPU buffer確保量
+  231,188,500 byte、GPU step median 0.217 ms / p95 0.256 msだった。
+  `stages` profileはmedian 0.267 ms / p95 0.281 msだが、dispatchごとにpassを分ける診断値であり、
+  通常batchとの比較には使わない。  queue完了待ちはmedian 2.4 ms / p95 2.6 msでGPU単体時間ではない。
+  単一端末・短時間・描画なしの測定で、適応CFLを通した描画込みの持続性能を保証しない。
   旧14,696 sceneの221,626,976 byteは別revision・別sceneの歴史値である。
 - benchmark harnessには制御S3/S4 fixtureがある。retuneでlayout・solver・shaderにも変更が入った。
   破断stateの `COPY_SRC` は時間計測後の制御fixture readbackに限って有効にする。
@@ -210,18 +216,24 @@ runごとのwarmup step数・scene状態が完全一致しないため、1回の
 
 ## 6. 2026-10-14 retune後の検証記録
 
-- 自動検証: `npm test` 20 files / 192 tests、`npm run check` 0 errors / 0 warnings、
+- 自動検証: `npm test` 20 files / 198 tests、`npm run check` 0 errors / 0 warnings、
   `npm run build` 成功。
-- 実GPU: `npm run benchmark:mpm -- --profile=stages`。Headless Chrome 155 / macOS /
-  Apple Metal 3（fallbackなし、`timestamp-query`あり）、3,674粒子、capacity 1,000,000、
-  220×150 grid、描画なし。GPU buffer確保量231,188,500 byte。12 batch×8 stepのGPU stepは
-  median 0.229376 ms、p95 0.286720 ms。`stages` profileはpassを112へ分割する診断計測であり、
-  通常の`batch`値・旧scene値との比較や、描画込みの持続性能を示さない。
+- 実GPU: `npm run benchmark:mpm -- --profile=batch`。Headless Chrome 154 / Apple Metal 3
+  （fallbackなし、`timestamp-query`あり）、3,674粒子、capacity 1,000,000、220×150 grid、
+  描画なし。GPU buffer確保量231,188,500 byte。12 sample×8 stepのGPU stepはmedian
+  0.217 ms / p95 0.256 ms、queue完了待ちはmedian 2.4 ms / p95 2.6 ms。
+  `stages` profileはmedian 0.267 ms / p95 0.281 msだが、passを112へ分割する診断値であり、
+  通常batchと直接比較しない。いずれも単一端末の短時間測定で、適応CFL・描画込み・持続性能は未保証。
 - 数値fixture: 45粒子・5材料・8 step回帰の最大絶対差0.0000139553、batch/single差0。
-  水/油contact、triangle pair contact、fractureの小規模physics acceptanceも通過した。
-  いずれもscene全体の物理品質や長時間安定性の保証ではない。
-- ブラウザー: 1440×1100の専用Headless Chromeでscene見出し、3,674 active粒子、
-  220×150 grid、GPU実行中とcanvas描画を確認。揺れは初期停止、ボタン操作で±240、
-  再度停止で0へ戻り、確認中のruntime/console errorは0件。
-- 現行sceneの単一runであり、`profile=batch`の反復、mobile/他adapter、scene-scale接触・
-  破断品質は未検証。測定条件とsource hashは[性能計測資料](./PERFORMANCE-MLS-MPM.md)を参照。
+  GPUのwater/oil contact fixture（初速±64、相対接近速度128 world units/s、dt 0.001）は
+  8 stepで最大差0.0000519、各相mass error 0、momentum residual 2.86e-6、
+  全stepで粒子crossingなし。CPU referenceの接触fixtureは±0.5 / ±64 world units/s、
+  dt 0.0001・0.001・0.01で分離方向と運動量を検査した。
+  EOS圧縮回復・triangle pair contact・fractureも通過したが、いずれもscene全体や
+  長時間の物理品質を保証しない。
+- ブラウザー: 1440×1100の専用Headless Chromeで水・油・小石のcanvas描画、scene見出し、
+  3,674 active粒子、220×150 grid、GPU実行中を確認。揺れの開始で±240、停止で0に戻り、
+  その後15秒の実行中にstatus・粒子数・canvasは維持され、runtime/console errorは0件。
+  表示mode切替・emitter追加・容量境界・scene-scale接触品質は未確認。
+- 現行sceneの単一runであり、mobile/他adapter、scene-scale接触・破断品質は未検証。
+  測定条件とsource hashは[性能計測資料](./PERFORMANCE-MLS-MPM.md)を参照。

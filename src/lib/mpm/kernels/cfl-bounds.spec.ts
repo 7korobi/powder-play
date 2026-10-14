@@ -28,8 +28,8 @@ describe('GPU MPM CFL bound derivation', () => {
 		);
 
 		expect(bounds).not.toBeNull();
-		expect(bounds?.waveSpeedBound).toBeGreaterThanOrEqual(Math.sqrt(40_000 / 0.02));
-		expect(bounds?.waveSpeedBound).toBeCloseTo(Math.sqrt(40_000 / 0.02), 2);
+		expect(bounds?.waveSpeedBound).toBeGreaterThanOrEqual(Math.sqrt(160_000 / 0.02));
+		expect(bounds?.waveSpeedBound).toBeCloseTo(Math.sqrt(160_000 / 0.02), 2);
 		expect(bounds?.velocityBound).toBeGreaterThanOrEqual(actualInitialSpeed);
 		expect(bounds?.velocityBound).toBeLessThan(actualInitialSpeed + 0.01);
 	});

@@ -1,3 +1,9 @@
+import {
+	MPM_LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER,
+	MPM_LIQUID_CONTACT_RELAXATION_SECONDS,
+	MPM_LIQUID_CONTACT_SEPARATION_FRACTION
+} from '../materials.js';
+
 export const MLS_MPM_COMPUTE_WGSL = /* wgsl */ `
 struct Particle {
 	position: vec2<f32>,
@@ -151,6 +157,9 @@ const ERROR_FRACTURE_BOND: u32 = 32768u;
 const BONDED_TRIANGLE_SOLVER_ITERATIONS: u32 = 2u;
 const TRIANGLE_CONTACT_SKIN_CELLS: f32 = 0.1;
 const TRIANGLE_CONTACT_IMPULSE_RELAXATION: f32 = 0.25;
+const LIQUID_CONTACT_SEPARATION_FRACTION: f32 = ${MPM_LIQUID_CONTACT_SEPARATION_FRACTION};
+const LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER: f32 = ${MPM_LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER};
+const LIQUID_CONTACT_RELAXATION_SECONDS: f32 = ${MPM_LIQUID_CONTACT_RELAXATION_SECONDS};
 const TRIANGLE_FIELD_CANDIDATE_BODY_LIMIT: u32 = 512u;
 const TRIANGLE_FIELD_CANDIDATE_BODY_WORD_BITS: u32 = 32u;
 const TRIANGLE_FIELD_CANDIDATE_TILE_SIZE: u32 = 16u;
@@ -1343,9 +1352,23 @@ fn updateGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		if (finiteFloat(separationLength) && separationLength > 1e-8) {
 			let normal = separation / separationLength;
 			let relativeNormalVelocity = dot(oilVelocity - waterVelocity, normal);
-			if (relativeNormalVelocity < 0.0) {
+			let overlapFraction = clamp(
+				2.0 * min(waterVolume, oilVolume) / (waterVolume + oilVolume),
+				0.0,
+				1.0,
+			);
+			let minimumSeparationVelocity = max(
+				LIQUID_CONTACT_SEPARATION_FRACTION *
+					overlapFraction *
+					params.physical.x /
+					LIQUID_CONTACT_RELAXATION_SECONDS,
+				max(-relativeNormalVelocity, 0.0) *
+					LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER,
+			);
+			if (relativeNormalVelocity < minimumSeparationVelocity) {
 				let impulseMagnitude =
-					-relativeNormalVelocity / (1.0 / waterMass + 1.0 / oilMass);
+					(minimumSeparationVelocity - relativeNormalVelocity) /
+					(1.0 / waterMass + 1.0 / oilMass);
 				let impulse = impulseMagnitude * normal;
 				waterVelocity = waterVelocity - impulse / waterMass;
 				oilVelocity = oilVelocity + impulse / oilMass;
@@ -2813,6 +2836,7 @@ struct SurfaceRenderParams {
 @group(0) @binding(1) var<uniform> params: RenderParams;
 @group(0) @binding(2) var<storage, read> surfaceFields: array<vec2<f32>>;
 @group(0) @binding(3) var<uniform> surfaceParams: SurfaceRenderParams;
+@group(0) @binding(4) var<storage, read> bondedBodyStarts: array<u32>;
 
 const PARTICLE_MARKER_REFERENCE_AREA: f32 = 25.0;
 const PARTICLE_MARKER_AREA_SCALE: f32 = 2.0;
@@ -2897,6 +2921,46 @@ fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
 		discard;
 	}
 	return vec4<f32>(input.materialColor, 1.0);
+}
+
+struct PebbleVertexOutput {
+	@builtin(position) position: vec4<f32>,
+	@location(0) barycentric: vec3<f32>,
+}
+
+@vertex
+fn pebbleVertexMain(
+	@builtin(vertex_index) vertexIndex: u32,
+	@builtin(instance_index) instanceIndex: u32,
+) -> PebbleVertexOutput {
+	let start = bondedBodyStarts[instanceIndex];
+	let particle = particles[start + vertexIndex];
+	let worldPosition = particle.position;
+	let clipPosition = vec2<f32>(
+		2.0 * worldPosition.x / params.domainAndRadius.x - 1.0,
+		1.0 - 2.0 * worldPosition.y / params.domainAndRadius.y,
+	);
+	let barycentricCoordinates = array<vec3<f32>, 3>(
+		vec3<f32>(1.0, 0.0, 0.0),
+		vec3<f32>(0.0, 1.0, 0.0),
+		vec3<f32>(0.0, 0.0, 1.0),
+	);
+	var output: PebbleVertexOutput;
+	output.position = vec4<f32>(clipPosition, 0.0, 1.0);
+	output.barycentric = barycentricCoordinates[vertexIndex];
+	return output;
+}
+
+@fragment
+fn pebbleFragmentMain(input: PebbleVertexOutput) -> @location(0) vec4<f32> {
+	let edgeDistance = min(
+		input.barycentric.x,
+		min(input.barycentric.y, input.barycentric.z),
+	);
+	let fill = smoothstep(0.0, max(fwidth(edgeDistance) * 2.5, 1.0e-5), edgeDistance);
+	let outlineColor = vec3<f32>(0.98, 0.78, 0.36);
+	let pebbleColor = vec3<f32>(0.42, 0.34, 0.24);
+	return vec4<f32>(mix(outlineColor, pebbleColor, fill), 1.0);
 }
 
 struct SurfaceVertexOutput {

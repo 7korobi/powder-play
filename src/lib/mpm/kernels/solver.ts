@@ -337,6 +337,7 @@ interface MpmMlsGpuPipelines {
 	readonly pick: GPUComputePipeline;
 	readonly cloneObject: GPUComputePipeline;
 	readonly render: GPURenderPipeline;
+	readonly pebbleRender: GPURenderPipeline;
 	readonly surfaceRender: GPURenderPipeline;
 }
 
@@ -362,6 +363,7 @@ interface MpmMlsGpuStepBindings {
 	readonly commitParticles: GPUBindGroup;
 	readonly pick: GPUBindGroup;
 	readonly render: GPUBindGroup;
+	readonly pebbleRender: GPUBindGroup;
 }
 
 const INTERACTION_PARAMS_BYTES = 32;
@@ -684,6 +686,11 @@ async function createRuntime(
 		pick: await createComputePipeline(device, computeModule, 'pickParticle'),
 		cloneObject: await createComputePipeline(device, computeModule, 'cloneObject'),
 		render: await createRenderPipeline(device, renderModule, format),
+		pebbleRender: await createRenderPipeline(device, renderModule, format, {
+			label: 'MLS-MPM pebble triangle render pipeline',
+			vertexEntryPoint: 'pebbleVertexMain',
+			fragmentEntryPoint: 'pebbleFragmentMain'
+		}),
 		surfaceRender: await createRenderPipeline(device, renderModule, format, {
 			label: 'MLS-MPM water/oil surface render pipeline',
 			vertexEntryPoint: 'surfaceVertexMain',
@@ -1112,6 +1119,11 @@ async function createRuntime(
 			bufferEntry(0, input),
 			bufferEntry(1, buffers.renderParams)
 		]);
+		const pebbleRender = createBindGroup(device, pipelines.pebbleRender, [
+			bufferEntry(0, input),
+			bufferEntry(1, buffers.renderParams),
+			bufferEntry(4, buffers.bondedBodyStarts)
+		]);
 		const pick = createBindGroup(device, pipelines.pick, [
 			bufferEntry(1, input),
 			bufferEntry(8, buffers.particleObjectIds),
@@ -1138,7 +1150,8 @@ async function createRuntime(
 			removeParticlesInOutlet,
 			commitParticles,
 			pick,
-			render
+			render,
+			pebbleRender
 		};
 	};
 	const createCloneBinding = (inputIndex: 0 | 1): GPUBindGroup =>
@@ -2040,6 +2053,11 @@ function createSolver(
 			pass.setPipeline(runtime.pipelines.render);
 			pass.setBindGroup(0, runtime.bindings[currentBuffer].render);
 			pass.draw(6, particleSlotCount);
+			if (bondedBodyCount > 0) {
+				pass.setPipeline(runtime.pipelines.pebbleRender);
+				pass.setBindGroup(0, runtime.bindings[currentBuffer].pebbleRender);
+				pass.draw(3, bondedBodyCount);
+			}
 			pass.end();
 			session.device.queue.submit([encoder.finish()]);
 		} catch (cause) {

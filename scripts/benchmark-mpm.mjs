@@ -356,12 +356,12 @@ async function benchmark(profile) {
 		const oilMaterial = { model: 'oil', lambda: 8, mu: 0, density: 1 };
 		const contactParticles = [
 			{
-				position: { x: 7.5, y: 8 }, velocity: { x: 5, y: 0 },
+				position: { x: 7.5, y: 8 }, velocity: { x: 64, y: 0 },
 				C: zeroMatrix, F: identityMatrix, volume: 0.25,
 				objectId: 1, material: waterMaterial
 			},
 			{
-				position: { x: 8.5, y: 8 }, velocity: { x: -5, y: 0 },
+				position: { x: 8.5, y: 8 }, velocity: { x: -64, y: 0 },
 				C: zeroMatrix, F: identityMatrix, volume: 0.25,
 				objectId: 2, material: oilMaterial
 			}
@@ -437,6 +437,8 @@ async function benchmark(profile) {
 		}
 		const liquidContactAcceptance = {
 			particles: actualContact.length,
+			initialVelocityComponents: [64, -64],
+			dt: contactConfig.dt,
 			steps: contactSteps,
 			maxAbsoluteError: contactMaxAbsoluteError,
 			tolerance: physicsParityTolerance,

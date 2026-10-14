@@ -4,6 +4,7 @@ import type {
 	MpmParticle,
 	MpmVector2
 } from '../reference/solver.js';
+import { GATE4_LIQUID_BULK_MODULUS_SCALE } from './gate4.js';
 
 export const MAX_MPM_EMITTER_PARTICLES = 100_000;
 
@@ -27,13 +28,13 @@ const ZERO_MATRIX = { m00: 0, m01: 0, m10: 0, m11: 0 } as const;
 const IDENTITY = { m00: 1, m01: 0, m10: 0, m11: 1 } as const;
 const MATERIALS = {
 	water: {
-		lambda: 40_000,
+		lambda: 40_000 * GATE4_LIQUID_BULK_MODULUS_SCALE,
 		mu: 0,
 		model: 'water',
 		density: 0.02
 	},
 	oil: {
-		lambda: 30_000,
+		lambda: 30_000 * GATE4_LIQUID_BULK_MODULUS_SCALE,
 		mu: 0,
 		model: 'oil',
 		density: 0.016

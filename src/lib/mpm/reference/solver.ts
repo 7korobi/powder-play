@@ -1,5 +1,8 @@
 import {
 	normalizeMpmConstitutiveModel,
+	MPM_LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER,
+	MPM_LIQUID_CONTACT_RELAXATION_SECONDS,
+	MPM_LIQUID_CONTACT_SEPARATION_FRACTION,
 	SNOW_PLASTICITY
 } from '../materials.js';
 import {
@@ -985,9 +988,23 @@ function solveLiquidGridContact(
 	const relativeNormalVelocity =
 		(node.oilVelocityX - node.waterVelocityX) * normal.x +
 		(node.oilVelocityY - node.waterVelocityY) * normal.y;
-	if (relativeNormalVelocity >= 0) return;
+	const overlapFraction = Math.min(
+		1,
+		(2 * Math.min(node.waterVolume, node.oilVolume)) /
+			(node.waterVolume + node.oilVolume)
+	);
+	const minimumSeparationVelocity =
+		Math.max(
+			(MPM_LIQUID_CONTACT_SEPARATION_FRACTION *
+				overlapFraction *
+				config.grid.cellSize) /
+				MPM_LIQUID_CONTACT_RELAXATION_SECONDS,
+			Math.max(-relativeNormalVelocity, 0) *
+				MPM_LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER
+		);
+	if (relativeNormalVelocity >= minimumSeparationVelocity) return;
 	const impulse =
-		-relativeNormalVelocity /
+		(minimumSeparationVelocity - relativeNormalVelocity) /
 		(1 / node.waterMass + 1 / node.oilMass);
 	node.waterVelocityX -= (impulse / node.waterMass) * normal.x;
 	node.waterVelocityY -= (impulse / node.waterMass) * normal.y;

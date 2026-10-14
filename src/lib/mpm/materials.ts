@@ -10,6 +10,10 @@ export const MPM_CONSTITUTIVE_MODEL_CODES: Readonly<
 	powder: 4
 };
 
+export const MPM_LIQUID_CONTACT_SEPARATION_FRACTION = 0.25;
+export const MPM_LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER = 2;
+export const MPM_LIQUID_CONTACT_RELAXATION_SECONDS = 0.05;
+
 export const SNOW_PLASTICITY = {
 	compressionYield: 0.025,
 	stretchYield: 0.0075,

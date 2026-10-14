@@ -21,6 +21,8 @@ export const GATE4_LIQUID_START_X = 100;
 export const GATE4_WATER_START_Y = 640;
 export const GATE4_OIL_START_Y = 100;
 export const GATE4_PARTICLE_AREA = 100;
+export const GATE4_LIQUID_PARTICLE_AREA = GATE4_PARTICLE_AREA;
+export const GATE4_LIQUID_BULK_MODULUS_SCALE = 4;
 export const GATE4_SOLID_PARTICLE_MASS = 4;
 export const GATE4_PEBBLE_COUNT = 50;
 export const GATE4_PEBBLE_PARTICLES_PER_OBJECT = 3;
@@ -40,8 +42,9 @@ export const GATE4_FRACTURE_FAILURE_STRAIN = 0.12;
 export const GATE4_PEBBLE_COLUMNS = 8;
 export const GATE4_PEBBLE_ROWS = Math.ceil(GATE4_PEBBLE_COUNT / GATE4_PEBBLE_COLUMNS);
 export const GATE4_PEBBLE_SPACING = 150;
-export const GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX = 8;
-export const GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX = 30;
+export const GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX = 8 * 8;
+export const GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX = 30 * 8;
+export const GATE4_FRACTURE_INITIAL_VELOCITY_COMPONENT_MAX = 10 * 8;
 const PEBBLE_BASE_WIDTH_RATIO = 0.005;
 const PEBBLE_SIZE_MULTIPLIER = 12;
 const UINT32_RANGE = 0x1_0000_0000;
@@ -67,13 +70,13 @@ const PEBBLE_MATERIAL = {
 const ZERO_MATRIX = { m00: 0, m01: 0, m10: 0, m11: 0 } as const;
 const INITIAL_DEFORMATION = { m00: 1, m01: 0, m10: 0, m11: 1 } as const;
 const WATER_MATERIAL = {
-	lambda: 40_000,
+	lambda: 40_000 * GATE4_LIQUID_BULK_MODULUS_SCALE,
 	mu: 0,
 	model: 'water',
 	density: 0.02
 } as const satisfies MpmMaterialParameters;
 const OIL_MATERIAL = {
-	lambda: 30_000,
+	lambda: 30_000 * GATE4_LIQUID_BULK_MODULUS_SCALE,
 	mu: 0,
 	model: 'oil',
 	density: 0.016
@@ -85,6 +88,7 @@ const OBJECTS = [
 		startY: GATE4_WATER_START_Y,
 		columns: GATE4_WATER_PARTICLE_COLUMNS,
 		rows: GATE4_WATER_PARTICLE_ROWS,
+		particleArea: GATE4_LIQUID_PARTICLE_AREA,
 		probeRow: 0,
 		probeColumn: Math.floor(GATE4_WATER_PARTICLE_COLUMNS / 2),
 		material: WATER_MATERIAL
@@ -95,6 +99,7 @@ const OBJECTS = [
 		startY: GATE4_OIL_START_Y,
 		columns: GATE4_OIL_PARTICLE_COLUMNS,
 		rows: GATE4_OIL_PARTICLE_ROWS,
+		particleArea: GATE4_LIQUID_PARTICLE_AREA,
 		probeRow: GATE4_OIL_PARTICLE_ROWS - 1,
 		probeColumn: Math.floor(GATE4_OIL_PARTICLE_COLUMNS / 2),
 		material: OIL_MATERIAL
@@ -173,7 +178,7 @@ export function createMpmGate4Scene(
 					F: INITIAL_DEFORMATION,
 					objectId: object.objectId,
 					plasticVolume: 1,
-					volume: GATE4_PARTICLE_AREA,
+					volume: object.particleArea,
 					material: object.material
 				});
 			}
@@ -229,7 +234,10 @@ export function createMpmGate4Scene(
 	}
 
 	const fractureStart = particles.length;
-	const fractureVelocity = createRandomVelocity(random, 10);
+	const fractureVelocity = createRandomVelocity(
+		random,
+		GATE4_FRACTURE_INITIAL_VELOCITY_COMPONENT_MAX
+	);
 	for (let row = 0; row < GATE4_FRACTURE_ROWS; row += 1) {
 		for (let column = 0; column < GATE4_FRACTURE_COLUMNS; column += 1) {
 			const centeredColumn = column - (GATE4_FRACTURE_COLUMNS - 1) / 2;

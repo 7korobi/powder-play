@@ -49,7 +49,9 @@
 		GATE4_FRACTURE_PARTICLE_COUNT,
 		GATE4_FRACTURE_ROWS,
 		GATE4_GRID,
+		GATE4_LIQUID_BULK_MODULUS_SCALE,
 		GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX,
+		GATE4_LIQUID_PARTICLE_AREA,
 		GATE4_LIQUID_PARTICLE_SPACING,
 		GATE4_PARTICLE_CAPACITY,
 		GATE4_PARTICLE_COUNT,
@@ -824,7 +826,10 @@
 				spacing: emitterSpacing,
 				velocity: { x: emitterVelocityX, y: emitterVelocityY },
 				material: emitterMaterial,
-				particleVolume: PARTICLE_VOLUME,
+				particleVolume:
+					emitterMaterial === 'water' || emitterMaterial === 'oil'
+						? GATE4_LIQUID_PARTICLE_AREA
+						: PARTICLE_VOLUME,
 				grid: GRID
 			});
 		} catch (error) {
@@ -1347,19 +1352,7 @@
 					velocityBound: parityVelocityBound,
 					maxMicrosteps: MAX_MICROSTEPS_PER_FRAME
 				});
-				const parityMicrostepConfig = makeStepConfig(
-					config.gravity,
-					parityBatch.microstepPlan.microDt
-				);
-				let expectedSample = paritySample.particles;
-				for (
-					let microstep = 0;
-					microstep < parityBatch.microstepPlan.stepCount;
-					microstep += 1
-				) {
-					expectedSample = stepMpm(expectedSample, parityMicrostepConfig).particles;
-				}
-				candidate.stepCflBatch(
+				const parityMeasurement = await candidate.stepCflBatchAdaptive(
 					parityBatch.macroStepCount,
 					FIXED_STEP_SECONDS,
 					parityBatch.microstepPlan,
@@ -1367,25 +1360,57 @@
 					MAX_MICROSTEPS_PER_FRAME,
 					config.gravity
 				);
-				const [actual, maximumParticleSpeed] = await Promise.all([
-					candidate.readParticles(initialScene.parityProbeIndices),
-					candidate.measureMaximumParticleSpeed()
-				]);
 				if (!mounted || activeSolver !== candidate || phase === 'lost') return;
-				latestSubmittedCflSequence = maximumParticleSpeed.sequence;
-				applyCflSpeedSample(maximumParticleSpeed);
-
-				const expected = paritySample.probeSampleIndices.map(
-					(index) => expectedSample[index]
-				);
-				const maxError = maxParticleDifference(actual, expected);
-				parityPassed = particleDifferenceWithinTolerance(actual, expected);
-				const probeLabel = PARITY_PROBE_LABELS[maxError.probeIndex] ?? '粒子';
-				parityMessage = Number.isFinite(maxError.absoluteDifference)
-					? `初回1 macrostep・${parityBatch.microstepPlan.stepCount} CFL microsteps、各材料中央3粒子の CPU reference 比較: 最大絶対誤差 ${maxError.absoluteDifference.toExponential(2)}（${probeLabel} ${maxError.field}: GPU ${maxError.actual.toExponential(2)} / CPU ${maxError.expected.toExponential(2)}）${
-							parityPassed ? '· 誤差基準内' : '· 誤差基準超過'
-						}`
-					: '初回1 macrostepの CPU reference 比較で粒子数または数値が一致しません。';
+				latestSubmittedCflSequence = parityMeasurement.sequence;
+				applyCflSpeedSample(parityMeasurement);
+				if (
+					parityMeasurement.retryCount === 0 &&
+					parityMeasurement.remainingDuration === 0
+				) {
+					const parityMicrostepConfig = makeStepConfig(
+						config.gravity,
+						parityBatch.microstepPlan.microDt
+					);
+					let expectedSample = paritySample.particles;
+					for (
+						let microstep = 0;
+						microstep < parityBatch.microstepPlan.stepCount;
+						microstep += 1
+					) {
+						expectedSample = stepMpm(
+							expectedSample,
+							parityMicrostepConfig
+						).particles;
+					}
+					const actual = await candidate.readParticles(
+						initialScene.parityProbeIndices
+					);
+					if (
+						!mounted ||
+						activeSolver !== candidate ||
+						phase !== 'initializing'
+					) {
+						return;
+					}
+					const expected = paritySample.probeSampleIndices.map(
+						(index) => expectedSample[index]
+					);
+					const maxError = maxParticleDifference(actual, expected);
+					parityPassed = particleDifferenceWithinTolerance(actual, expected);
+					const probeLabel =
+						PARITY_PROBE_LABELS[maxError.probeIndex] ?? '粒子';
+					parityMessage = Number.isFinite(maxError.absoluteDifference)
+						? `初回1 macrostep・${parityBatch.microstepPlan.stepCount} CFL microsteps、各材料中央3粒子の CPU reference 比較: 最大絶対誤差 ${maxError.absoluteDifference.toExponential(2)}（${probeLabel} ${maxError.field}: GPU ${maxError.actual.toExponential(2)} / CPU ${maxError.expected.toExponential(2)}）${
+								parityPassed ? '· 誤差基準内' : '· 誤差基準超過'
+							}`
+						: '初回1 macrostepの CPU reference 比較で粒子数または数値が一致しません。';
+				} else {
+					parityPassed = null;
+					parityMessage =
+						`初回macrostepを適応CFLで安全に進めました（${parityMeasurement.retryCount} retry、` +
+						`${parityMeasurement.attemptedMicroStepCount} microsteps）。時間刻みを再試行時に変更したため、` +
+						'この起動時CPU/GPU比較は省略しました。';
+				}
 				submittedMacroStepCount = 0;
 				submittedMicroStepCount = 0;
 				submittedParticleMicrosteps = 0;
@@ -1393,8 +1418,8 @@
 				submittedBatchCpuMilliseconds = 0;
 				queueSampleCount = 0;
 				queueSampleTotalMs = 0;
-				simulatedTimeSeconds = 0;
-				simulationAccumulatorSeconds = 0;
+				simulatedTimeSeconds = parityMeasurement.simulatedDuration;
+				simulationAccumulatorSeconds = parityMeasurement.remainingDuration;
 				metricsStartTimestamp = null;
 				performanceFrameCount = 0;
 				measuredMacroStepsPerSecond = null;
@@ -1470,7 +1495,7 @@
 			<p class="intro">
 				水・油・Neo-Hookean 固体を repeatable / continuous emitter から追加し、傾きまたは手動の2D重力で操作します。
 				水と油は相別速度場・node-owned normal contact で接触し、各相の mass と接触 impulse を小規模 CPU reference で検証します。
-				初期シーンは{GATE4_PARTICLE_COUNT.toLocaleString()}粒子（旧14,696粒子の1/4）で、参照面積を4倍・見た目の面積を約8倍にし、総量を保ちます。小石を液体中に配置し、初期速度と揺れは弱めています。
+				初期シーンは{GATE4_PARTICLE_COUNT.toLocaleString()}粒子（旧14,696粒子の1/4）です。水・油の参照面積・総質量は維持し、圧縮抵抗を{GATE4_LIQUID_BULK_MODULUS_SCALE}倍に強化しました。水・油の相境界には独立した重なり緩和を加え、初期配置は維持します。初期速度は水・油±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX}へ上げ、揺れは初期停止にしています。
 				50個の三粒子小石に加え、{GATE4_FRACTURE_COLUMNS}×{GATE4_FRACTURE_ROWS}ノード・{GATE4_FRACTURE_BOND_COUNT} bond の固体を GPU 上で損傷・局所破断させます。
 				これは制御可能な研究用 vertical slice であり、一般用途の流体・破壊エンジンや物理精度保証ではありません。
 			</p>
@@ -1732,7 +1757,7 @@
 				<section class="source-controls" aria-labelledby="source-title">
 					<h3 id="source-title">材料 emitter · 容量 · outlet</h3>
 					<p class="control-note">
-						各追加は seed + burst 番号から決定論的に配置します。GPU 粒子 state が正本です。一時停止中は連続追加も停止します。容量超過分は追加せず件数を報告し、削除スロットは再利用しません。
+						各追加は seed + burst 番号から決定論的に配置します。水・油は参照面積{GATE4_LIQUID_PARTICLE_AREA.toLocaleString()}、固体は{PARTICLE_VOLUME}を使います。GPU 粒子 state が正本です。一時停止中は連続追加も停止します。容量超過分は追加せず件数を報告し、削除スロットは再利用しません。
 					</p>
 					<div class="source-grid">
 						<label>
@@ -1862,7 +1887,7 @@
 					</p>
 				</section>
 				<p id="render-mode-description" class="render-mode-note">
-					自由表面は粒子の現在面積から GPU 上で作る表示専用フィールドです。各画素は優勢な相の色で表示し、水と油の占有が同程度の境界だけを明るく示します。これは描画上の色分けであり、物理的な完全分離を意味しません。粒子マーカー（診断）では全材料の粒子位置を表示し、参照面積に応じて半径を拡大します。材料間接触は表示場とは別の物理 pass で解きます。
+					自由表面は粒子の現在面積から GPU 上で作る表示専用フィールドです。各画素は優勢な相の色で表示し、水と油の占有が同程度の境界だけを明るく示します。これは描画上の色分けであり、物理的な完全分離を意味しません。小石はGPU上で塗り三角形と明るい輪郭線を重ね、物体形状を表示します。粒子マーカー（診断）では全材料の粒子位置も表示します。材料間接触は表示場とは別の物理 pass で解きます。
 				</p>
 			</section>
 
@@ -1901,11 +1926,11 @@
 		</div>
 
 		<p class="material-legend">
-			<span><i class="water-swatch"></i> 水 {GATE4_WATER_PARTICLE_COUNT.toLocaleString()}粒子（密度 0.02・圧縮係数 40,000）</span>
-			<span><i class="oil-swatch"></i> 油 {GATE4_OIL_PARTICLE_COUNT.toLocaleString()}粒子（密度 0.016・圧縮係数 30,000）</span>
+			<span><i class="water-swatch"></i> 水 {GATE4_WATER_PARTICLE_COUNT.toLocaleString()}粒子（密度 0.02・圧縮係数 {(40_000 * GATE4_LIQUID_BULK_MODULUS_SCALE).toLocaleString()}）</span>
+			<span><i class="oil-swatch"></i> 油 {GATE4_OIL_PARTICLE_COUNT.toLocaleString()}粒子（密度 0.016・圧縮係数 {(30_000 * GATE4_LIQUID_BULK_MODULUS_SCALE).toLocaleString()}）</span>
 			<span><i class="pebble-swatch"></i> 弾性小石{GATE4_PEBBLE_COUNT}個（各3粒子・Neo-Hookean・λ 20・μ 10）</span>
 			<span><i class="fracture-swatch"></i> GPU fracture body（{GATE4_FRACTURE_PARTICLE_COUNT} node・{GATE4_FRACTURE_BOND_COUNT} bond・赤は damage）</span>
-			参照粒子面積は旧25から100へ4倍にし、水・油の粒子間隔も9から18へ拡大しました。液体・固体の総質量と参照面積は維持し、表面・粒子マーカーの表示面積は旧scene比約8倍です。小石は一辺132 world units、中心間隔150の正三角形で、液体の上から内部に広がります。液体の初速は各成分±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石頂点は±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX} world units/s、左右揺れの初期値は0です。水と油は相別grid field・相別密度による法線接触を保ちますが、界面の優勢相表示は実際の混合状態を隠しません。接触・質量保存の小規模 controlled reference test は通りますが、幅広い速度・解像度・長時間挙動を保証しません。表面張力、濡れ、接線摩擦、連続衝突検出、界面の微視的物理は未実装です。
+			固体粒子の参照面積は旧25から100へ4倍、水・油は参照面積100・密度を保ち、総質量・参照体積も従来sceneから変えていません。水・油の弱圧縮EOS係数を4倍（160,000・120,000）にして、同じ圧縮に対する復元圧力を強めました。相別grid fieldで従来の接近速度除去に加え、両相が同じcellを占める割合と接近速度に応じた分離biasを与え、等量・反対向きのimpulseで運動量を保ちます。node-levelの接近速度に対するtargetはその2倍ですが、これは接触・圧縮抵抗の近似であり、任意状態の完全な非混和性や粒子貫入ゼロを保証しません。粒子数・初期座標・間隔18 world unitsは変更していません。小石は一辺132 world units、中心間隔150の正三角形を塗りと輪郭線で描画します。液体の初速は各成分±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石頂点は±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX} world units/s、左右揺れの初期値は0です。界面表示は物理場とは独立した描画近似です。controlled reference testは圧縮応答・接触impulse・質量・運動量を検査しますが、幅広い速度・解像度・長時間挙動を保証しません。表面張力、濡れ、接線摩擦、連続衝突検出、界面の微視的物理は未実装です。
 		</p>
 
 		<section class="performance" aria-labelledby="performance-title">
