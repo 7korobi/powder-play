@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { projectDeviceOrientationGravity } from '#lib/input/sensors.js';
+	import Gate4ParticleSizeControl from '#lib/mpm/Gate4ParticleSizeControl.svelte';
 	import { encodeMpmConstitutiveModel } from '#lib/mpm/materials.js';
 	import {
 		createMpmMlsGpuSolver,
@@ -35,34 +36,35 @@
 	import {
 		stepMpm,
 		type MpmParticle,
-		type MpmStepConfig,
 		type MpmVector2
 	} from '#lib/mpm/reference/solver.js';
 	import {
 		createMpmCpuParitySample,
-		createMpmGate4MlsScene,
+		createMpmGate4Scene,
+		createMpmGate4StepConfig,
+		getGate4LiquidParticleArea,
 		GATE4_CLONE_OFFSET,
+		GATE4_DEFAULT_GRAVITY,
 		GATE4_FRACTURE_BOND_COUNT,
 		GATE4_FRACTURE_COLUMNS,
 		GATE4_FRACTURE_FAILURE_STRAIN,
 		GATE4_FRACTURE_OBJECT_ID,
 		GATE4_FRACTURE_PARTICLE_COUNT,
 		GATE4_FRACTURE_ROWS,
-		GATE4_LIQUID_PARTICLE_AREA,
 		GATE4_LIQUID_BULK_MODULUS_SCALE,
 		GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX,
+		GATE4_LIQUID_PARTICLE_DIAMETER,
+		GATE4_LIQUID_PARTICLE_DIAMETER_QUERY_KEY,
 		GATE4_LIQUID_PARTICLE_SPACING,
-		GATE4_MPM_GRID,
-		GATE4_MPM_INITIAL_Y_OFFSET,
-		GATE4_MPM_LIQUID_PARTICLE_AREA,
-		GATE4_MPM_LIQUID_PARTICLE_AREA_SCALE,
+		GATE4_FIXED_STEP_SECONDS,
+		GATE4_GRID,
 		GATE4_PARTICLE_CAPACITY,
 		GATE4_PARTICLE_COUNT,
 		GATE4_PARTICLE_AREA,
 		GATE4_PEBBLE_COUNT,
 		GATE4_PEBBLE_EDGE_LENGTH,
 		GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX,
-		GATE4_SOLID_PARTICLE_MASS,
+		GATE4_SCENE_SEED,
 		GATE4_WATER_PARTICLE_COUNT,
 		GATE4_OIL_PARTICLE_COUNT
 	} from '#lib/mpm/scenes/gate4.js';
@@ -72,7 +74,7 @@
 		type MpmEmitterShape
 	} from '#lib/mpm/scenes/emitter.js';
 
-	const GRID = GATE4_MPM_GRID;
+	const GRID = GATE4_GRID;
 	const WORLD_WIDTH = GRID.cellsX * GRID.cellSize;
 	const WORLD_HEIGHT = GRID.cellsY * GRID.cellSize;
 	const LIQUID_J_FLOOR_BAND_HEIGHT = 8 * GRID.cellSize;
@@ -83,7 +85,7 @@
 		maxX: WORLD_WIDTH,
 		maxY: WORLD_HEIGHT
 	};
-	const FIXED_STEP_SECONDS = 1 / 240;
+	const FIXED_STEP_SECONDS = GATE4_FIXED_STEP_SECONDS;
 	const MAX_SIMULATION_SPEED = 32;
 	const SENSOR_GRAVITY_MAXIMUM = 180;
 	const CONTINUOUS_EMISSION_INTERVAL_MS = 250;
@@ -98,9 +100,7 @@
 	const GPU_PARTICLE_CAPACITY = GATE4_PARTICLE_CAPACITY;
 	const PICK_RADIUS = 14;
 	const BRUSH_RADIUS = 24;
-	const PARTICLE_MASS = GATE4_SOLID_PARTICLE_MASS;
 	const PARTICLE_VOLUME = GATE4_PARTICLE_AREA;
-	const MATERIAL = { lambda: 20, mu: 10, model: 'neo-hookean' } as const;
 	const PARITY_ABSOLUTE_TOLERANCE = 0.02;
 	const PARITY_VELOCITY_ABSOLUTE_TOLERANCE = 0.025;
 	const PARITY_VELOCITY_RELATIVE_TOLERANCE = 0.0005;
@@ -142,24 +142,6 @@
 	let simulationAccumulatorSeconds = $state(0);
 	let latestSubmittedCflSequence = 0;
 	let latestPlannedParticleSpeedBound = 0;
-
-	function makeStepConfig(
-		gravity: MpmVector2,
-		dt = FIXED_STEP_SECONDS,
-		fractureBonds?: MpmStepConfig['fractureBonds']
-	): MpmStepConfig {
-		return {
-			dt,
-			bondReferenceDt: FIXED_STEP_SECONDS,
-			grid: GRID,
-			particleMass: PARTICLE_MASS,
-			particleVolume: PARTICLE_VOLUME,
-			bondRestLength: GATE4_PEBBLE_EDGE_LENGTH,
-			material: MATERIAL,
-			gravity,
-			...(fractureBonds === undefined ? {} : { fractureBonds })
-		};
-	}
 
 	function toggleHorizontalOscillation(): void {
 		horizontalOscillationAmplitude =
@@ -386,7 +368,7 @@
 	}
 
 	function particleValues(particle: MpmParticle): number[] {
-		const material = particle.material ?? MATERIAL;
+		const material = particle.material ?? createMpmGate4StepConfig().material;
 		const density =
 			material.model === 'water' || material.model === 'oil'
 				? material.density
@@ -509,9 +491,9 @@
 	let solver: GpuSolver | null = null;
 	let phase = $state<Phase>('initializing');
 	let phaseMessage = $state('WebGPU MLS-MPM を初期化しています…');
-	let gravityMagnitude = $state(90);
-	let manualGravityX = $state(0);
-	let manualGravityY = $state(90);
+	let gravityMagnitude = $state(GATE4_DEFAULT_GRAVITY.y);
+	let manualGravityX = $state(GATE4_DEFAULT_GRAVITY.x);
+	let manualGravityY = $state(GATE4_DEFAULT_GRAVITY.y);
 	let orientationStatus = $state<OrientationStatus>('checking');
 	let orientationMessage = $state('DeviceOrientation センサーを確認しています…');
 	let sensorGravityUnit = $state<MpmVector2>({ x: 0, y: 0 });
@@ -519,6 +501,8 @@
 	let simulationSpeed = $state(DEFAULT_SIMULATION_SPEED);
 	let renderTargetFps: MpmRenderFps = $state(DEFAULT_RENDER_FPS);
 	let horizontalOscillationAmplitude = $state(INITIAL_HORIZONTAL_OSCILLATION_AMPLITUDE);
+	let liquidParticleDiameter = $state(GATE4_LIQUID_PARTICLE_DIAMETER);
+	let appliedLiquidParticleDiameter = $state(GATE4_LIQUID_PARTICLE_DIAMETER);
 	let paused = $state(false);
 	let parityMessage = $state('');
 	let parityPassed = $state<boolean | null>(null);
@@ -546,7 +530,7 @@
 	let emitterSeed = $state(0x5eed_1234);
 	let emitterSequence = $state(0);
 	let emitterX = $state(700);
-	let emitterY = $state(200 + GATE4_MPM_INITIAL_Y_OFFSET);
+	let emitterY = $state(200);
 	let emitterSpacing = $state(GATE4_LIQUID_PARTICLE_SPACING);
 	let emitterVelocityX = $state(0);
 	let emitterVelocityY = $state(30);
@@ -571,10 +555,20 @@
 				y: sensorGravityUnit.y * gravityMagnitude
 			};
 		}
+
 		return { x: manualGravityX, y: manualGravityY };
 	}
 
 	let appliedGravity = $derived(effectiveGravity());
+
+	function applyLiquidParticleDiameter(): void {
+		const url = new URL(window.location.href);
+		url.searchParams.set(
+			GATE4_LIQUID_PARTICLE_DIAMETER_QUERY_KEY,
+			String(liquidParticleDiameter)
+		);
+		window.location.assign(url.href);
+	}
 
 	function refreshDeviceOrientationSupport(): void {
 		const supported =
@@ -915,7 +909,7 @@
 				material: emitterMaterial,
 				particleVolume:
 					emitterMaterial === 'water' || emitterMaterial === 'oil'
-						? GATE4_MPM_LIQUID_PARTICLE_AREA
+						? getGate4LiquidParticleArea(appliedLiquidParticleDiameter)
 						: PARTICLE_VOLUME,
 				grid: GRID
 			});
@@ -1375,14 +1369,23 @@
 
 			try {
 				resizeCanvas();
-				const initialScene = createMpmGate4MlsScene(0x4d504d34);
+				const particleDiameterParameter = new URLSearchParams(window.location.search).get(
+					GATE4_LIQUID_PARTICLE_DIAMETER_QUERY_KEY
+				);
+				if (particleDiameterParameter !== null) {
+					liquidParticleDiameter = Number(particleDiameterParameter);
+				}
+				const initialScene = createMpmGate4Scene(GATE4_SCENE_SEED, {
+					liquidParticleDiameter
+				});
+				appliedLiquidParticleDiameter = liquidParticleDiameter;
 				const paritySample = createMpmCpuParitySample(
 					initialScene.particles,
 					initialScene.parityProbeIndices,
 					GRID.cellSize
 				);
 				const initialParticles = initialScene.particles;
-				const config = makeStepConfig(
+				const config = createMpmGate4StepConfig(
 					effectiveGravity(),
 					FIXED_STEP_SECONDS,
 					initialScene.fractureBonds
@@ -1454,7 +1457,7 @@
 					parityMeasurement.retryCount === 0 &&
 					parityMeasurement.remainingDuration === 0
 				) {
-					const parityMicrostepConfig = makeStepConfig(
+					const parityMicrostepConfig = createMpmGate4StepConfig(
 						config.gravity,
 						parityBatch.microstepPlan.microDt
 					);
@@ -1570,7 +1573,7 @@
 	<title>GPU 2D MLS-MPM インタラクティブサンドボックス · powder-play</title>
 	<meta
 		name="description"
-		content="2D GPU MLS-MPM の水・油相、材料 emitter、傾き重力と局所破断する弾性体を操作する実験サンドボックスです。"
+		content="CPU MPM reference と共通のシーン・材料設定を使う、2D GPU MLS-MPM の比較実験サンドボックスです。"
 	/>
 </svelte:head>
 
@@ -1581,13 +1584,24 @@
 			<h1>GPU 2D MLS-MPM サンドボックス</h1>
 			<p class="intro">
 				水・油・Neo-Hookean 固体を repeatable / continuous emitter から追加し、傾きまたは手動の2D重力で操作します。
+				CPU reference ページと同じ seed・初期配置・材料・時間刻み・領域を使い、実行経路だけが WGSL/WebGPU です。
 				水と油は相別速度場・node-owned normal contact で接触し、各相の mass と接触 impulse を小規模 CPU reference で検証します。
-				初期シーンは{GATE4_PARTICLE_COUNT.toLocaleString()}粒子（旧14,696粒子の1/4）です。MPM専用領域は{WORLD_WIDTH}×{WORLD_HEIGHT}（grid {GRID.cellsX}×{GRID.cellsY}・cell {GRID.cellSize}）です。水・油の参照面積と質量は従来のMPM設定からさらに{GATE4_MPM_LIQUID_PARTICLE_AREA_SCALE}倍（{GATE4_LIQUID_PARTICLE_AREA}→{GATE4_MPM_LIQUID_PARTICLE_AREA}）にし、密度・粒子数・間隔18は維持します。全初期物体をY方向に{GATE4_MPM_INITIAL_Y_OFFSET}移動して床との余白を維持し、粒子マーカー半径は従来設定の2倍です。EOS係数は160,000・120,000のまま、水・油の相境界には運動エネルギーを増幅しない接触を使います。初期速度は水・油±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX}、揺れは初期停止です。
+				初期シーンは{GATE4_PARTICLE_COUNT.toLocaleString()}粒子（旧14,696粒子の1/4）、共通領域は{WORLD_WIDTH}×{WORLD_HEIGHT}（grid {GRID.cellsX}×{GRID.cellsY}・cell {GRID.cellSize}）です。
+				水・油の既定直径は{appliedLiquidParticleDiameter} units、参照面積は
+				{getGate4LiquidParticleArea(appliedLiquidParticleDiameter).toLocaleString()} units²（基準面積100の4倍）です。
+				粒子数と配置間隔{GATE4_LIQUID_PARTICLE_SPACING}は固定し、粒径から面積・質量・描画径を導出します。
+				EOS係数は160,000・120,000、水・油の相境界には運動エネルギーを増幅しない接触を使います。
+				初期速度は水・油±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX}です。左右揺れは既定で有効（±240 world units/s²・0.16 Hz）で、操作欄から停止できます。
 				50個の三粒子小石に加え、{GATE4_FRACTURE_COLUMNS}×{GATE4_FRACTURE_ROWS}ノード・{GATE4_FRACTURE_BOND_COUNT} bond の固体を GPU 上で損傷・局所破断させます。
 				これは制御可能な研究用 vertical slice であり、一般用途の流体・破壊エンジンや物理精度保証ではありません。
 			</p>
 		</div>
 		<nav aria-label="実験ページ">
+			<a
+				href={`/labs/mpm/liquidfun?${GATE4_LIQUID_PARTICLE_DIAMETER_QUERY_KEY}=${appliedLiquidParticleDiameter}`}
+			>
+				CPU MLS-MPM reference
+			</a>
 			<a href="/labs/mpm">粒子操作ラボ</a>
 			<a href="/">通常画面</a>
 		</nav>
@@ -1623,6 +1637,12 @@
 		<div class="simulation-layout">
 			<section class="simulation-controls" aria-label="シミュレーション操作">
 				<div class="controls">
+					<Gate4ParticleSizeControl
+						bind:value={liquidParticleDiameter}
+						appliedValue={appliedLiquidParticleDiameter}
+						disabled={phase !== 'ready'}
+						onApply={applyLiquidParticleDiameter}
+					/>
 					<fieldset class="gravity-controls">
 						<legend>2D 重力 · {orientationStatus === 'enabled' && hasSensorGravity ? 'センサー' : '手動'}</legend>
 						<label>
@@ -1844,7 +1864,10 @@
 				<section class="source-controls" aria-labelledby="source-title">
 					<h3 id="source-title">材料 emitter · 容量 · outlet</h3>
 					<p class="control-note">
-						各追加は seed + burst 番号から決定論的に配置します。水・油は参照面積{GATE4_MPM_LIQUID_PARTICLE_AREA.toLocaleString()}、固体は{PARTICLE_VOLUME}を使います。GPU 粒子 state が正本です。一時停止中は連続追加も停止します。容量超過分は追加せず件数を報告し、削除スロットは再利用しません。
+						各追加は seed + burst 番号から決定論的に配置します。水・油は共通粒径
+						{appliedLiquidParticleDiameter}・参照面積
+						{getGate4LiquidParticleArea(appliedLiquidParticleDiameter).toLocaleString()}、固体は
+						{PARTICLE_VOLUME}を使います。GPU 粒子 state が正本です。一時停止中は連続追加も停止します。容量超過分は追加せず件数を報告し、削除スロットは再利用しません。
 					</p>
 					<div class="source-grid">
 						<label>
@@ -2018,7 +2041,7 @@
 			<span><i class="oil-swatch"></i> 油 {GATE4_OIL_PARTICLE_COUNT.toLocaleString()}粒子（密度 0.016・圧縮係数 {(30_000 * GATE4_LIQUID_BULK_MODULUS_SCALE).toLocaleString()}）</span>
 			<span><i class="pebble-swatch"></i> 弾性小石{GATE4_PEBBLE_COUNT}個（各3粒子・Neo-Hookean・λ 20・μ 10）</span>
 			<span><i class="fracture-swatch"></i> GPU fracture body（{GATE4_FRACTURE_PARTICLE_COUNT} node・{GATE4_FRACTURE_BOND_COUNT} bond・赤は damage）</span>
-			固体粒子の参照面積は旧25から100へ4倍、水・油は従来のMPM設定400から1600へさらに4倍（旧100の16倍）にし、密度・粒子数・間隔は維持したため総液体質量・参照体積も4倍（水64,000・油38,400）です。相対配置と底部余白を維持するため全初期物体をY方向に4,500移動し、MPM専用gridは220×600 cell、cellSize 10（world 2,200×6,000）です。水・油の弱圧縮EOS係数160,000・120,000は変更せず、相別grid fieldでは重なりに応じた基礎分離速度と、接近速度を増幅しない等量・反対向きのimpulseを使います。これは近似的な接触応答であり、完全な非混和性や粒子貫入ゼロを保証しません。小石は一辺132 world units、中心間隔150の正三角形を塗りと輪郭線で描画します。液体の初速は各成分±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石頂点は±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX} world units/s、左右揺れの初期値は0です。界面表示は物理場とは独立した描画近似です。controlled reference testは圧縮応答・接触impulse・質量・運動量を検査しますが、幅広い速度・解像度・長時間挙動を保証しません。表面張力、濡れ、接線摩擦、連続衝突検出、界面の微視的物理は未実装です。
+			固体粒子の参照面積は100 units²です。水・油の参照面積は共通直径の二乗（既定20 unitsなら400 units²）で、質量は各相の密度（水0.02・油0.016）から導出します。粒子数と配置間隔18 unitsは固定のため、直径変更に応じて液体の質量・参照体積が変わります。共有領域は2,200×1,500 world units（220×150 grid・cellSize 10）です。水・油の弱圧縮EOS係数160,000・120,000は変更せず、相別grid fieldでは重なりに応じた基礎分離速度と、接近速度を増幅しない等量・反対向きのimpulseを使います。これは近似的な接触応答であり、完全な非混和性や粒子貫入ゼロを保証しません。小石は一辺132 world units、中心間隔150の正三角形を塗りと輪郭線で描画します。液体の初速は各成分±{GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX}、小石頂点は±{GATE4_PEBBLE_INITIAL_VELOCITY_COMPONENT_MAX} world units/sです。左右揺れは既定で有効（±240 world units/s²・0.16 Hz）で、0にすると停止します。界面表示は物理場とは独立した描画近似です。controlled reference testは圧縮応答・接触impulse・質量・運動量を検査しますが、幅広い速度・解像度・長時間挙動を保証しません。表面張力、濡れ、接線摩擦、連続衝突検出、界面の微視的物理は未実装です。
 		</p>
 
 		<section class="performance" aria-labelledby="performance-title">

@@ -2,18 +2,17 @@ import { describe, expect, it } from 'vitest';
 import {
 	createMpmCpuParitySample,
 	createMpmGate4Scene,
-	createMpmGate4MlsScene,
 	GATE4_CLONE_OFFSET,
+	GATE4_DEFAULT_GRAVITY,
+	GATE4_FIXED_STEP_SECONDS,
 	GATE4_GRID,
-	GATE4_MPM_DOMAIN_HEIGHT_SCALE,
-	GATE4_MPM_GRID,
-	GATE4_MPM_INITIAL_Y_OFFSET,
-	GATE4_MPM_LIQUID_PARTICLE_AREA,
-	GATE4_MPM_LIQUID_PARTICLE_AREA_SCALE,
 	GATE4_LIQUID_INITIAL_VELOCITY_COMPONENT_MAX,
 	GATE4_LIQUID_BULK_MODULUS_SCALE,
 	GATE4_LIQUID_PARTICLE_AREA,
 	GATE4_LIQUID_PARTICLE_AREA_SCALE,
+	GATE4_LIQUID_PARTICLE_DIAMETER,
+	GATE4_LIQUID_PARTICLE_DIAMETER_MAX,
+	GATE4_LIQUID_PARTICLE_DIAMETER_MIN,
 	GATE4_LIQUID_PARTICLE_SPACING,
 	GATE4_LIQUID_START_X,
 	GATE4_OIL_PARTICLE_COUNT,
@@ -39,15 +38,18 @@ import {
 	GATE4_FRACTURE_ROWS,
 	GATE4_FRACTURE_SPACING,
 	GATE4_PARTICLE_COUNT,
+	GATE4_SCENE_SEED,
 	GATE4_SOLID_PARTICLE_MASS,
 	GATE4_WATER_PARTICLE_COLUMNS,
 	GATE4_WATER_PARTICLE_COUNT,
-	GATE4_WATER_START_Y
+	GATE4_WATER_START_Y,
+	createMpmGate4StepConfig,
+	getGate4LiquidParticleArea
 } from './gate4.js';
 import { stepMpm } from '../reference/solver.js';
 
 describe('Gate 4 mixed-material sample scene', () => {
-	const sceneSeed = 0x4d504d34;
+	const sceneSeed = GATE4_SCENE_SEED;
 	const scene = createMpmGate4Scene(sceneSeed);
 	const LIQUID_PARTICLE_COUNT = GATE4_WATER_PARTICLE_COUNT + GATE4_OIL_PARTICLE_COUNT;
 	const PEBBLE_START = LIQUID_PARTICLE_COUNT;
@@ -205,63 +207,72 @@ describe('Gate 4 mixed-material sample scene', () => {
 		);
 	});
 
-	it('expands the MPM-only liquid volume and domain while preserving floor clearance', () => {
-		const mlsScene = createMpmGate4MlsScene(sceneSeed);
-		const mlsWaterFloorParticle =
-			mlsScene.particles[GATE4_WATER_PARTICLE_COUNT - 1];
+	it('uses one adjustable particle diameter in the shared domain', () => {
+		const smallerScene = createMpmGate4Scene(sceneSeed, {
+			liquidParticleDiameter: 18
+		});
+		const domainArea =
+			GATE4_GRID.cellsX *
+			GATE4_GRID.cellsY *
+			GATE4_GRID.cellSize ** 2;
+		const liquidReferenceArea =
+			(GATE4_WATER_PARTICLE_COUNT + GATE4_OIL_PARTICLE_COUNT) *
+			GATE4_LIQUID_PARTICLE_AREA;
 
-		expect(GATE4_GRID).toEqual({ cellsX: 220, cellsY: 150, cellSize: 10 });
-		expect(GATE4_MPM_DOMAIN_HEIGHT_SCALE).toBe(4);
-		expect(GATE4_MPM_GRID).toEqual({ cellsX: 220, cellsY: 600, cellSize: 10 });
-		expect(GATE4_MPM_INITIAL_Y_OFFSET).toBe(4_500);
-		expect(GATE4_MPM_LIQUID_PARTICLE_AREA_SCALE).toBe(4);
-		expect(GATE4_MPM_LIQUID_PARTICLE_AREA).toBe(
-			GATE4_LIQUID_PARTICLE_AREA * GATE4_MPM_LIQUID_PARTICLE_AREA_SCALE
-		);
-		expect(mlsScene.particles).toHaveLength(GATE4_PARTICLE_COUNT);
-		expect(mlsScene.fractureBonds).toEqual(scene.fractureBonds);
-		expect(mlsScene.particles[0].position).toEqual({
-			x: GATE4_LIQUID_START_X,
-			y: GATE4_WATER_START_Y + GATE4_MPM_INITIAL_Y_OFFSET
-		});
+		expect(GATE4_SCENE_SEED).toBe(0x4d504d34);
+		expect(GATE4_FIXED_STEP_SECONDS).toBe(1 / 240);
+		expect(GATE4_DEFAULT_GRAVITY).toEqual({ x: 0, y: 90 });
+		expect(GATE4_LIQUID_PARTICLE_DIAMETER_MIN).toBe(10);
+		expect(GATE4_LIQUID_PARTICLE_DIAMETER).toBe(20);
+		expect(GATE4_LIQUID_PARTICLE_DIAMETER_MAX).toBe(21);
+		expect(GATE4_LIQUID_PARTICLE_AREA).toBe(400);
+		expect(GATE4_LIQUID_PARTICLE_AREA_SCALE).toBe(4);
+		expect(getGate4LiquidParticleArea(18)).toBe(324);
+		expect(smallerScene.particles[0].volume).toBe(324);
+		expect(smallerScene.particles[GATE4_WATER_PARTICLE_COUNT].volume).toBe(324);
 		expect(
-			mlsScene.particles[GATE4_WATER_PARTICLE_COUNT].position
-		).toEqual({
-			x: GATE4_LIQUID_START_X,
-			y: GATE4_OIL_START_Y + GATE4_MPM_INITIAL_Y_OFFSET
-		});
+			smallerScene.particles.map(({ position }) => position)
+		).toEqual(scene.particles.map(({ position }) => position));
+		expect(liquidReferenceArea / domainArea).toBeCloseTo(1_400_000 / 3_300_000, 12);
 		expect(
-			mlsScene.particles.every(
-				(particle, index) =>
-					particle.position.y - scene.particles[index].position.y ===
-					GATE4_MPM_INITIAL_Y_OFFSET
-			)
-		).toBe(true);
-		expect(
-			GATE4_MPM_GRID.cellsY * GATE4_MPM_GRID.cellSize -
-				mlsWaterFloorParticle.position.y
-		).toBe(158);
-		expect(
-			mlsScene.particles.every(
+			scene.particles.every(
 				({ position }) =>
 					position.x >= 0 &&
-					position.x <= GATE4_MPM_GRID.cellsX * GATE4_MPM_GRID.cellSize &&
+					position.x <= GATE4_GRID.cellsX * GATE4_GRID.cellSize &&
 					position.y >= 0 &&
-					position.y <= GATE4_MPM_GRID.cellsY * GATE4_MPM_GRID.cellSize
+					position.y <= GATE4_GRID.cellsY * GATE4_GRID.cellSize
 			)
 		).toBe(true);
-		expect(
-			mlsScene.particles[0].volume
-		).toBe(GATE4_MPM_LIQUID_PARTICLE_AREA);
-		expect(
-			mlsScene.particles[GATE4_WATER_PARTICLE_COUNT].volume
-		).toBe(GATE4_MPM_LIQUID_PARTICLE_AREA);
-		expect(
-			GATE4_WATER_PARTICLE_COUNT * GATE4_MPM_LIQUID_PARTICLE_AREA * 0.02
-		).toBe(64_000);
-		expect(
-			GATE4_OIL_PARTICLE_COUNT * GATE4_MPM_LIQUID_PARTICLE_AREA * 0.016
-		).toBe(38_400);
+		expect(() =>
+			createMpmGate4Scene(sceneSeed, {
+				liquidParticleDiameter: GATE4_LIQUID_PARTICLE_DIAMETER_MIN - 1
+			})
+		).toThrow(RangeError);
+		expect(() =>
+			createMpmGate4Scene(sceneSeed, {
+				liquidParticleDiameter: GATE4_LIQUID_PARTICLE_DIAMETER_MAX + 1
+			})
+		).toThrow(RangeError);
+	});
+
+	it('provides one shared CPU/GPU MPM step configuration', () => {
+		const config = createMpmGate4StepConfig(
+			{ x: -12, y: 90 },
+			GATE4_FIXED_STEP_SECONDS / 2,
+			scene.fractureBonds
+		);
+
+		expect(config).toMatchObject({
+			dt: GATE4_FIXED_STEP_SECONDS / 2,
+			bondReferenceDt: GATE4_FIXED_STEP_SECONDS,
+			grid: GATE4_GRID,
+			particleMass: GATE4_SOLID_PARTICLE_MASS,
+			particleVolume: GATE4_PARTICLE_AREA,
+			bondRestLength: GATE4_PEBBLE_EDGE_LENGTH,
+			material: { lambda: 20, mu: 10, model: 'neo-hookean' },
+			gravity: { x: -12, y: 90 }
+		});
+		expect(config.fractureBonds).toBe(scene.fractureBonds);
 	});
 
 	it('gives every particle bounded random initial velocity and gives pebbles angular momentum', () => {

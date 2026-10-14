@@ -2,15 +2,14 @@ import type {
 	MpmMaterialParameters,
 	MpmParticle,
 	MpmSolidBond,
+	MpmStepConfig,
 	MpmVector2
 } from '../reference/solver.js';
 
 export const GATE4_GRID = { cellsX: 220, cellsY: 150, cellSize: 10 } as const;
-export const GATE4_MPM_DOMAIN_HEIGHT_SCALE = 4;
-export const GATE4_MPM_GRID = {
-	...GATE4_GRID,
-	cellsY: GATE4_GRID.cellsY * GATE4_MPM_DOMAIN_HEIGHT_SCALE
-} as const;
+export const GATE4_SCENE_SEED = 0x4d504d34;
+export const GATE4_FIXED_STEP_SECONDS = 1 / 240;
+export const GATE4_DEFAULT_GRAVITY: MpmVector2 = { x: 0, y: 90 };
 export const GATE4_PARTICLE_CAPACITY = 1_000_000;
 export const GATE4_CLONE_OFFSET: MpmVector2 = { x: 72, y: 0 };
 export const GATE4_WATER_PARTICLE_COLUMNS = 50;
@@ -26,14 +25,13 @@ export const GATE4_LIQUID_START_X = 100;
 export const GATE4_WATER_START_Y = 640;
 export const GATE4_OIL_START_Y = 100;
 export const GATE4_PARTICLE_AREA = 100;
-export const GATE4_LIQUID_PARTICLE_AREA_SCALE = 4;
-export const GATE4_LIQUID_PARTICLE_AREA =
-	GATE4_PARTICLE_AREA * GATE4_LIQUID_PARTICLE_AREA_SCALE;
-export const GATE4_MPM_LIQUID_PARTICLE_AREA_SCALE = 4;
-export const GATE4_MPM_LIQUID_PARTICLE_AREA =
-	GATE4_LIQUID_PARTICLE_AREA * GATE4_MPM_LIQUID_PARTICLE_AREA_SCALE;
-export const GATE4_MPM_INITIAL_Y_OFFSET =
-	(GATE4_MPM_GRID.cellsY - GATE4_GRID.cellsY) * GATE4_GRID.cellSize;
+export const GATE4_LIQUID_PARTICLE_DIAMETER_MIN = 10;
+export const GATE4_LIQUID_PARTICLE_DIAMETER_MAX = 21;
+export const GATE4_LIQUID_PARTICLE_DIAMETER = 20;
+export const GATE4_LIQUID_PARTICLE_DIAMETER_QUERY_KEY = 'liquidParticleDiameter';
+export const GATE4_LIQUID_PARTICLE_AREA = GATE4_LIQUID_PARTICLE_DIAMETER ** 2;
+export const GATE4_LIQUID_PARTICLE_AREA_SCALE =
+	GATE4_LIQUID_PARTICLE_AREA / GATE4_PARTICLE_AREA;
 export const GATE4_LIQUID_BULK_MODULUS_SCALE = 4;
 export const GATE4_SOLID_PARTICLE_MASS = 4;
 export const GATE4_PEBBLE_COUNT = 50;
@@ -164,25 +162,34 @@ export interface MpmCpuParitySample {
 	readonly probeSampleIndices: readonly number[];
 }
 
-export function createMpmGate4Scene(
-	seed = Math.floor(Math.random() * UINT32_RANGE)
-): MpmGate4Scene {
-	return createGate4Scene(seed, 0, GATE4_LIQUID_PARTICLE_AREA);
+export interface MpmGate4SceneOptions {
+	readonly liquidParticleDiameter?: number;
 }
 
-export function createMpmGate4MlsScene(
-	seed = Math.floor(Math.random() * UINT32_RANGE)
+export function getGate4LiquidParticleArea(
+	diameter = GATE4_LIQUID_PARTICLE_DIAMETER
+): number {
+	if (
+		!Number.isFinite(diameter) ||
+		diameter < GATE4_LIQUID_PARTICLE_DIAMETER_MIN ||
+		diameter > GATE4_LIQUID_PARTICLE_DIAMETER_MAX
+	) {
+		throw new RangeError(
+			`liquidParticleDiameter must be between ${GATE4_LIQUID_PARTICLE_DIAMETER_MIN} and ${GATE4_LIQUID_PARTICLE_DIAMETER_MAX}.`
+		);
+	}
+	return diameter ** 2;
+}
+
+export function createMpmGate4Scene(
+	seed = Math.floor(Math.random() * UINT32_RANGE),
+	{ liquidParticleDiameter = GATE4_LIQUID_PARTICLE_DIAMETER }: MpmGate4SceneOptions = {}
 ): MpmGate4Scene {
-	return createGate4Scene(
-		seed,
-		GATE4_MPM_INITIAL_Y_OFFSET,
-		GATE4_MPM_LIQUID_PARTICLE_AREA
-	);
+	return createGate4Scene(seed, getGate4LiquidParticleArea(liquidParticleDiameter));
 }
 
 function createGate4Scene(
 	seed: number,
-	yOffset: number,
 	liquidParticleArea: number
 ): MpmGate4Scene {
 	const random = createSeededRandom(seed);
@@ -196,10 +203,7 @@ function createGate4Scene(
 				particles.push({
 					position: {
 						x: object.startX + column * GATE4_LIQUID_PARTICLE_SPACING,
-						y:
-							object.startY +
-							yOffset +
-							row * GATE4_LIQUID_PARTICLE_SPACING
+						y: object.startY + row * GATE4_LIQUID_PARTICLE_SPACING
 					},
 					velocity: createRandomVelocity(
 						random,
@@ -238,7 +242,6 @@ function createGate4Scene(
 					GATE4_PEBBLE_SPACING,
 			y:
 				PEBBLE_CENTER.y +
-				yOffset +
 				(row - (GATE4_PEBBLE_ROWS - 1) / 2) * GATE4_PEBBLE_SPACING
 		};
 		const pebbleStart = particles.length;
@@ -277,10 +280,7 @@ function createGate4Scene(
 			particles.push({
 				position: {
 					x: FRACTURE_CENTER.x + centeredColumn * GATE4_FRACTURE_SPACING,
-					y:
-						FRACTURE_CENTER.y +
-						yOffset +
-						centeredRow * GATE4_FRACTURE_SPACING
+					y: FRACTURE_CENTER.y + centeredRow * GATE4_FRACTURE_SPACING
 				},
 				velocity: fractureVelocity,
 				C: ZERO_MATRIX,
@@ -336,6 +336,24 @@ function createGate4Scene(
 	}
 
 	return { particles, parityProbeIndices, fractureBonds };
+}
+
+export function createMpmGate4StepConfig(
+	gravity: MpmVector2 = GATE4_DEFAULT_GRAVITY,
+	dt = GATE4_FIXED_STEP_SECONDS,
+	fractureBonds?: readonly MpmSolidBond[]
+): MpmStepConfig {
+	return {
+		dt,
+		bondReferenceDt: GATE4_FIXED_STEP_SECONDS,
+		grid: GATE4_GRID,
+		particleMass: GATE4_SOLID_PARTICLE_MASS,
+		particleVolume: GATE4_PARTICLE_AREA,
+		bondRestLength: GATE4_PEBBLE_EDGE_LENGTH,
+		material: PEBBLE_MATERIAL,
+		gravity,
+		...(fractureBonds === undefined ? {} : { fractureBonds })
+	};
 }
 
 export function createMpmCpuParitySample(

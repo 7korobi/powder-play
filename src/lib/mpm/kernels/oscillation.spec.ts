@@ -34,9 +34,11 @@ describe('meanSinusoidalAcceleration', () => {
 		expect(meanSinusoidalAcceleration(2, 1, 0)).toBe(0);
 	});
 
-	it('starts with horizontal oscillation disabled', () => {
+	it('starts with the default horizontal oscillation enabled', () => {
 		expect(DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE).toBe(240);
-		expect(INITIAL_HORIZONTAL_OSCILLATION_AMPLITUDE).toBe(0);
+		expect(INITIAL_HORIZONTAL_OSCILLATION_AMPLITUDE).toBe(
+			DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE
+		);
 	});
 
 	it('rejects invalid time intervals and frequencies', () => {

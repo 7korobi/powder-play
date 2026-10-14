@@ -1,11 +1,15 @@
 # LiquidFun CPU benchmark
 
-`/labs/mpm/liquidfun` is a CPU-only comparison scene using
-`liquidfun-wasm@7.0.0`, the LiquidFun particle API in Birch-san's
-`box2d-wasm` WebAssembly fork based on Box2D 2.4.1. It maps the same seeded
-Gate 4 nodes and bond topology as the WebGPU MLS-MPM page at
-`/labs/mpm/kernels`, but it is **not a physically equivalent implementation**:
-the solvers, material models, and liquid representations differ.
+This document describes the standalone `benchmark:liquidfun` harness and its
+historical LiquidFun implementation. The live `/labs/mpm/liquidfun` route now
+runs the CPU MLS-MPM reference solver so it can be compared with
+`/labs/mpm/kernels` under the same physical model. See
+[MPM CPU/GPU comparison](./MPM-CPU-GPU-COMPARISON.md) for the current setup.
+
+The benchmark harness still uses `liquidfun-wasm@7.0.0`, the LiquidFun
+particle API in Birch-san's `box2d-wasm` WebAssembly fork based on Box2D 2.4.1.
+It is a standalone CPU benchmark, not a physically equivalent implementation
+of MLS-MPM: the solvers, material models, and liquid representations differ.
 
 ## Attribution and license files
 
@@ -24,9 +28,9 @@ package is imported as `liquidfun-wasm`; `liquidfun-wasm.d.ts` supplies a narrow
 type contract for the runtime surface used here. It does not replace or emulate
 the LiquidFun engine.
 
-## Shared initial workload and coordinate mapping
+## Benchmark workload and coordinate mapping
 
-The page and benchmark call `createMpmGate4Scene(0x4d504d34)` and use the current
+The benchmark calls `createMpmGate4Scene(0x4d504d34)` and uses the current
 `GATE4_*` dimensions and counts. The mapped scene has a 2,200 × 1,500 Gate 4
 unit domain (220 × 150 cells, 10 units per cell). With the declared scale of
 100 Gate 4 units per meter, the Box2D world is 22 × 15 m.
@@ -65,25 +69,14 @@ independently. Expect different trajectories and breakage timing; the
 comparison holds the seeded source scene and fixed timestep, not the exact
 physical response.
 
-## Interactive metrics
+## Current live comparison
 
-The live page runs fixed `1/240 s` simulation steps and draws with Canvas2D.
-The speed multiplier scales elapsed simulation time without changing the
-fixed step. A simulation step includes `world.Step()` and the CPU
-tensile-strain checks that destroy fracture joints. It reports:
-
-- rendered FPS, capped by the selected render target;
-- synchronous CPU time around each complete simulation step;
-- completed physics steps per wall-clock second;
-- Canvas2D draw time per frame, reported separately from physics time;
-- any fixed-step backlog retained by the frame scheduler.
-
-The UI supports pause/resume, one fixed step, reset, two-axis gravity,
-optional device tilt, speed multipliers, surface/particle-marker rendering,
-render-rate selection, horizontal oscillation, and discarding accumulated
-simulation backlog while paused. Surface mode draws larger circles for visual
-continuity; it does not change the LiquidFun particle physics. The live UI
-does not claim GPU measurements. Reset rebuilds the same fixed-seed scene.
+The live route no longer loads this LiquidFun simulation. It now uses the CPU
+MLS-MPM reference solver and shares the seeded scene, liquid particle-size
+control, fixed timestep, CFL policy, gravity, and oscillation with the GPU
+page. The GPU route retains optional GPU-only interaction and emitter
+experiments; those are outside the default CPU/GPU baseline. The benchmark
+below remains available to measure the independent LiquidFun implementation.
 
 ## Repeatable simulation-only benchmark
 
