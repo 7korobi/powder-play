@@ -2,9 +2,10 @@
 
 `/labs/mpm/liquidfun` is a CPU-only comparison scene using
 `liquidfun-wasm@7.0.0`, the LiquidFun particle API in Birch-san's
-`box2d-wasm` WebAssembly fork based on Box2D 2.4.1. It is a separate solver
-workload, **not a physically equivalent implementation** of the WebGPU MLS-MPM
-page at `/labs/mpm/kernels`.
+`box2d-wasm` WebAssembly fork based on Box2D 2.4.1. It maps the same seeded
+Gate 4 nodes and bond topology as the WebGPU MLS-MPM page at
+`/labs/mpm/kernels`, but it is **not a physically equivalent implementation**:
+the solvers, material models, and liquid representations differ.
 
 ## Attribution and license files
 
@@ -41,32 +42,35 @@ Gate 4 coordinates are y-down; Box2D coordinates are y-up:
   timestep, or source scene counts.
 
 The source has 3,674 MPM nodes: 2,000 water, 1,500 oil, 150 pebble vertices,
-and 24 fracture nodes. LiquidFun receives the same seeded initial position and
-velocity for all 3,500 fluid nodes. Water uses the default `b2_waterParticle`
-flag; oil uses `b2_viscousParticle`. Both are created in the **same** LiquidFun
-particle system, with a shared radius and system density.
+and 24 fracture nodes. LiquidFun maps every node's seeded initial position and
+velocity. Water uses the default `b2_waterParticle` flag; oil uses
+`b2_viscousParticle`. Both are created in the **same** LiquidFun particle
+system, with a shared radius and system density.
 
-The 150 pebble nodes become 50 dynamic triangle fixtures. Each body uses the
-mean of the three mapped node velocities for linear velocity and a least-squares
-rigid-body fit for angular velocity. The shape is initialized from the mapped
-triangle vertices. This discards non-rigid node-velocity components; a rigid
-Box2D triangle is not an MPM Neo-Hookean pebble.
+Each of the 150 pebble nodes becomes an individual dynamic circle body. The
+nodes are grouped into the same 50 triangles, and each triangle's three edges
+are represented by distance joints. The 24 fracture nodes are individual
+dynamic circle bodies connected by the same 53 Gate 4 bonds. Those bonds break
+when their tensile strain reaches the Gate 4 12% threshold. Solid-node circle
+area and mass are mapped from Gate 4 particle area and mass.
 
-The 24 fracture nodes are omitted rather than presented as equivalent to
-LiquidFun elasticity. Thus the simulated LiquidFun workload is 3,500 particle
-system particles plus 50 dynamic triangle bodies (and four static boundary
-bodies), compared with 3,674 MPM nodes. One LiquidFun particle system shares
-density across water and oil, so it cannot preserve the MPM phase densities
-0.02 and 0.016 independently. Differences in constitutive behavior, mass
-mapping, contact, and fracture are expected.
+This preserves the source node count, initial state, and bond topology while
+using Box2D constraints as an approximation: distance joints do not reproduce
+MPM deformation gradients or Neo-Hookean constitutive behavior, and Box2D
+contact/constraint solving differs from MLS-MPM. One LiquidFun particle system
+shares density across water and oil, so it cannot preserve the MPM phase
+densities 0.02 and 0.016 independently. Expect different trajectories and
+breakage timing; the comparison holds the seeded workload and timestep fixed,
+not the exact physical response.
 
 ## Interactive metrics
 
-The live page runs fixed `1/240 s` world steps and draws with Canvas2D. It
-reports:
+The live page runs fixed `1/240 s` simulation steps and draws with Canvas2D. A
+simulation step includes `world.Step()` and the CPU tensile-strain checks that
+destroy fracture joints. It reports:
 
 - browser animation-frame FPS;
-- synchronous CPU time around `world.Step()` per step;
+- synchronous CPU time around each complete simulation step;
 - completed physics steps per wall-clock second;
 - Canvas2D draw time per frame, reported separately from physics time;
 - any fixed-step backlog retained by the frame scheduler.
@@ -96,16 +100,16 @@ Each run creates a fresh, non-rendered scene, then performs:
 1. a 600 ms wall-clock stationary warmup using zero gravity (the number of
    completed steps is recorded because the warmup is time-based);
 2. 64 fixed-timestep steps with Gate 4 gravity;
-3. 12 measured batches, each containing 8 consecutive `world.Step()` calls.
+3. 12 measured batches, each containing 8 consecutive simulation steps.
 
 `performance.now()` starts immediately before and stops immediately after the
 eight synchronous calls. The JSON includes median, p95, min, max, and sample
 count for batch CPU milliseconds, plus derived per-step time and steps/second.
 The p95 uses the same lower-index quantile convention as
-`scripts/benchmark-mpm.mjs`. Scope includes JavaScript-to-WASM call overhead and
-LiquidFun/Box2D `world.Step()` work. Scene construction, Canvas2D, UI work, GPU
-timestamps, and GPU queue completion/wait are excluded. No GPU or
-`navigator.gpu` is used by this benchmark.
+`scripts/benchmark-mpm.mjs`. Scope includes JavaScript-to-WASM call overhead,
+LiquidFun/Box2D `world.Step()` work, and fracture-bond strain checks. Scene
+construction, Canvas2D, UI work, GPU timestamps, and GPU queue completion/wait
+are excluded. No GPU or `navigator.gpu` is used by this benchmark.
 
 The result also records package/engine version, browser user agent,
 `hardwareConcurrency`, source hashes, scene seed/counts, grid/domain, scale,

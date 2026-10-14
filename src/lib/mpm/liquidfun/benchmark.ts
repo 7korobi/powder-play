@@ -6,6 +6,7 @@ import {
 	LIQUIDFUN_GATE4_DOMAIN,
 	LIQUIDFUN_GATE4_GRAVITY,
 	LIQUIDFUN_GATE4_UNITS_PER_METER,
+	LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN,
 	LIQUIDFUN_GRAVITY_WARMUP_STEPS,
 	LIQUIDFUN_PACKAGE_VERSION,
 	LIQUIDFUN_SAMPLE_BATCHES,
@@ -78,12 +79,21 @@ export async function runLiquidFunBenchmark({
 				seed: LIQUIDFUN_SCENE_SEED,
 				seedHex: `0x${LIQUIDFUN_SCENE_SEED.toString(16)}`,
 				sourceMpmNodeCount: simulation.sourceMpmNodeCount,
+				mappedMpmNodeCount: simulation.mappedMpmNodeCount,
 				liquidFunParticleCount: simulation.particleCount,
 				waterParticleCount: simulation.waterParticleCount,
 				oilViscousParticleCount: simulation.oilParticleCount,
-				dynamicTriangleBodyCount: simulation.triangleBodyCount,
+				pebbleNodeCount: simulation.pebbleNodeCount,
+				pebbleTriangleGroupCount: simulation.triangleGroupCount,
+				pebbleBondCount: simulation.pebbleBondCount,
+				fractureNodeCount: simulation.fractureNodeCount,
+				fractureBondCount: simulation.fractureBondCount,
+				activeFractureBondCountAfterMeasurement:
+					simulation.activeFractureBondCount,
+				fractureBondFailureStrain: LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN,
+				dynamicSolidNodeBodyCount:
+					simulation.pebbleNodeCount + simulation.fractureNodeCount,
 				staticWallBodyCount: simulation.staticWallBodyCount,
-				omittedFractureNodeCount: simulation.omittedFractureNodeCount,
 				grid: {
 					cellsX: GATE4_GRID.cellsX,
 					cellsY: GATE4_GRID.cellsY,
@@ -107,15 +117,15 @@ export async function runLiquidFunBenchmark({
 				rendered: false
 			},
 			measurement: {
-				scope: 'Synchronous CPU wall-clock time around eight LiquidFun world.Step() calls per batch.',
+				scope: 'Synchronous CPU wall-clock time around eight LiquidFun simulation steps per batch, including world.Step() and fracture bond checks.',
 				clock: 'performance.now()',
-				includes: 'JavaScript-to-WASM call overhead and LiquidFun/Box2D world.Step() work.',
+				includes: 'JavaScript-to-WASM call overhead, LiquidFun/Box2D world.Step() work, and fracture bond strain checks.',
 				excludes: 'Canvas2D drawing, UI work, GPU timestamps, GPU queue completion/wait, and world construction.',
-				worldStepBatchCpuMs: batchDistribution,
-				worldStepCpuMsPerStep: summarizeSamples(
+				simulationStepBatchCpuMs: batchDistribution,
+				simulationStepCpuMsPerStep: summarizeSamples(
 					samples.map((milliseconds) => milliseconds / LIQUIDFUN_STEPS_PER_BATCH)
 				),
-				stepsPerSecondAtMedian:
+				simulationStepsPerSecondAtMedian:
 					(LIQUIDFUN_STEPS_PER_BATCH * 1_000) / batchDistribution.median
 			}
 		};

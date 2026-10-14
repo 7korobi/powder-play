@@ -240,7 +240,7 @@
 	<title>LiquidFun CPU · Gate 4 MPM comparison</title>
 	<meta
 		name="description"
-		content="LiquidFun particle API を使った CPU-only の Gate 4 類似シミュレーションと再現可能な計測"
+		content="LiquidFun particle API を使い、Gate 4 と同じ初期ノード・結合構造を CPU-only で近似実行する比較ページ"
 	/>
 </svelte:head>
 
@@ -249,8 +249,8 @@
 		<p class="eyebrow">MLS-MPM · solver comparison</p>
 		<h1>LiquidFun CPU comparison</h1>
 		<p class="intro">
-			LiquidFun particle API による CPU-only の類似シミュレーションです。GPU
-			MLS-MPMと物理的に同等な実装ではなく、固定した Gate 4 入力で実行コストを比べるための別 solver です。
+			GPU MLS-MPM ページと同じ Gate 4 の初期ノード・結合構造を、LiquidFun の CPU solver に写像して実行します。
+			構成則や流体の表現は異なるため物理的に同等ではありませんが、入力規模を揃えて処理コストを比較できます。
 		</p>
 		<nav class="solver-links" aria-label="Solver pages">
 			<a href="/labs/mpm/kernels">GPU MLS-MPM page →</a>
@@ -306,7 +306,7 @@
 					<dd>{fps.toFixed(1)}</dd>
 				</div>
 				<div>
-					<dt>world.Step CPU ms / step</dt>
+					<dt>Simulation CPU ms / step</dt>
 					<dd>{physicsMsPerStep.toFixed(3)}</dd>
 				</div>
 				<div>
@@ -326,8 +326,28 @@
 					<dd>{simulation?.particleCount ?? '—'}</dd>
 				</div>
 				<div>
-					<dt>Dynamic triangle bodies</dt>
-					<dd>{simulation?.triangleBodyCount ?? '—'}</dd>
+					<dt>Mapped / source MPM nodes</dt>
+					<dd>
+						{simulation?.mappedMpmNodeCount ?? '—'} / {simulation?.sourceMpmNodeCount ?? '—'}
+					</dd>
+				</div>
+				<div>
+					<dt>Pebble nodes / triangle groups</dt>
+					<dd>{simulation?.pebbleNodeCount ?? '—'} / {simulation?.triangleGroupCount ?? '—'}</dd>
+				</div>
+				<div>
+					<dt>Pebble distance bonds</dt>
+					<dd>{simulation?.pebbleBondCount ?? '—'}</dd>
+				</div>
+				<div>
+					<dt>Fracture nodes</dt>
+					<dd>{simulation?.fractureNodeCount ?? '—'}</dd>
+				</div>
+				<div>
+					<dt>Active fracture bonds</dt>
+					<dd>
+						{simulation?.activeFractureBondCount ?? '—'} / {simulation?.fractureBondCount ?? '—'}
+					</dd>
 				</div>
 			</dl>
 
@@ -343,6 +363,7 @@
 						m)
 					</li>
 					<li>dt = 1/{Math.round(1 / LIQUIDFUN_DT_SECONDS)} s · gravity = 90 units/s² down</li>
+					<li>3,500 fluid particles + 174 dynamic solid-node bodies · 50 pebble groups · 53 breakable fracture bonds</li>
 					<li>
 						Benchmark: {LIQUIDFUN_STATIONARY_WARMUP_MS} ms stationary warmup + {LIQUIDFUN_GRAVITY_WARMUP_STEPS}
 						gravity steps + {LIQUIDFUN_SAMPLE_BATCHES} × {LIQUIDFUN_STEPS_PER_BATCH} steps
@@ -361,17 +382,19 @@
 				the MPM water/oil densities (0.02 / 0.016) cannot be represented independently here.
 			</li>
 			<li>
-				The source scene has 3,674 MPM nodes. This mapping creates 3,500 LiquidFun fluid particles and 50 dynamic
-				triangle fixtures. The 24 fracture nodes are omitted; LiquidFun elastic behavior is not treated as equivalent
-				to MPM damage/fracture.
+				All 3,674 seeded MPM nodes are represented: 3,500 LiquidFun fluid particles and 174 dynamic circle bodies.
+				The 150 pebble nodes form 50 groups connected by 150 distance joints. The 24 fracture nodes use 53
+				breakable distance joints with the Gate 4 12% tensile-strain threshold.
 			</li>
 			<li>
-				Each triangle body fits its initial linear and angular velocity from its three seeded MPM node velocities.
-				A rigid Box2D fixture is not a deformable Neo-Hookean MPM pebble.
+				Node positions and velocities are mapped from the same Gate 4 source data. Circle bodies and Box2D distance
+				joints approximate the pebble and fracture networks; they do not reproduce MPM material behavior,
+				constitutive response, or liquid phase-specific densities.
 			</li>
 			<li>
-				Live physics timing wraps synchronous CPU <code>world.Step()</code> calls; Canvas2D drawing has a separate
-				metric. The benchmark runs without drawing and reports neither GPU timestamps nor queue waits.
+				Live timing wraps synchronous CPU simulation steps, including <code>world.Step()</code> and fracture-bond
+				checks; Canvas2D drawing has a separate metric. The benchmark runs without drawing and reports neither GPU
+				timestamps nor queue waits.
 			</li>
 		</ul>
 		<p class="attribution">

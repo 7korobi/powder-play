@@ -18,17 +18,41 @@ declare module 'liquidfun-wasm' {
 		delete?(): void;
 	}
 
+	export interface B2Shape {
+		m_radius: number;
+		delete?(): void;
+	}
+
 	export interface B2Body {
-		CreateFixture(shape: B2PolygonShape, density: number): B2Fixture;
+		CreateFixture(shape: B2Shape, density: number): B2Fixture;
 		GetPosition(): B2Vec2;
 		GetAngle(): number;
 		delete?(): void;
 	}
 
-	export interface B2PolygonShape {
+	export interface B2PolygonShape extends B2Shape {
 		SetAsBox(halfWidth: number, halfHeight: number): void;
 		Set?(vertices: readonly B2Vec2[], count: number): void;
 		SetAsArray?(vertices: readonly B2Vec2[], count: number): void;
+	}
+
+	export interface B2CircleShape extends B2Shape {}
+
+	export interface B2Joint {
+		delete?(): void;
+	}
+
+	export interface B2DistanceJointDef {
+		Initialize(
+			bodyA: B2Body,
+			bodyB: B2Body,
+			anchorA: B2Vec2,
+			anchorB: B2Vec2
+		): void;
+		length: number;
+		stiffness: number;
+		damping: number;
+		collideConnected: boolean;
 		delete?(): void;
 	}
 
@@ -56,6 +80,8 @@ declare module 'liquidfun-wasm' {
 	export interface B2World {
 		CreateBody(definition: B2BodyDef): B2Body;
 		CreateParticleSystem(definition: B2ParticleSystemDef): B2ParticleSystem;
+		CreateJoint(definition: B2DistanceJointDef): B2Joint;
+		DestroyJoint(joint: B2Joint): void;
 		CalculateReasonableParticleIterations(timeStep: number): number;
 		SetGravity(gravity: B2Vec2): void;
 		Step(
@@ -72,6 +98,8 @@ declare module 'liquidfun-wasm' {
 		b2World: new (gravity: B2Vec2) => B2World;
 		b2BodyDef: new () => B2BodyDef;
 		b2PolygonShape: new () => B2PolygonShape;
+		b2CircleShape: new () => B2CircleShape;
+		b2DistanceJointDef: new () => B2DistanceJointDef;
 		b2ParticleDef: new () => B2ParticleDef;
 		b2ParticleSystemDef: new () => B2ParticleSystemDef;
 		b2_waterParticle: number;

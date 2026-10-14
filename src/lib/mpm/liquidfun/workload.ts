@@ -1,11 +1,14 @@
-import type { MpmParticle, MpmVector2 } from '../reference/solver.js';
+import type { MpmParticle, MpmSolidBond, MpmVector2 } from '../reference/solver.js';
 import {
 	createMpmGate4Scene,
+	GATE4_FRACTURE_BOND_COUNT,
+	GATE4_FRACTURE_FAILURE_STRAIN,
 	GATE4_FRACTURE_PARTICLE_COUNT,
 	GATE4_FRACTURE_OBJECT_ID,
 	GATE4_GRID,
 	GATE4_LIQUID_PARTICLE_SPACING,
 	GATE4_OIL_PARTICLE_COUNT,
+	GATE4_PARTICLE_AREA,
 	GATE4_PARTICLE_COUNT,
 	GATE4_PEBBLE_COUNT,
 	GATE4_PEBBLE_PARTICLE_COUNT,
@@ -25,6 +28,39 @@ export const LIQUIDFUN_BOX2D_GRAVITY: MpmVector2 = {
 export const LIQUIDFUN_SHARED_PARTICLE_DENSITY = 1;
 export const LIQUIDFUN_PARTICLE_RADIUS_METERS =
 	GATE4_LIQUID_PARTICLE_SPACING / LIQUIDFUN_GATE4_UNITS_PER_METER / 2;
+export const LIQUIDFUN_SOLID_NODE_AREA_SQUARE_METERS =
+	GATE4_PARTICLE_AREA / LIQUIDFUN_GATE4_UNITS_PER_METER ** 2;
+export const LIQUIDFUN_SOLID_NODE_RADIUS_METERS = Math.sqrt(
+	LIQUIDFUN_SOLID_NODE_AREA_SQUARE_METERS / Math.PI
+);
+export const LIQUIDFUN_SOLID_NODE_DENSITY =
+	GATE4_SOLID_PARTICLE_MASS / LIQUIDFUN_SOLID_NODE_AREA_SQUARE_METERS;
+export const LIQUIDFUN_PEBBLE_BOND_FREQUENCY_HZ = 30;
+export const LIQUIDFUN_FRACTURE_BOND_FREQUENCY_HZ = 8;
+export const LIQUIDFUN_BOND_DAMPING_RATIO = 1;
+const LIQUIDFUN_PEBBLE_BOND_ANGULAR_FREQUENCY =
+	2 * Math.PI * LIQUIDFUN_PEBBLE_BOND_FREQUENCY_HZ;
+const LIQUIDFUN_FRACTURE_BOND_ANGULAR_FREQUENCY =
+	2 * Math.PI * LIQUIDFUN_FRACTURE_BOND_FREQUENCY_HZ;
+const LIQUIDFUN_REDUCED_SOLID_NODE_MASS = GATE4_SOLID_PARTICLE_MASS / 2;
+export const LIQUIDFUN_PEBBLE_BOND_STIFFNESS =
+	LIQUIDFUN_REDUCED_SOLID_NODE_MASS *
+	LIQUIDFUN_PEBBLE_BOND_ANGULAR_FREQUENCY ** 2;
+export const LIQUIDFUN_PEBBLE_BOND_DAMPING =
+	2 *
+	LIQUIDFUN_BOND_DAMPING_RATIO *
+	LIQUIDFUN_REDUCED_SOLID_NODE_MASS *
+	LIQUIDFUN_PEBBLE_BOND_ANGULAR_FREQUENCY;
+export const LIQUIDFUN_FRACTURE_BOND_STIFFNESS =
+	LIQUIDFUN_REDUCED_SOLID_NODE_MASS *
+	LIQUIDFUN_FRACTURE_BOND_ANGULAR_FREQUENCY ** 2;
+export const LIQUIDFUN_FRACTURE_BOND_DAMPING =
+	2 *
+	LIQUIDFUN_BOND_DAMPING_RATIO *
+	LIQUIDFUN_REDUCED_SOLID_NODE_MASS *
+	LIQUIDFUN_FRACTURE_BOND_ANGULAR_FREQUENCY;
+export const LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN =
+	GATE4_FRACTURE_FAILURE_STRAIN;
 export const LIQUIDFUN_VELOCITY_ITERATIONS = 8;
 export const LIQUIDFUN_POSITION_ITERATIONS = 3;
 export const LIQUIDFUN_STATIONARY_WARMUP_MS = 600;
@@ -47,23 +83,32 @@ export interface LiquidFunVector {
 	readonly y: number;
 }
 
-export interface LiquidFunTriangleBodySeed {
+export interface LiquidFunTriangleGroupSeed {
 	readonly objectId: number;
-	readonly position: LiquidFunVector;
-	readonly linearVelocity: LiquidFunVector;
-	readonly angularVelocity: number;
-	readonly localVertices: readonly LiquidFunVector[];
-	readonly areaSquareMeters: number;
-	readonly density: number;
+	readonly nodeIndices: readonly [number, number, number];
+}
+
+export interface LiquidFunBondSeed {
+	readonly firstNodeIndex: number;
+	readonly secondNodeIndex: number;
+	readonly restLengthMeters: number;
+}
+
+export interface LiquidFunFractureBondSeed extends LiquidFunBondSeed {
+	readonly failureStrain: number;
 }
 
 export interface LiquidFunGate4Workload {
 	readonly seed: number;
 	readonly sourceMpmNodeCount: number;
+	readonly mappedMpmNodeCount: number;
 	readonly waterParticles: readonly MpmParticle[];
 	readonly oilParticles: readonly MpmParticle[];
-	readonly triangleBodies: readonly LiquidFunTriangleBodySeed[];
-	readonly omittedFractureNodeCount: number;
+	readonly pebbleNodes: readonly MpmParticle[];
+	readonly pebbleGroups: readonly LiquidFunTriangleGroupSeed[];
+	readonly pebbleBonds: readonly LiquidFunBondSeed[];
+	readonly fractureNodes: readonly MpmParticle[];
+	readonly fractureBonds: readonly LiquidFunFractureBondSeed[];
 }
 
 export function mapGate4PositionToBox2D(position: MpmVector2): LiquidFunVector {
@@ -98,101 +143,16 @@ export function mapBox2DVelocityToGate4(velocity: LiquidFunVector): MpmVector2 {
 	};
 }
 
-export function mapGate4PebbleTriangle(
-	nodes: readonly MpmParticle[]
-): LiquidFunTriangleBodySeed {
-	if (nodes.length !== 3) {
-		throw new RangeError('A Gate 4 pebble must contain exactly three MPM nodes.');
-	}
-
-	const orderedNodes = [...nodes].sort(
-		(first, second) =>
-			(first.bondedTriangleVertex ?? -1) - (second.bondedTriangleVertex ?? -1)
-	);
-	const firstObjectId = orderedNodes[0].objectId;
-	if (
-		firstObjectId === undefined ||
-		orderedNodes.some(
-			(node, vertex) =>
-				node.objectId !== firstObjectId || node.bondedTriangleVertex !== vertex
-		)
-	) {
-		throw new RangeError('Gate 4 pebble nodes must identify vertices 0, 1, and 2.');
-	}
-
-	const positions = orderedNodes.map(({ position }) =>
-		mapGate4PositionToBox2D(position)
-	);
-	const velocities = orderedNodes.map(({ velocity }) =>
-		mapGate4VelocityToBox2D(velocity)
-	);
-	const position = positions.reduce(
-		(center, point) => ({
-			x: center.x + point.x / positions.length,
-			y: center.y + point.y / positions.length
-		}),
-		{ x: 0, y: 0 }
-	);
-	const linearVelocity = velocities.reduce(
-		(center, velocity) => ({
-			x: center.x + velocity.x / velocities.length,
-			y: center.y + velocity.y / velocities.length
-		}),
-		{ x: 0, y: 0 }
-	);
-	const localVertices = positions.map((point) => ({
-		x: point.x - position.x,
-		y: point.y - position.y
-	}));
-	let angularMomentumNumerator = 0;
-	let momentOfInertiaPerMass = 0;
-	for (let index = 0; index < localVertices.length; index += 1) {
-		const relativePosition = localVertices[index];
-		const relativeVelocity = {
-			x: velocities[index].x - linearVelocity.x,
-			y: velocities[index].y - linearVelocity.y
-		};
-		angularMomentumNumerator +=
-			relativePosition.x * relativeVelocity.y -
-			relativePosition.y * relativeVelocity.x;
-		momentOfInertiaPerMass +=
-			relativePosition.x ** 2 + relativePosition.y ** 2;
-	}
-	if (momentOfInertiaPerMass <= 0) {
-		throw new RangeError('Gate 4 pebble nodes must have nonzero area.');
-	}
-
-	let doubledArea = 0;
-	for (let index = 0; index < localVertices.length; index += 1) {
-		const first = localVertices[index];
-		const second = localVertices[(index + 1) % localVertices.length];
-		doubledArea += first.x * second.y - first.y * second.x;
-	}
-	const areaSquareMeters = Math.abs(doubledArea) / 2;
-	if (!Number.isFinite(areaSquareMeters) || areaSquareMeters <= 0) {
-		throw new RangeError('Gate 4 pebble triangle area must be positive and finite.');
-	}
-
-	const mappedNodeMass = GATE4_SOLID_PARTICLE_MASS * orderedNodes.length;
-	return {
-		objectId: firstObjectId,
-		position,
-		linearVelocity,
-		angularVelocity: angularMomentumNumerator / momentOfInertiaPerMass,
-		localVertices,
-		areaSquareMeters,
-		density: mappedNodeMass / areaSquareMeters
-	};
-}
-
 export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 	const scene = createMpmGate4Scene(LIQUIDFUN_SCENE_SEED);
 	const waterParticles: MpmParticle[] = [];
 	const oilParticles: MpmParticle[] = [];
-	const fractureNodes: MpmParticle[] = [];
 	const pebbleNodesByObject = new Map<number, MpmParticle[]>();
+	const fractureNodes: MpmParticle[] = [];
+	const fractureNodeIndices = new Map<number, number>();
 
-	for (const particle of scene.particles) {
+	for (let sourceIndex = 0; sourceIndex < scene.particles.length; sourceIndex += 1) {
+		const particle = scene.particles[sourceIndex];
 		const material = particle.material?.model;
 		if (material === 'water') {
 			waterParticles.push(particle);
@@ -206,33 +166,115 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 			nodes.push(particle);
 			pebbleNodesByObject.set(particle.objectId, nodes);
 		} else if (particle.objectId === GATE4_FRACTURE_OBJECT_ID) {
+			fractureNodeIndices.set(sourceIndex, fractureNodes.length);
 			fractureNodes.push(particle);
 		}
 	}
 
-	const triangleBodies = [...pebbleNodesByObject.entries()]
-		.sort(([first], [second]) => first - second)
-		.map(([, nodes]) => mapGate4PebbleTriangle(nodes));
+	const pebbleNodes: MpmParticle[] = [];
+	const pebbleGroups: LiquidFunTriangleGroupSeed[] = [];
+	const pebbleBonds: LiquidFunBondSeed[] = [];
+	for (const [objectId, nodes] of [...pebbleNodesByObject.entries()].sort(
+		([first], [second]) => first - second
+	)) {
+		const orderedNodes = [...nodes].sort(
+			(first, second) =>
+				(first.bondedTriangleVertex ?? -1) - (second.bondedTriangleVertex ?? -1)
+		);
+		if (
+			orderedNodes.length !== 3 ||
+			orderedNodes.some(
+				(node, vertex) =>
+					node.objectId !== objectId || node.bondedTriangleVertex !== vertex
+			)
+		) {
+			throw new Error(`Gate 4 pebble ${objectId} must contain vertices 0, 1, and 2.`);
+		}
+
+		const firstNodeIndex = pebbleNodes.length;
+		pebbleNodes.push(...orderedNodes);
+		pebbleGroups.push({
+			objectId,
+			nodeIndices: [
+				firstNodeIndex,
+				firstNodeIndex + 1,
+				firstNodeIndex + 2
+			]
+		});
+		for (let firstVertex = 0; firstVertex < orderedNodes.length; firstVertex += 1) {
+			for (
+				let secondVertex = firstVertex + 1;
+				secondVertex < orderedNodes.length;
+				secondVertex += 1
+			) {
+				const first = orderedNodes[firstVertex].position;
+				const second = orderedNodes[secondVertex].position;
+				pebbleBonds.push({
+					firstNodeIndex: firstNodeIndex + firstVertex,
+					secondNodeIndex: firstNodeIndex + secondVertex,
+					restLengthMeters:
+						Math.hypot(second.x - first.x, second.y - first.y) /
+						LIQUIDFUN_GATE4_UNITS_PER_METER
+				});
+			}
+		}
+	}
+
+	const fractureBonds: LiquidFunFractureBondSeed[] = scene.fractureBonds.map(
+		(bond: MpmSolidBond) => {
+			const firstNodeIndex = fractureNodeIndices.get(bond.firstParticle);
+			const secondNodeIndex = fractureNodeIndices.get(bond.secondParticle);
+			if (firstNodeIndex === undefined || secondNodeIndex === undefined) {
+				throw new Error('Every Gate 4 fracture bond must map to fracture nodes.');
+			}
+			return {
+				firstNodeIndex,
+				secondNodeIndex,
+				restLengthMeters:
+					bond.restLength / LIQUIDFUN_GATE4_UNITS_PER_METER,
+				failureStrain: bond.failureStrain
+			};
+		}
+	);
+	const mappedMpmNodeCount =
+		waterParticles.length +
+		oilParticles.length +
+		pebbleNodes.length +
+		fractureNodes.length;
 
 	if (
 		scene.particles.length !== GATE4_PARTICLE_COUNT ||
 		waterParticles.length !== GATE4_WATER_PARTICLE_COUNT ||
 		oilParticles.length !== GATE4_OIL_PARTICLE_COUNT ||
-		triangleBodies.length !== GATE4_PEBBLE_COUNT ||
-		triangleBodies.reduce((count, body) => count + body.localVertices.length, 0) !==
-			GATE4_PEBBLE_PARTICLE_COUNT ||
-		fractureNodes.length !== GATE4_FRACTURE_PARTICLE_COUNT
+		pebbleGroups.length !== GATE4_PEBBLE_COUNT ||
+		pebbleNodes.length !== GATE4_PEBBLE_PARTICLE_COUNT ||
+		pebbleBonds.length !== GATE4_PEBBLE_COUNT * 3 ||
+		fractureNodes.length !== GATE4_FRACTURE_PARTICLE_COUNT ||
+		fractureBonds.length !== GATE4_FRACTURE_BOND_COUNT ||
+		mappedMpmNodeCount !== scene.particles.length ||
+		fractureBonds.some(
+			(bond) =>
+				bond.failureStrain !== GATE4_FRACTURE_FAILURE_STRAIN ||
+				bond.firstNodeIndex < 0 ||
+				bond.firstNodeIndex >= fractureNodes.length ||
+				bond.secondNodeIndex < 0 ||
+				bond.secondNodeIndex >= fractureNodes.length
+		)
 	) {
-		throw new Error('The LiquidFun mapping no longer matches the Gate 4 scene counts.');
+		throw new Error('The LiquidFun mapping no longer matches the Gate 4 scene nodes and bonds.');
 	}
 
 	return {
 		seed: LIQUIDFUN_SCENE_SEED,
 		sourceMpmNodeCount: scene.particles.length,
+		mappedMpmNodeCount,
 		waterParticles,
 		oilParticles,
-		triangleBodies,
-		omittedFractureNodeCount: fractureNodes.length
+		pebbleNodes,
+		pebbleGroups,
+		pebbleBonds,
+		fractureNodes,
+		fractureBonds
 	};
 }
 
