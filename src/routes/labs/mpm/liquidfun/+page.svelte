@@ -1,737 +1,345 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { projectDeviceOrientationGravity } from '#lib/input/sensors.js';
-	import Gate4ParticleSizeControl from '#lib/mpm/Gate4ParticleSizeControl.svelte';
-	import {
-		MPM_LIVE_METRIC_WINDOW_MS,
-		MpmRollingMetric,
-		type MpmMetricDistribution
-	} from '#lib/mpm/performance-metrics.js';
-	import { DEFAULT_MPM_COURANT_LIMIT } from '#lib/mpm/kernels/cfl.js';
-	import {
-		MPM_RENDER_FPS_OPTIONS,
-		MpmFramePacer,
-		type MpmRenderFps
-	} from '#lib/mpm/kernels/frame-pacer.js';
-	import {
-		DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE,
-		HORIZONTAL_OSCILLATION_FREQUENCY_HZ,
-		INITIAL_HORIZONTAL_OSCILLATION_AMPLITUDE,
-		MAX_HORIZONTAL_OSCILLATION_AMPLITUDE
-	} from '#lib/mpm/kernels/oscillation.js';
-	import {
-		MpmCpuReferenceSimulation,
-		MPM_CPU_MAX_CFL_MICROSTEPS_PER_MANUAL_STEP,
-		type MpmCpuRenderMode,
-		type MpmCpuWorkerRequest,
-		type MpmCpuWorkerResponse
-	} from '#lib/mpm/reference/cpu-simulation.js';
 	import type { MpmVector2 } from '#lib/mpm/reference/solver.js';
 	import {
-		createMpmGate4Scene,
-		GATE4_DEFAULT_GRAVITY,
-		GATE4_FIXED_STEP_SECONDS,
-		GATE4_FRACTURE_BOND_COUNT,
-		GATE4_FRACTURE_PARTICLE_COUNT,
-		GATE4_GRID,
-		GATE4_LIQUID_PARTICLE_DIAMETER,
-		GATE4_LIQUID_PARTICLE_DIAMETER_QUERY_KEY,
-		GATE4_OIL_PARTICLE_COUNT,
-		GATE4_PARTICLE_COUNT,
-		GATE4_PEBBLE_COUNT,
-		GATE4_PEBBLE_PARTICLE_COUNT,
-		GATE4_SCENE_SEED,
-		GATE4_WATER_PARTICLE_COUNT
-	} from '#lib/mpm/scenes/gate4.js';
+		createLiquidFunSimulation,
+		type LiquidFunRenderMode,
+		type LiquidFunSimulation
+	} from '#lib/mpm/liquidfun/simulation.js';
+	import {
+		LIQUIDFUN_BOX2D_DOMAIN_METERS,
+		LIQUIDFUN_DT_SECONDS,
+		LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN,
+		LIQUIDFUN_GATE4_DOMAIN,
+		LIQUIDFUN_GATE4_GRAVITY,
+		LIQUIDFUN_GATE4_UNITS_PER_METER,
+		LIQUIDFUN_PACKAGE_VERSION,
+		LIQUIDFUN_SCENE_SEED,
+		LIQUIDFUN_SHARED_PARTICLE_DENSITY,
+		LIQUIDFUN_VELOCITY_ITERATIONS,
+		LIQUIDFUN_POSITION_ITERATIONS
+	} from '#lib/mpm/liquidfun/workload.js';
+
+	const MAX_STEPS_PER_FRAME = 8;
+	const MAX_PHYSICS_FRAME_BUDGET_MS = 8;
+	const SIMULATION_SPEED_OPTIONS = [0.25, 0.5, 1, 2, 4, 8, 16, 32] as const;
+	const METRICS_INTERVAL_MS = 500;
 
 	type Phase = 'loading' | 'ready' | 'error';
-	type OrientationStatus =
-		| 'checking'
-		| 'idle'
-		| 'requesting'
-		| 'enabled'
-		| 'denied'
-		| 'unsupported';
-
-	const MAX_CPU_MICROSTEPS_PER_BATCH = 8;
-	const METRICS_INTERVAL_MS = 500;
-	const LIVE_METRICS_WINDOW_MS = MPM_LIVE_METRIC_WINDOW_MS;
-	const MAX_SIMULATION_SPEED = 32;
-	const SIMULATION_SPEED_OPTIONS = [0.5, 1, 2, 4, 8, 16, MAX_SIMULATION_SPEED] as const;
-	const DEFAULT_SIMULATION_SPEED = 2;
-	const DEFAULT_RENDER_FPS: MpmRenderFps = 60;
-	const STEP_SECONDS = GATE4_FIXED_STEP_SECONDS;
-	const framePacer = new MpmFramePacer();
-	const renderedFrameIntervals = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
-	const canvasDrawSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
-	const workerBatchCpuSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
-	const workerMicrostepCpuSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
-	const workerRoundTripSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
-	const workerOverheadSamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
-	const snapshotApplySamples = new MpmRollingMetric(LIVE_METRICS_WINDOW_MS);
 
 	let canvas: HTMLCanvasElement | undefined;
 	let context: CanvasRenderingContext2D | null = null;
-	let simulation = $state<MpmCpuReferenceSimulation | null>(null);
-	let cpuWorker: Worker | null = null;
-	let workerBusy = $state(false);
+	let simulation = $state<LiquidFunSimulation | null>(null);
 	let phase = $state<Phase>('loading');
 	let paused = $state(false);
-	let isVisible = $state(true);
+	let pageVisible = $state(true);
 	let errorMessage = $state('');
+	let gravityX = $state(LIQUIDFUN_GATE4_GRAVITY.x);
+	let gravityY = $state(LIQUIDFUN_GATE4_GRAVITY.y);
+	let simulationSpeed = $state(1);
+	let renderMode = $state<LiquidFunRenderMode>('surface');
 	let fps = $state(0);
-	let physicsMsPerMicrostep = $state(0);
-	let canvasDrawMsPerFrame = $state(0);
 	let stepsPerSecond = $state(0);
-	let microstepsPerSecond = $state(0);
+	let physicsMsPerStep = $state(0);
 	let pendingSimulationMs = $state(0);
-	let frameIntervalDistribution = $state<MpmMetricDistribution | null>(null);
-	let canvasDrawDistribution = $state<MpmMetricDistribution | null>(null);
-	let workerBatchCpuDistribution = $state<MpmMetricDistribution | null>(null);
-	let workerMicrostepCpuDistribution = $state<MpmMetricDistribution | null>(null);
-	let workerRoundTripDistribution = $state<MpmMetricDistribution | null>(null);
-	let workerOverheadDistribution = $state<MpmMetricDistribution | null>(null);
-	let snapshotApplyDistribution = $state<MpmMetricDistribution | null>(null);
-	let gravityMagnitude = $state(GATE4_DEFAULT_GRAVITY.y);
-	let manualGravityX = $state(GATE4_DEFAULT_GRAVITY.x);
-	let manualGravityY = $state(GATE4_DEFAULT_GRAVITY.y);
-	let orientationStatus = $state<OrientationStatus>('checking');
-	let orientationMessage = $state('DeviceOrientation センサーを確認しています…');
-	let sensorGravityUnit = $state<MpmVector2>({ x: 0, y: 0 });
-	let hasSensorGravity = $state(false);
-	let simulationSpeed = $state(DEFAULT_SIMULATION_SPEED);
-	let renderTargetFps: MpmRenderFps = $state(DEFAULT_RENDER_FPS);
-	let renderMode = $state<MpmCpuRenderMode>('surface');
-	let liquidParticleDiameter = $state(GATE4_LIQUID_PARTICLE_DIAMETER);
-	let appliedLiquidParticleDiameter = $state(GATE4_LIQUID_PARTICLE_DIAMETER);
-	let horizontalOscillationAmplitude = $state(
-		INITIAL_HORIZONTAL_OSCILLATION_AMPLITUDE
-	);
 
 	let mounted = false;
 	let generation = 0;
 	let animationFrame = 0;
 	let lastFrameTime = 0;
-	let lastRenderedFrameTime = 0;
 	let lastMetricsTime = 0;
-	let workerRequestStartedAt: number | null = null;
-	let workerRequestMetricsGeneration: number | null = null;
-	let liveMetricsGeneration = 0;
 	let accumulatorSeconds = 0;
-	let frameCount = 0;
-	let physicsStepsForMetrics = 0;
-	let physicsMicrostepsForMetrics = 0;
-	let macroStepRemainderSeconds = 0;
+	let framesForMetrics = 0;
+	let stepsForMetrics = 0;
 	let physicsMsForMetrics = 0;
-	let drawMsForMetrics = 0;
 
-	function formatMetricDistribution(
-		distribution: MpmMetricDistribution | null,
-		unit: string,
-		digits = 2
-	): string {
-		return distribution === null
-			? '計測中'
-			: `p50 ${distribution.median.toFixed(digits)} / p95 ${distribution.p95.toFixed(digits)} ${unit} · n=${distribution.samples}`;
-	}
-
-	let particleMicrostepsPerSecond = $derived(
-		(simulation?.particleCount ?? 0) * microstepsPerSecond
+	const appliedGravity = $derived<MpmVector2>({ x: gravityX, y: gravityY });
+	const effectiveSimulationSpeed = $derived(
+		stepsPerSecond * LIQUIDFUN_DT_SECONDS
 	);
-
-	function resetRollingMetrics(): void {
-		liveMetricsGeneration += 1;
-		renderedFrameIntervals.clear();
-		canvasDrawSamples.clear();
-		workerBatchCpuSamples.clear();
-		workerMicrostepCpuSamples.clear();
-		workerRoundTripSamples.clear();
-		workerOverheadSamples.clear();
-		snapshotApplySamples.clear();
-		frameIntervalDistribution = null;
-		canvasDrawDistribution = null;
-		workerBatchCpuDistribution = null;
-		workerMicrostepCpuDistribution = null;
-		workerRoundTripDistribution = null;
-		workerOverheadDistribution = null;
-		snapshotApplyDistribution = null;
-	}
-
-	function effectiveGravity(): MpmVector2 {
-		if (orientationStatus === 'enabled' && hasSensorGravity) {
-			return {
-				x: sensorGravityUnit.x * gravityMagnitude,
-				y: sensorGravityUnit.y * gravityMagnitude
-			};
-		}
-		return { x: manualGravityX, y: manualGravityY };
-	}
-
-	let appliedGravity = $derived(effectiveGravity());
 
 	const statusText = $derived(
 		phase === 'loading'
-			? 'CPU MLS-MPM reference を初期化中…'
+			? 'LiquidFun WASM を初期化中…'
 			: phase === 'error'
-				? 'シミュレーションを初期化できません'
-				: !isVisible
-					? 'ページ非表示中 · 物理ステップを停止中'
+				? 'シミュレーションを停止しました'
+				: !pageVisible
+					? 'ページ非表示中 · 物理計算を停止中'
 					: paused
-						? '一時停止中 · 固定刻み 1/240 秒'
-						: `実行中 · CPU · ${simulationSpeed}× · 固定刻み 1/240 秒`
+						? '一時停止中 · 未処理時間は保持されています'
+						: `実行中 · LiquidFun WASM · 要求 ${simulationSpeed}×`
 	);
 
 	function errorText(error: unknown): string {
 		return error instanceof Error && error.message.trim()
 			? error.message
-			: 'CPU MLS-MPM の処理中に詳細不明のエラーが発生しました。';
+			: 'LiquidFun WASM の処理中に詳細不明のエラーが発生しました。';
 	}
 
 	function resetMetrics(): void {
 		fps = 0;
-		physicsMsPerMicrostep = 0;
-		canvasDrawMsPerFrame = 0;
 		stepsPerSecond = 0;
-		microstepsPerSecond = 0;
-		pendingSimulationMs = 0;
-		frameCount = 0;
-		physicsStepsForMetrics = 0;
-		physicsMicrostepsForMetrics = 0;
-		macroStepRemainderSeconds = 0;
-		physicsMsForMetrics = 0;
-		drawMsForMetrics = 0;
-		workerRequestStartedAt = null;
-		workerRequestMetricsGeneration = null;
-		lastRenderedFrameTime = 0;
-		accumulatorSeconds = 0;
-		lastFrameTime = 0;
+		physicsMsPerStep = 0;
 		lastMetricsTime = 0;
-		resetRollingMetrics();
-		framePacer.reset();
-	}
-
-	function postWorkerRequest(request: MpmCpuWorkerRequest): void {
-		if (!cpuWorker) {
-			throw new Error('CPU MLS-MPM worker is not initialized.');
-		}
-		if (workerBusy) {
-			throw new Error('A CPU MLS-MPM worker batch is already in flight.');
-		}
-		workerBusy = true;
-		workerRequestStartedAt = performance.now();
-		workerRequestMetricsGeneration = liveMetricsGeneration;
-		try {
-			cpuWorker.postMessage(request);
-		} catch (error) {
-			workerBusy = false;
-			workerRequestStartedAt = null;
-			workerRequestMetricsGeneration = null;
-			throw error;
-		}
-	}
-
-	function handleWorkerResponse(response: MpmCpuWorkerResponse): void {
-		if (!mounted || response.generation !== generation) return;
-		const responseReceivedAt = performance.now();
-		const requestStartedAt = workerRequestStartedAt;
-		const requestMetricsGeneration = workerRequestMetricsGeneration;
-		workerRequestStartedAt = null;
-		workerRequestMetricsGeneration = null;
-		if (response.type === 'error') {
-			workerBusy = false;
-			failSimulation(new Error(response.message));
-			return;
-		}
-		if (!simulation) {
-			workerBusy = false;
-			failSimulation(new Error('CPU MLS-MPM worker returned state before initialization.'));
-			return;
-		}
-		try {
-			const snapshotApplyStartedAt = performance.now();
-			simulation.applyRenderSnapshot(response.snapshot);
-			const snapshotAppliedAt = performance.now();
-			if (
-				response.type !== 'ready' &&
-				requestMetricsGeneration === liveMetricsGeneration &&
-				isVisible
-			) {
-				snapshotApplySamples.record(
-					snapshotAppliedAt - snapshotApplyStartedAt,
-					snapshotAppliedAt
-				);
-			}
-		} catch (error) {
-			workerBusy = false;
-			failSimulation(error);
-			return;
-		}
-
-		workerBusy = false;
-		accumulatorSeconds += response.remainderSeconds;
-		if (response.type === 'ready') {
-			resetRollingMetrics();
-			fps = 0;
-			canvasDrawMsPerFrame = 0;
-			frameCount = 0;
-			drawMsForMetrics = 0;
-			lastFrameTime = 0;
-			lastRenderedFrameTime = 0;
-			lastMetricsTime = 0;
-			framePacer.reset();
-			appliedLiquidParticleDiameter = liquidParticleDiameter;
-			pendingSimulationMs = accumulatorSeconds * 1_000;
-			phase = 'ready';
-			return;
-		}
-
-		if (
-			requestMetricsGeneration === liveMetricsGeneration &&
-			isVisible
-		) {
-			workerBatchCpuSamples.record(response.workerMilliseconds, responseReceivedAt);
-			if (response.microStepCount > 0) {
-				workerMicrostepCpuSamples.record(
-					response.workerMilliseconds / response.microStepCount,
-					responseReceivedAt
-				);
-			}
-			if (requestStartedAt !== null) {
-				const roundTripMs = Math.max(0, responseReceivedAt - requestStartedAt);
-				workerRoundTripSamples.record(roundTripMs, responseReceivedAt);
-				workerOverheadSamples.record(
-					Math.max(0, roundTripMs - response.workerMilliseconds),
-					responseReceivedAt
-				);
-			}
-		}
-
-		if (requestMetricsGeneration === liveMetricsGeneration && isVisible) {
-			const macroStepProgress =
-				macroStepRemainderSeconds + response.simulatedSeconds;
-			const macroStepTolerance = STEP_SECONDS * Number.EPSILON * 8;
-			const completedMacroSteps = Math.floor(
-				(macroStepProgress + macroStepTolerance) / STEP_SECONDS
-			);
-			physicsStepsForMetrics += completedMacroSteps;
-			macroStepRemainderSeconds = Math.max(
-				0,
-				macroStepProgress - completedMacroSteps * STEP_SECONDS
-			);
-			physicsMicrostepsForMetrics += response.microStepCount;
-			physicsMsForMetrics += response.workerMilliseconds;
-		}
-		pendingSimulationMs = accumulatorSeconds * 1_000;
-	}
-
-	function initializeSimulation(): void {
-		const currentGeneration = ++generation;
-		paused = false;
-		phase = 'loading';
-		errorMessage = '';
-		resetMetrics();
-		cpuWorker?.terminate();
-		cpuWorker = null;
-		workerBusy = false;
-		simulation?.dispose();
-		simulation = null;
-
-		try {
-			const particleDiameterParameter = new URLSearchParams(
-				window.location.search
-			).get(GATE4_LIQUID_PARTICLE_DIAMETER_QUERY_KEY);
-			if (particleDiameterParameter !== null) {
-				liquidParticleDiameter = Number(particleDiameterParameter);
-			}
-			const scene = createMpmGate4Scene(GATE4_SCENE_SEED, {
-				liquidParticleDiameter
-			});
-			const created = new MpmCpuReferenceSimulation(scene);
-			if (!mounted || currentGeneration !== generation) {
-				created.dispose();
-				return;
-			}
-			simulation = created;
-			const worker = new Worker(
-				new URL('../../../../lib/mpm/reference/cpu-simulation.worker.ts', import.meta.url),
-				{ type: 'module' }
-			);
-			worker.onmessage = (event: MessageEvent<MpmCpuWorkerResponse>) =>
-				handleWorkerResponse(event.data);
-			worker.onerror = (event: ErrorEvent) => {
-				if (!mounted || currentGeneration !== generation) return;
-				failSimulation(
-					new Error(event.message || 'CPU MLS-MPM worker terminated unexpectedly.')
-				);
-			};
-			cpuWorker = worker;
-			postWorkerRequest({
-				type: 'initialize',
-				generation: currentGeneration,
-				liquidParticleDiameter,
-				gravity: effectiveGravity()
-			});
-		} catch (error) {
-			if (!mounted || currentGeneration !== generation) return;
-			failSimulation(error);
-		}
-	}
-
-	function resizeCanvas(): void {
-		if (!canvas || !context) return;
-		const bounds = canvas.getBoundingClientRect();
-		const devicePixelRatio = Math.min(window.devicePixelRatio || 1, 2);
-		const pixelWidth = Math.max(1, Math.round(bounds.width * devicePixelRatio));
-		const pixelHeight = Math.max(1, Math.round(bounds.height * devicePixelRatio));
-		if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
-		if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
-		context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+		framesForMetrics = 0;
+		stepsForMetrics = 0;
+		physicsMsForMetrics = 0;
 	}
 
 	function failSimulation(error: unknown): void {
 		paused = true;
 		phase = 'error';
 		errorMessage = errorText(error);
-		cpuWorker?.terminate();
-		cpuWorker = null;
-		workerBusy = false;
-		simulation?.dispose();
+		console.error('LiquidFun WASM simulation failed.', error);
+		const failedSimulation = simulation;
 		simulation = null;
-	}
-
-	function advanceOneCflBatch(): void {
-		if (!simulation || !cpuWorker) {
-			throw new Error('CPU MLS-MPM simulation is not initialized.');
+		try {
+			failedSimulation?.dispose();
+		} catch (disposeError) {
+			console.error('LiquidFun WASM cleanup failed after a simulation error.', disposeError);
+			errorMessage += ` WASM リソースの解放にも失敗しました: ${errorText(disposeError)}`;
 		}
-		postWorkerRequest({
-			type: 'step',
-			generation,
-			maxMicrosteps: MPM_CPU_MAX_CFL_MICROSTEPS_PER_MANUAL_STEP,
-			gravity: appliedGravity,
-			oscillationAmplitude: horizontalOscillationAmplitude
-		});
 	}
 
-	function applyCurrentGravity(): void {
+	async function initializeSimulation(): Promise<void> {
+		const currentGeneration = ++generation;
+		paused = false;
+		phase = 'loading';
+		errorMessage = '';
+		accumulatorSeconds = 0;
+		pendingSimulationMs = 0;
+		lastFrameTime = 0;
+		resetMetrics();
+
+		try {
+			const previousSimulation = simulation;
+			simulation = null;
+			previousSimulation?.dispose();
+
+			const createdSimulation = await createLiquidFunSimulation();
+			if (!mounted || currentGeneration !== generation) {
+				try {
+					createdSimulation.dispose();
+				} catch (disposeError) {
+					console.error('Stale LiquidFun WASM simulation cleanup failed.', disposeError);
+				}
+				return;
+			}
+
+			try {
+				createdSimulation.setGravityFromGate4(appliedGravity);
+			} catch (error) {
+				try {
+					createdSimulation.dispose();
+				} catch (disposeError) {
+					console.error('LiquidFun WASM cleanup failed after initialization.', disposeError);
+				}
+				throw error;
+			}
+
+			simulation = createdSimulation;
+			phase = 'ready';
+		} catch (error) {
+			if (currentGeneration !== generation) {
+				console.error('Superseded LiquidFun WASM initialization failed.', error);
+				return;
+			}
+			failSimulation(error);
+		}
+	}
+
+	function resizeCanvas(): void {
+		if (!canvas) return;
+		context = canvas.getContext('2d');
+		if (!context) {
+			failSimulation(new Error('このブラウザーでは Canvas2D を利用できません。'));
+			return;
+		}
+
+		const bounds = canvas.getBoundingClientRect();
+		const devicePixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+		canvas.width = Math.max(1, Math.round(bounds.width * devicePixelRatio));
+		canvas.height = Math.max(1, Math.round(bounds.height * devicePixelRatio));
+	}
+
+	function setGravity(): void {
+		try {
+			simulation?.setGravityFromGate4(appliedGravity);
+		} catch (error) {
+			failSimulation(error);
+		}
+	}
+
+	function stepOnce(): void {
+		if (!simulation || phase !== 'ready' || !paused) return;
+		try {
+			const startedAt = performance.now();
+			simulation.step();
+			physicsMsForMetrics += performance.now() - startedAt;
+			stepsForMetrics += 1;
+		} catch (error) {
+			failSimulation(error);
+		}
+	}
+
+	function togglePaused(): void {
+		paused = !paused;
 		lastFrameTime = 0;
 	}
 
-	function applyLiquidParticleDiameter(): void {
-		const url = new URL(window.location.href);
-		url.searchParams.set(
-			GATE4_LIQUID_PARTICLE_DIAMETER_QUERY_KEY,
-			String(liquidParticleDiameter)
-		);
-		window.location.assign(url.href);
+	function discardPendingTime(): void {
+		accumulatorSeconds = 0;
+		pendingSimulationMs = 0;
+	}
+
+	function handleVisibilityChange(): void {
+		pageVisible = document.visibilityState === 'visible';
+		lastFrameTime = 0;
+		resetMetrics();
 	}
 
 	function renderFrame(now: number): void {
 		if (!mounted) return;
 		animationFrame = window.requestAnimationFrame(renderFrame);
 
-		const previousFrameTime = lastFrameTime;
-		lastFrameTime = now;
 		const elapsedSeconds =
-			previousFrameTime === 0 ? 0 : Math.max(0, now - previousFrameTime) / 1_000;
+			lastFrameTime === 0 ? 0 : Math.max(0, (now - lastFrameTime) / 1_000);
+		lastFrameTime = now;
+		framesForMetrics += 1;
 
-		if (simulation && phase === 'ready' && !paused && isVisible) {
+		if (simulation && phase === 'ready' && !paused && pageVisible) {
 			try {
 				accumulatorSeconds += elapsedSeconds * simulationSpeed;
 				if (!Number.isFinite(accumulatorSeconds)) {
-					throw new RangeError('Accumulated CPU simulation time is outside the supported range.');
+					throw new RangeError('LiquidFun simulation backlog exceeded the finite time range.');
 				}
-				if (!workerBusy && accumulatorSeconds >= STEP_SECONDS) {
-					const requestedSeconds = accumulatorSeconds;
-					accumulatorSeconds = 0;
-					postWorkerRequest({
-						type: 'advance',
-						generation,
-						accumulatorSeconds: requestedSeconds,
-						maxMicrosteps: MAX_CPU_MICROSTEPS_PER_BATCH,
-						gravity: appliedGravity,
-						oscillationAmplitude: horizontalOscillationAmplitude
-					});
+
+				const physicsStartedAt = performance.now();
+				let stepsThisFrame = 0;
+				while (
+					accumulatorSeconds >= LIQUIDFUN_DT_SECONDS &&
+					stepsThisFrame < MAX_STEPS_PER_FRAME &&
+					performance.now() - physicsStartedAt < MAX_PHYSICS_FRAME_BUDGET_MS
+				) {
+					const stepStartedAt = performance.now();
+					simulation.step();
+					physicsMsForMetrics += performance.now() - stepStartedAt;
+					accumulatorSeconds = Math.max(
+						0,
+						accumulatorSeconds - LIQUIDFUN_DT_SECONDS
+					);
+					stepsForMetrics += 1;
+					stepsThisFrame += 1;
 				}
 			} catch (error) {
 				failSimulation(error);
 			}
 		}
 
-		if (isVisible && framePacer.shouldRender(now, renderTargetFps)) {
-			if (lastRenderedFrameTime > 0) {
-				renderedFrameIntervals.record(
-					Math.max(0, now - lastRenderedFrameTime),
-					now
-				);
+		pendingSimulationMs = accumulatorSeconds * 1_000;
+
+		if (context && canvas && simulation && phase === 'ready') {
+			try {
+				simulation.draw(context, canvas.width, canvas.height, renderMode);
+			} catch (error) {
+				failSimulation(error);
 			}
-			lastRenderedFrameTime = now;
-			const drawStartedAt = performance.now();
-			if (canvas && context && simulation && phase === 'ready') {
-				const bounds = canvas.getBoundingClientRect();
-				try {
-					simulation.draw(context, bounds.width, bounds.height, renderMode);
-				} catch (error) {
-					failSimulation(error);
-				}
-			} else if (canvas && context) {
-				const bounds = canvas.getBoundingClientRect();
-				context.clearRect(0, 0, bounds.width, bounds.height);
-				context.fillStyle = '#101a28';
-				context.fillRect(0, 0, bounds.width, bounds.height);
-			}
-			const drawCompletedAt = performance.now();
-			const drawMilliseconds = drawCompletedAt - drawStartedAt;
-			canvasDrawSamples.record(drawMilliseconds, drawCompletedAt);
-			drawMsForMetrics += drawMilliseconds;
-			frameCount += 1;
 		}
 
-		if (lastMetricsTime === 0) lastMetricsTime = now;
-		const metricsElapsedMs = now - lastMetricsTime;
-		if (metricsElapsedMs >= METRICS_INTERVAL_MS) {
-			fps = (frameCount * 1_000) / metricsElapsedMs;
-			stepsPerSecond = (physicsStepsForMetrics * 1_000) / metricsElapsedMs;
-			microstepsPerSecond =
-				(physicsMicrostepsForMetrics * 1_000) / metricsElapsedMs;
-			physicsMsPerMicrostep =
-				physicsMicrostepsForMetrics > 0
-					? physicsMsForMetrics / physicsMicrostepsForMetrics
-					: 0;
-			canvasDrawMsPerFrame =
-				frameCount > 0 ? drawMsForMetrics / frameCount : 0;
-			frameIntervalDistribution = renderedFrameIntervals.summarize(now);
-			canvasDrawDistribution = canvasDrawSamples.summarize(now);
-			workerBatchCpuDistribution = workerBatchCpuSamples.summarize(now);
-			workerMicrostepCpuDistribution = workerMicrostepCpuSamples.summarize(now);
-			workerRoundTripDistribution = workerRoundTripSamples.summarize(now);
-			workerOverheadDistribution = workerOverheadSamples.summarize(now);
-			snapshotApplyDistribution = snapshotApplySamples.summarize(now);
-			pendingSimulationMs = accumulatorSeconds * 1_000;
-			frameCount = 0;
-			physicsStepsForMetrics = 0;
-			physicsMicrostepsForMetrics = 0;
-			physicsMsForMetrics = 0;
-			drawMsForMetrics = 0;
+		if (lastMetricsTime === 0) {
 			lastMetricsTime = now;
+		} else if (now - lastMetricsTime >= METRICS_INTERVAL_MS) {
+			const elapsedMs = now - lastMetricsTime;
+			fps = (framesForMetrics * 1_000) / elapsedMs;
+			stepsPerSecond = (stepsForMetrics * 1_000) / elapsedMs;
+			physicsMsPerStep =
+				stepsForMetrics > 0 ? physicsMsForMetrics / stepsForMetrics : 0;
+			lastMetricsTime = now;
+			framesForMetrics = 0;
+			stepsForMetrics = 0;
+			physicsMsForMetrics = 0;
 		}
-	}
-
-	function togglePaused(): void {
-		if (phase !== 'ready') return;
-		paused = !paused;
-		if (paused) pendingSimulationMs = accumulatorSeconds * 1_000;
-		lastFrameTime = 0;
-	}
-
-	function stepOnce(): void {
-		if (phase !== 'ready' || !paused || !simulation || workerBusy) return;
-		try {
-			advanceOneCflBatch();
-		} catch (error) {
-			failSimulation(error);
-		}
-	}
-
-	function discardDeferredSimulationTime(): void {
-		if (!paused || accumulatorSeconds <= 0) return;
-		accumulatorSeconds = 0;
-		pendingSimulationMs = 0;
-	}
-
-	function toggleHorizontalOscillation(): void {
-		horizontalOscillationAmplitude =
-			horizontalOscillationAmplitude > 0
-				? 0
-				: DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE;
-	}
-
-	function refreshDeviceOrientationSupport(): void {
-		const supported =
-			typeof window.DeviceOrientationEvent !== 'undefined' && window.isSecureContext;
-		if (!supported) {
-			orientationStatus = 'unsupported';
-			orientationMessage =
-				'DeviceOrientation は非対応または安全でない接続です。手動の重力ベクトルを使用できます。';
-			return;
-		}
-		orientationStatus = 'idle';
-		orientationMessage =
-			'手動ベクトルを使用中です。センサーはボタンをタップした場合のみ開始します。';
-	}
-
-	function handleDeviceOrientation(event: DeviceOrientationEvent): void {
-		if (
-			event.beta === null ||
-			event.gamma === null ||
-			!Number.isFinite(event.beta) ||
-			!Number.isFinite(event.gamma)
-		) {
-			hasSensorGravity = false;
-			orientationMessage = '傾きデータがありません。手動の重力ベクトルを使用します。';
-			applyCurrentGravity();
-			return;
-		}
-		sensorGravityUnit = projectDeviceOrientationGravity(
-			event.beta,
-			event.gamma,
-			window.screen.orientation?.angle ?? 0
-		);
-		hasSensorGravity = true;
-		orientationMessage =
-			'DeviceOrientation を使用中です。重力ベクトルだけが変化し、画面は回転しません。';
-		applyCurrentGravity();
-	}
-
-	async function toggleDeviceOrientation(): Promise<void> {
-		if (orientationStatus === 'enabled') {
-			window.removeEventListener('deviceorientation', handleDeviceOrientation);
-			orientationStatus = 'idle';
-			hasSensorGravity = false;
-			orientationMessage = 'センサーを停止しました。手動の重力ベクトルを使用します。';
-			applyCurrentGravity();
-			return;
-		}
-		const constructor = window.DeviceOrientationEvent as
-			| (typeof DeviceOrientationEvent & {
-					requestPermission?: () => Promise<'granted' | 'denied'>;
-			  })
-			| undefined;
-		if (!constructor || !window.isSecureContext) {
-			orientationStatus = 'unsupported';
-			orientationMessage =
-				'DeviceOrientation は非対応または安全でない接続です。手動の重力ベクトルを使用できます。';
-			return;
-		}
-
-		orientationStatus = 'requesting';
-		orientationMessage = 'DeviceOrientation の許可を確認しています…';
-		try {
-			const permissionRequest = constructor.requestPermission
-				? constructor.requestPermission.call(constructor)
-				: Promise.resolve('granted' as const);
-			const permission = await permissionRequest;
-			if (permission !== 'granted') {
-				orientationStatus = 'denied';
-				hasSensorGravity = false;
-				orientationMessage =
-					'DeviceOrientation の許可が拒否されました。手動の重力ベクトルを使用できます。';
-				return;
-			}
-			window.addEventListener('deviceorientation', handleDeviceOrientation);
-			orientationStatus = 'enabled';
-			hasSensorGravity = false;
-			orientationMessage =
-				'DeviceOrientation は許可済みでデータを待っています。データ到着までは手動ベクトルを使用します。';
-		} catch {
-			orientationStatus = 'denied';
-			hasSensorGravity = false;
-			orientationMessage =
-				'DeviceOrientation の許可に失敗または拒否されました。手動の重力ベクトルを使用できます。';
-		}
-	}
-
-	function handleVisibilityChange(): void {
-		isVisible = document.visibilityState === 'visible';
-		lastFrameTime = 0;
-		lastRenderedFrameTime = 0;
-		lastMetricsTime = 0;
-		frameCount = 0;
-		physicsStepsForMetrics = 0;
-		physicsMicrostepsForMetrics = 0;
-		macroStepRemainderSeconds = 0;
-		physicsMsForMetrics = 0;
-		drawMsForMetrics = 0;
-		fps = 0;
-		physicsMsPerMicrostep = 0;
-		canvasDrawMsPerFrame = 0;
-		stepsPerSecond = 0;
-		microstepsPerSecond = 0;
-		resetRollingMetrics();
-		framePacer.reset();
 	}
 
 	onMount(() => {
 		mounted = true;
-		isVisible = document.visibilityState === 'visible';
-		refreshDeviceOrientationSupport();
+		pageVisible = document.visibilityState === 'visible';
 		context = canvas?.getContext('2d') ?? null;
 		if (!context) {
-			phase = 'error';
-			errorMessage = 'このブラウザーでは Canvas2D を利用できません。';
+			failSimulation(new Error('このブラウザーでは Canvas2D を利用できません。'));
+		} else {
+			const resizeObserver = new ResizeObserver(resizeCanvas);
+			if (canvas) resizeObserver.observe(canvas);
+			window.addEventListener('resize', resizeCanvas);
+			document.addEventListener('visibilitychange', handleVisibilityChange);
+			resizeCanvas();
+			void initializeSimulation();
+
+			animationFrame = window.requestAnimationFrame(renderFrame);
 			return () => {
 				mounted = false;
+				generation += 1;
+				window.cancelAnimationFrame(animationFrame);
+				window.removeEventListener('resize', resizeCanvas);
+				document.removeEventListener('visibilitychange', handleVisibilityChange);
+				resizeObserver.disconnect();
+				simulation?.dispose();
+				simulation = null;
 			};
 		}
-
-		const resizeObserver = new ResizeObserver(resizeCanvas);
-		if (canvas) resizeObserver.observe(canvas);
-		window.addEventListener('resize', resizeCanvas);
-		document.addEventListener('visibilitychange', handleVisibilityChange);
-		resizeCanvas();
-		void initializeSimulation();
-		animationFrame = window.requestAnimationFrame(renderFrame);
 
 		return () => {
 			mounted = false;
 			generation += 1;
-			window.cancelAnimationFrame(animationFrame);
-			window.removeEventListener('resize', resizeCanvas);
-			document.removeEventListener('visibilitychange', handleVisibilityChange);
-			resizeObserver.disconnect();
-			window.removeEventListener('deviceorientation', handleDeviceOrientation);
-			cpuWorker?.terminate();
-			cpuWorker = null;
-			workerBusy = false;
-			simulation?.dispose();
-			simulation = null;
 		};
 	});
 </script>
 
 <svelte:head>
-	<title>CPU MLS-MPM reference · Gate 4 comparison</title>
+	<title>LiquidFun WASM · Gate 4 behavioral reference</title>
 	<meta
 		name="description"
-		content="GPU MLS-MPM と同一の Gate 4 シーン・物理モデルを CPU の参照ソルバーで実行し、パフォーマンスと動作を比較するページ"
+		content="LiquidFun WASM を実際に動かして、MLS-MPM GPU 版と接触・波・安定性の挙動を比較するページ"
 	/>
 </svelte:head>
 
 <main class="page">
 	<header class="page-header">
-		<p class="eyebrow">MLS-MPM · CPU/GPU solver comparison</p>
-		<h1>CPU MLS-MPM reference</h1>
+		<p class="eyebrow">LIQUIDFUN WASM · BEHAVIORAL REFERENCE</p>
+		<h1>LiquidFun WASM · Gate 4 behavior lab</h1>
 		<p class="intro">
-			GPU ページと同じ seed・粒子配置・材料・固定刻み・CFL 条件を使い、同一の MLS-MPM 参照式を CPU で実行します。
-			CPU solver は Web Worker 上で実行し、1 batch を最大 8 CFL microsteps に制限します。追いつけない時間は捨てずに backlog として保持します。
+			既存の Gate 4 シーンを <code>liquidfun-wasm</code> の Box2D/LiquidFun world で実行します。
+			このページは挙動・接触・安定性を観察する独立した参照先です。GPU MLS-MPM の同じ式を解く数値 oracle ではありません。
+			要求速度が処理能力を超えたときは、1フレーム当たりの物理計算量を制限し、未処理時間を表示して catch-up の急増を防ぎます。
 		</p>
-		<nav class="solver-links" aria-label="Solver pages">
-			<a
-				href={`/labs/mpm/kernels?${GATE4_LIQUID_PARTICLE_DIAMETER_QUERY_KEY}=${appliedLiquidParticleDiameter}`}
-			>
-				GPU MLS-MPM page →
-			</a>
+		<nav class="solver-links" aria-label="Simulation pages">
+			<a href="/labs/mpm/kernels">GPU MLS-MPM page →</a>
+			<a href="/labs/mpm/reference">CPU MLS-MPM numerical reference</a>
 			<a href="/labs/mpm">MPM lab</a>
 		</nav>
 	</header>
 
-	<section class="simulation-layout" aria-label="CPU MLS-MPM reference simulation">
+	<section class="simulation-layout" aria-label="LiquidFun WASM simulation">
 		<div class="stage">
 			<div class="stage-heading">
 				<div>
-					<p class="eyebrow">CPU · shared MPM reference solver</p>
-					<h2>Gate 4 fixed scene</h2>
+					<p class="eyebrow">LiquidFun · fixed Gate 4 source scene</p>
+					<h2>Gate 4 LiquidFun scene</h2>
 				</div>
-				<span class="engine-tag">JavaScript · CPU · f64</span>
+				<span class="engine-tag">WASM · liquidfun-wasm {LIQUIDFUN_PACKAGE_VERSION}</span>
 			</div>
 
 			<div class="canvas-frame">
-				<canvas bind:this={canvas} aria-label="CPU MLS-MPM particle simulation">
+				<canvas bind:this={canvas} aria-label="LiquidFun WASM water, oil and solid particle simulation">
 					Canvas2D に対応したブラウザーでご利用ください。
 				</canvas>
 			</div>
 			<p class="status" role="status" aria-live="polite">{statusText}</p>
 			{#if errorMessage}
 				<p class="error" role="alert">{errorMessage}</p>
+				<button class="retry-button" type="button" onclick={() => void initializeSimulation()}>
+					Reset and retry
+				</button>
 			{/if}
 		</div>
 
@@ -749,7 +357,7 @@
 				</button>
 				<button
 					type="button"
-					disabled={phase !== 'ready' || !paused || workerBusy}
+					disabled={phase !== 'ready' || !paused}
 					onclick={stepOnce}
 				>
 					1 step
@@ -757,74 +365,45 @@
 				<button
 					type="button"
 					disabled={phase === 'loading'}
-					onclick={initializeSimulation}
+					onclick={() => void initializeSimulation()}
 				>
 					Reset
 				</button>
 			</div>
 
-			<Gate4ParticleSizeControl
-				bind:value={liquidParticleDiameter}
-				appliedValue={appliedLiquidParticleDiameter}
-				disabled={phase !== 'ready'}
-				onApply={applyLiquidParticleDiameter}
-			/>
-
 			<fieldset class="gravity-controls">
 				<legend>Gravity · Gate 4 units/s²</legend>
 				<label class="range-control">
 					<span>X</span>
-					<output>{manualGravityX}</output>
+					<output>{gravityX}</output>
 					<input
 						type="range"
 						min="-180"
 						max="180"
 						step="5"
-						bind:value={manualGravityX}
-						oninput={applyCurrentGravity}
-						disabled={orientationStatus === 'enabled' && hasSensorGravity}
+						bind:value={gravityX}
+						oninput={setGravity}
+						disabled={phase !== 'ready'}
 					/>
 				</label>
 				<label class="range-control">
 					<span>Y</span>
-					<output>{manualGravityY}</output>
+					<output>{gravityY}</output>
 					<input
 						type="range"
 						min="-180"
 						max="180"
 						step="5"
-						bind:value={manualGravityY}
-						oninput={applyCurrentGravity}
-						disabled={orientationStatus === 'enabled' && hasSensorGravity}
+						bind:value={gravityY}
+						oninput={setGravity}
+						disabled={phase !== 'ready'}
 					/>
 				</label>
-				<label class="range-control">
-					<span>Sensor strength</span>
-					<output>{gravityMagnitude}</output>
-					<input
-						type="range"
-						min="0"
-						max="180"
-						step="5"
-						bind:value={gravityMagnitude}
-						oninput={applyCurrentGravity}
-						disabled={orientationStatus !== 'enabled' || !hasSensorGravity}
-					/>
-				</label>
-				<button
-					type="button"
-					class="wide-button"
-					disabled={orientationStatus === 'unsupported' || orientationStatus === 'requesting'}
-					onclick={() => void toggleDeviceOrientation()}
-				>
-					{orientationStatus === 'enabled' ? 'Disable tilt sensor' : 'Enable tilt sensor'}
-				</button>
-				<p class="sensor-status" role="status">{orientationMessage}</p>
 			</fieldset>
 
 			<div class="setting-controls">
 				<label>
-					<span>Simulation speed</span>
+					<span>Requested simulation speed</span>
 					<select bind:value={simulationSpeed}>
 						{#each SIMULATION_SPEED_OPTIONS as speed}
 							<option value={speed}>{speed}×</option>
@@ -834,138 +413,67 @@
 				<label>
 					<span>Fluid display</span>
 					<select bind:value={renderMode}>
-						<option value="surface">Water/oil surface</option>
+						<option value="surface">Surface</option>
 						<option value="particles">Particle markers</option>
 					</select>
 				</label>
-				<label>
-					<span>Render target</span>
-					<select bind:value={renderTargetFps}>
-						{#each MPM_RENDER_FPS_OPTIONS as targetFps}
-							<option value={targetFps}>{targetFps} FPS</option>
-						{/each}
-					</select>
-				</label>
 			</div>
-
-			<fieldset class="oscillation-controls">
-				<legend>Horizontal oscillation</legend>
-				<label class="range-control">
-					<span>Acceleration</span>
-					<output>{horizontalOscillationAmplitude}</output>
-					<input
-						type="range"
-						min="0"
-						max={MAX_HORIZONTAL_OSCILLATION_AMPLITUDE}
-						step="10"
-						bind:value={horizontalOscillationAmplitude}
-					/>
-				</label>
-				<button type="button" class="wide-button" onclick={toggleHorizontalOscillation}>
-					{horizontalOscillationAmplitude > 0
-						? 'Stop oscillation'
-						: `Start ±${DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE} oscillation`}
-				</button>
-				<p class="control-note">Sinusoidal acceleration · {HORIZONTAL_OSCILLATION_FREQUENCY_HZ} Hz</p>
-			</fieldset>
 
 			<div class="backlog-controls">
 				<p>Pending simulation time: {pendingSimulationMs.toFixed(1)} ms</p>
 				<button
-					type="button"
 					class="wide-button"
-					disabled={!paused || workerBusy || pendingSimulationMs <= 0}
-					onclick={discardDeferredSimulationTime}
+					type="button"
+					disabled={!paused || pendingSimulationMs <= 0}
+					onclick={discardPendingTime}
 				>
 					Discard pending time
 				</button>
+				<p class="control-note">
+					Per-frame physics budget: up to {MAX_STEPS_PER_FRAME} steps and
+					{MAX_PHYSICS_FRAME_BUDGET_MS} ms. If the requested speed is too high, the backlog grows instead
+					of triggering an unbounded catch-up loop.
+				</p>
 			</div>
 
-			<h2>Live metrics · rolling 5 s</h2>
-			<p class="metric-note">
-				p50/p95 は直近 5 秒の分布（p50 は中央値、p95 は nearest-rank 法）です。Worker round-trip は dispatch から snapshot 応答までを含みます。
-				worker turnaround minus solver はその時間から Worker 報告の計算時間を引いた概算です。
-				snapshot apply と Canvas2D draw は main thread の CPU 時間です。
-			</p>
+			<h2>Live metrics · rolling 0.5 s</h2>
 			<dl class="metrics">
 				<div>
-					<dt>描画 FPS</dt>
+					<dt>Render FPS</dt>
 					<dd>{fps.toFixed(1)}</dd>
 				</div>
 				<div>
-					<dt>Simulation CPU ms / CFL microstep</dt>
-					<dd>{physicsMsPerMicrostep.toFixed(3)}</dd>
-				</div>
-				<div>
-					<dt>Completed macrosteps / s</dt>
+					<dt>Completed steps / s</dt>
 					<dd>{stepsPerSecond.toFixed(1)}</dd>
 				</div>
 				<div>
-					<dt>CFL microsteps / s</dt>
-					<dd>{microstepsPerSecond.toFixed(1)}</dd>
+					<dt>Effective simulation speed</dt>
+					<dd>{effectiveSimulationSpeed.toFixed(2)}×</dd>
 				</div>
 				<div>
-					<dt>Particle-microsteps / s</dt>
-					<dd>{Math.round(particleMicrostepsPerSecond).toLocaleString()}</dd>
+					<dt>JS + WASM CPU ms / step</dt>
+					<dd>{physicsMsPerStep.toFixed(3)}</dd>
 				</div>
 				<div>
-					<dt>Canvas2D draw ms / frame</dt>
-					<dd>{canvasDrawMsPerFrame.toFixed(3)}</dd>
+					<dt>LiquidFun particles</dt>
+					<dd>{simulation?.particleCount.toLocaleString() ?? '—'}</dd>
 				</div>
 				<div>
-					<dt>Rendered frame interval</dt>
-					<dd>{formatMetricDistribution(frameIntervalDistribution, 'ms')}</dd>
-				</div>
-				<div>
-					<dt>Canvas2D draw time</dt>
-					<dd>{formatMetricDistribution(canvasDrawDistribution, 'ms')}</dd>
-				</div>
-				<div>
-					<dt>Worker batch CPU time</dt>
-					<dd>{formatMetricDistribution(workerBatchCpuDistribution, 'ms')}</dd>
-				</div>
-				<div>
-					<dt>Worker CPU / CFL microstep</dt>
-					<dd>{formatMetricDistribution(workerMicrostepCpuDistribution, 'ms')}</dd>
-				</div>
-				<div>
-					<dt>Worker round-trip</dt>
-					<dd>{formatMetricDistribution(workerRoundTripDistribution, 'ms')}</dd>
-				</div>
-				<div>
-					<dt>Worker turnaround minus solver</dt>
-					<dd>{formatMetricDistribution(workerOverheadDistribution, 'ms')}</dd>
-				</div>
-				<div>
-					<dt>Snapshot apply on main thread</dt>
-					<dd>{formatMetricDistribution(snapshotApplyDistribution, 'ms')}</dd>
-				</div>
-				<div>
-					<dt>未処理の固定刻み</dt>
-					<dd>{pendingSimulationMs.toFixed(1)} ms</dd>
-				</div>
-				<div>
-					<dt>MPM particles</dt>
-					<dd>{simulation?.particleCount ?? '—'}</dd>
-				</div>
-				<div>
-					<dt>Water / oil particles</dt>
+					<dt>Water / oil flags</dt>
 					<dd>
-						{simulation?.waterParticleCount ?? '—'} / {simulation?.oilParticleCount ?? '—'}
+						{simulation?.waterParticleCount.toLocaleString() ?? '—'} /
+						{simulation?.oilParticleCount.toLocaleString() ?? '—'}
 					</dd>
 				</div>
 				<div>
-					<dt>Pebble vertices / deformable triangles</dt>
-					<dd>{simulation?.pebbleNodeCount ?? '—'} / {simulation?.triangleBodyCount ?? '—'}</dd>
+					<dt>Rigid pebble triangle bodies</dt>
+					<dd>{simulation?.triangleBodyCount ?? '—'}</dd>
 				</div>
 				<div>
-					<dt>Fracture nodes</dt>
-					<dd>{simulation?.fractureNodeCount ?? '—'}</dd>
-				</div>
-				<div>
-					<dt>Active fracture bonds</dt>
+					<dt>Fracture nodes / active bonds</dt>
 					<dd>
-						{simulation?.activeFractureBondCount ?? '—'} / {simulation?.fractureBondCount ?? '—'}
+						{simulation?.fractureNodeCount ?? '—'} /
+						{simulation?.activeFractureBondCount ?? '—'}
 					</dd>
 				</div>
 			</dl>
@@ -974,65 +482,64 @@
 				<h2>Fixed workload</h2>
 				<ul>
 					<li>
-						Seed <code>0x{GATE4_SCENE_SEED.toString(16)}</code>
+						Seed <code>0x{LIQUIDFUN_SCENE_SEED.toString(16)}</code> ·
+						{simulation?.mappedMpmNodeCount.toLocaleString() ?? '3,674'} mapped source nodes
 					</li>
 					<li>
-						{GATE4_GRID.cellsX * GATE4_GRID.cellSize} × {GATE4_GRID.cellsY * GATE4_GRID.cellSize}
-						world units · {GATE4_GRID.cellsX} × {GATE4_GRID.cellsY} grid · cell {GATE4_GRID.cellSize}
+						{LIQUIDFUN_GATE4_DOMAIN.width} × {LIQUIDFUN_GATE4_DOMAIN.height} Gate 4 units ·
+						{LIQUIDFUN_BOX2D_DOMAIN_METERS.width} × {LIQUIDFUN_BOX2D_DOMAIN_METERS.height} m Box2D world
 					</li>
 					<li>
-						dt = 1/{Math.round(1 / STEP_SECONDS)} s · default gravity = ({GATE4_DEFAULT_GRAVITY.x},
-						{GATE4_DEFAULT_GRAVITY.y}) units/s²
+						dt = 1/{Math.round(1 / LIQUIDFUN_DT_SECONDS)} s · scale {LIQUIDFUN_GATE4_UNITS_PER_METER}
+						Gate 4 units / m
 					</li>
 					<li>
-						{GATE4_WATER_PARTICLE_COUNT.toLocaleString()} water + {GATE4_OIL_PARTICLE_COUNT.toLocaleString()}
-						oil + {GATE4_PEBBLE_PARTICLE_COUNT} pebble vertices ({GATE4_PEBBLE_COUNT} deformable triangles)
-						+ {GATE4_FRACTURE_PARTICLE_COUNT} fracture nodes / {GATE4_FRACTURE_BOND_COUNT} bonds
+						{LIQUIDFUN_VELOCITY_ITERATIONS} velocity + {LIQUIDFUN_POSITION_ITERATIONS} position
+						iterations · particle iterations {simulation?.particleIterations ?? '…'}
 					</li>
 					<li>
-						Liquid reference diameter {appliedLiquidParticleDiameter} units · area
-						{appliedLiquidParticleDiameter ** 2} units²
-					</li>
-					<li>
-						Courant limit {DEFAULT_MPM_COURANT_LIMIT} · max {MAX_CPU_MICROSTEPS_PER_BATCH}
-						CFL microsteps per worker batch; excess simulation time is retained
+						Shared particle-system density {LIQUIDFUN_SHARED_PARTICLE_DENSITY} · fracture threshold
+						{(LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN * 100).toFixed(0)}%
 					</li>
 				</ul>
 			</div>
 		</aside>
 	</section>
 
-	<section class="limitations" aria-labelledby="limits-heading">
-		<h2 id="limits-heading">Comparison notes</h2>
+	<section class="limitations" aria-labelledby="comparison-heading">
+		<h2 id="comparison-heading">How to use this reference</h2>
 		<ul>
 			<li>
-				CPU and GPU pages construct the same seeded Gate 4 particles, materials, fracture bonds, grid, gravity,
-				fixed timestep, CFL limit, and oscillation. The CPU page runs the shared <code>stepMpm</code> reference
-				equations instead of LiquidFun.
+				This page steps the installed <code>liquidfun-wasm</code> engine. Liquid particles are solved by
+				LiquidFun; pebble triangles and the fracture network are represented by Box2D rigid bodies and
+				distance joints. Canvas2D is only the renderer.
 			</li>
 			<li>
-				The reference solver uses JavaScript number precision; WebGPU kernels use float32 and parallel
-				accumulation. Expect small numerical drift rather than bit-for-bit identical trajectories.
+				The water and oil flags share one LiquidFun particle system and its density/radius settings.
+				The triangular pebbles are rigid approximations, not deformable MLS-MPM triangles. Do not
+				interpret their paths as a matched-physics comparison.
 			</li>
 			<li>
-				The CPU solver runs off the main thread and caps each worker batch at
-				{MAX_CPU_MICROSTEPS_PER_BATCH} CFL microsteps. When it cannot meet the selected simulation speed, it
-				retains the excess as pending simulation time instead of dropping it or taking an unbounded catch-up loop.
+				Use the CPU MLS-MPM page at <a href="/labs/mpm/reference">/labs/mpm/reference</a> as the
+				same-equation numerical reference for <a href="/labs/mpm/kernels">GPU MLS-MPM</a>. Use this
+				LiquidFun page to judge whether its contact, wave, settling and stability behavior is a useful
+				target. Tune the GPU implementation toward selected behaviors only after recording measurable
+				criteria; do not require particle-by-particle trajectory parity across different solvers.
 			</li>
 			<li>
-				CPU timing covers synchronous MLS-MPM stepping; Canvas2D drawing is reported separately. The GPU page
-				reports GPU queue and kernel measurements, so compare completed macrosteps/s or CFL microsteps/s alongside
-				per-step timing.
-			</li>
-			<li>
-				Water/oil surface mode and particle-marker mode change only the drawing. The older standalone LiquidFun
-				benchmark remains separate and is not used by either live comparison page.
+				The live timing includes synchronous JavaScript-to-WASM simulation calls and excludes rendering.
+				Compare it only under the same browser/device and workload; this is not a GPU timing or a
+				cross-device performance guarantee.
 			</li>
 		</ul>
 		<p class="docs-link">
-			Comparison setup and interpretation are documented in
-			<code>docs/MPM-CPU-GPU-COMPARISON.md</code>. The standalone LiquidFun benchmark remains at
-			<code>docs/LIQUIDFUN-BENCHMARK.md</code>.
+			See <code>docs/LIQUIDFUN-BENCHMARK.md</code> for mapping and benchmark methodology and
+			<code>docs/MPM-CPU-GPU-COMPARISON.md</code> for the separate numerical-reference role.
+		</p>
+		<p class="license-links">
+			Package notices:
+			<a href="/licenses/liquidfun-wasm/LICENSE.zlib.txt">Zlib</a> ·
+			<a href="/licenses/liquidfun-wasm/LICENSE.wasm-feature-detect.Apache.txt">Apache 2.0</a>
 		</p>
 	</section>
 </main>
@@ -1048,14 +555,13 @@
 
 	.page {
 		box-sizing: border-box;
-		width: min(1012px, 100%);
+		width: min(100%, 1480px);
 		margin: 0 auto;
-		padding: max(1rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right))
-			max(2rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));
+		padding: clamp(1rem, 3vw, 2.5rem);
 	}
 
 	.page-header {
-		margin-bottom: 1.5rem;
+		margin-bottom: 1.25rem;
 	}
 
 	.eyebrow {
@@ -1085,7 +591,7 @@
 	}
 
 	.intro {
-		max-width: 74ch;
+		max-width: 84ch;
 		margin-bottom: 0.8rem;
 		color: #bdcada;
 		line-height: 1.6;
@@ -1106,6 +612,13 @@
 		color: #c4f2ff;
 	}
 
+	.simulation-layout,
+	.limitations {
+		border: 1px solid #26374d;
+		border-radius: 14px;
+		background: #121c2a;
+	}
+
 	.simulation-layout {
 		box-sizing: border-box;
 		display: grid;
@@ -1114,13 +627,6 @@
 		gap: 1rem;
 		align-items: start;
 		padding: 1rem;
-	}
-
-	.simulation-layout,
-	.limitations {
-		border: 1px solid #26374d;
-		border-radius: 14px;
-		background: #121c2a;
 	}
 
 	.stage {
@@ -1163,7 +669,6 @@
 		display: block;
 		width: 100%;
 		height: 100%;
-		touch-action: none;
 	}
 
 	.status {
@@ -1205,18 +710,6 @@
 		cursor: pointer;
 	}
 
-	select {
-		box-sizing: border-box;
-		width: 100%;
-		min-height: 2.55rem;
-		border: 1px solid #3b4d62;
-		border-radius: 8px;
-		padding: 0.45rem 0.65rem;
-		background: #1a2839;
-		color: #e7eef8;
-		font: inherit;
-	}
-
 	button:hover:not(:disabled) {
 		background: #263a50;
 	}
@@ -1238,8 +731,19 @@
 		opacity: 0.55;
 	}
 
-	.gravity-controls,
-	.oscillation-controls {
+	select {
+		box-sizing: border-box;
+		width: 100%;
+		min-height: 2.55rem;
+		border: 1px solid #3b4d62;
+		border-radius: 8px;
+		padding: 0.45rem 0.65rem;
+		background: #1a2839;
+		color: #e7eef8;
+		font: inherit;
+	}
+
+	.gravity-controls {
 		display: grid;
 		gap: 0.65rem;
 		min-width: 0;
@@ -1250,8 +754,7 @@
 		background: #0d1823;
 	}
 
-	.gravity-controls legend,
-	.oscillation-controls legend {
+	.gravity-controls legend {
 		padding: 0 0.35rem;
 		font-weight: 650;
 	}
@@ -1297,25 +800,6 @@
 		font-size: 0.88rem;
 	}
 
-	.wide-button {
-		width: 100%;
-	}
-
-	.sensor-status,
-	.control-note,
-	.backlog-controls p,
-	.metric-note {
-		margin: 0;
-		color: #b8c7d8;
-		font-size: 0.84rem;
-		line-height: 1.5;
-		overflow-wrap: anywhere;
-	}
-
-	.metric-note {
-		margin: -0.45rem 0 0.75rem;
-	}
-
 	.backlog-controls {
 		display: grid;
 		gap: 0.55rem;
@@ -1324,6 +808,27 @@
 		border-radius: 0.55rem;
 		padding: 0.75rem;
 		background: #0d1823;
+	}
+
+	.backlog-controls p {
+		margin: 0;
+		color: #c4d0de;
+		font-size: 0.84rem;
+		line-height: 1.5;
+		overflow-wrap: anywhere;
+	}
+
+	.control-note {
+		color: #b8c7d8 !important;
+	}
+
+	.wide-button,
+	.retry-button {
+		width: 100%;
+	}
+
+	.retry-button {
+		margin-top: 0.75rem;
 	}
 
 	.metrics {
@@ -1382,22 +887,24 @@
 		padding: clamp(1rem, 2vw, 1.4rem);
 	}
 
-	.docs-link {
-		margin: 1rem 0 0;
-		color: #b9c8d8;
-		line-height: 1.55;
-		overflow-wrap: anywhere;
+	.limitations ul {
+		margin-bottom: 1rem;
 	}
 
-	.docs-link {
+	.docs-link,
+	.license-links {
+		margin: 0.75rem 0 0;
+		color: #b9c8d8;
 		font-size: 0.9rem;
+		line-height: 1.55;
+		overflow-wrap: anywhere;
 	}
 
 	@media (max-width: 900px) {
 		.simulation-layout {
 			grid-template-areas:
-				'controls'
-				'canvas';
+				'canvas'
+				'controls';
 			grid-template-columns: minmax(0, 1fr);
 		}
 	}

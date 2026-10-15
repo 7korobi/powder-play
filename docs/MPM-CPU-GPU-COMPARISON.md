@@ -1,11 +1,13 @@
 # Gate 4 CPU/GPU MLS-MPM comparison
 
-`/labs/mpm/liquidfun` is the CPU reference and `/labs/mpm/kernels` is the
-WebGPU implementation. Both pages build the same Gate 4 scene and use the
-same `stepMpm` constitutive/contact model, material parameters, fracture
-network, fixed timestep, and CFL limit. The CPU page is not a LiquidFun/Box2D
-simulation; the older standalone LiquidFun benchmark is documented in
-[LIQUIDFUN-BENCHMARK.md](./LIQUIDFUN-BENCHMARK.md).
+`/labs/mpm/reference` is the CPU numerical reference and
+`/labs/mpm/kernels` is the WebGPU implementation. Both pages build the same
+Gate 4 scene and use the same `stepMpm` constitutive/contact model, material
+parameters, fracture network, fixed timestep, and CFL limit.
+`/labs/mpm/liquidfun` is a separate LiquidFun WASM behavior reference; its
+solver and solid representation differ and it is not a numerical oracle for
+MLS-MPM. See [LIQUIDFUN-BENCHMARK.md](./LIQUIDFUN-BENCHMARK.md) for its
+mapping, limitations, and measurement method.
 
 Liquid contact with bonded triangles uses the same normal response and
 rate-based tangential drag on both implementations. Tangential relative
@@ -62,9 +64,20 @@ pages; normal simulation begins with the same oscillation phase afterward.
   now scale liquid display area using the current deformation, although their
   surface extraction and rasterization remain different.
 
-Both pages provide matching baseline controls for pause/resume, one step,
+The CPU and GPU pages provide matching baseline controls for pause/resume, one step,
 gravity and device tilt, simulation speed, liquid particle size, oscillation,
 render mode, and render-rate target. For performance comparisons, record
 browser/device, applied diameter, speed, render target, oscillation setting,
 completed macrosteps/s, CFL microsteps/s, and the separate physics/render
 timings. Reset both pages after changing their initial settings.
+
+## LiquidFun as a behavioral target
+
+Use LiquidFun to identify desirable qualitative and measurable outcomes (for
+example maximum pebble penetration, settling time, wave height/decay, and
+whether fluid motion carries a pebble) before tuning the GPU MLS-MPM page.
+Compare those behavior metrics separately from same-equation CPU/GPU parity
+and from per-step performance. Different solvers, shared LiquidFun
+particle-system parameters, and rigid-body pebble approximations mean
+particle-by-particle trajectory matching is neither expected nor a reliable
+correctness test.

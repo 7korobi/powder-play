@@ -70,6 +70,9 @@ Android Chrome と iOS Safari のセンサー権限、複数指操作、画面�
 `/labs/mpm/kernels` は、Gate 1のMLS-MPM数値コア、Gate 2のGPU選択・局所力ドラッグ・
 オブジェクト複製、Gate 4の水・油・弾性小石・破断固体3,674粒子の試作構成則を検証します。
 いずれもWebGPU非対応のブラウザーでは利用できません。
+`/labs/mpm/reference` は同じ MLS-MPM 式を使う CPU 数値参照、
+`/labs/mpm/liquidfun` は `liquidfun-wasm` の挙動比較ラボです。
+LiquidFun は接触・波・安定性の比較対象で、GPU 版との粒子軌跡一致を期待するものではありません。
 通常のアプリ画面 `/` は従来のシミュレーションを引き続き使用します。実装状況と次の判定ゲートは
 [2D GPU MLS-MPM ロードマップ](./docs/ROADMAP-MLS-MPM.md) を参照してください。
 

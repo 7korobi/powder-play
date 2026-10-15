@@ -1,10 +1,14 @@
 # LiquidFun CPU benchmark
 
-This document describes the standalone `benchmark:liquidfun` harness and its
-historical LiquidFun implementation. The live `/labs/mpm/liquidfun` route now
-runs the CPU MLS-MPM reference solver so it can be compared with
-`/labs/mpm/kernels` under the same physical model. See
-[MPM CPU/GPU comparison](./MPM-CPU-GPU-COMPARISON.md) for the current setup.
+This document describes the live LiquidFun behavior lab at
+`/labs/mpm/liquidfun` and the standalone `benchmark:liquidfun` harness. The
+interactive page and benchmark use the same `createLiquidFunSimulation()`
+implementation; the page adds Canvas2D rendering and live controls, while the
+benchmark measures simulation-only batches. The CPU MLS-MPM numerical
+reference lives at `/labs/mpm/reference`, and `/labs/mpm/kernels` is the GPU
+MLS-MPM implementation. See
+[MPM CPU/GPU comparison](./MPM-CPU-GPU-COMPARISON.md) for how to use these
+three references together.
 
 The benchmark harness still uses `liquidfun-wasm@7.0.0`, the LiquidFun
 particle API in Birch-san's `box2d-wasm` WebAssembly fork based on Box2D 2.4.1.
@@ -69,14 +73,23 @@ independently. Expect different trajectories and breakage timing; the
 comparison holds the seeded source scene and fixed timestep, not the exact
 physical response.
 
-## Current live comparison
+## Live LiquidFun lab and MPM references
 
-The live route no longer loads this LiquidFun simulation. It now uses the CPU
-MLS-MPM reference solver and shares the seeded scene, liquid particle-size
-control, fixed timestep, CFL policy, gravity, and oscillation with the GPU
-page. The GPU route retains optional GPU-only interaction and emitter
-experiments; those are outside the default CPU/GPU baseline. The benchmark
-below remains available to measure the independent LiquidFun implementation.
+The live LiquidFun route executes the WASM engine described above and exposes
+pause/resume, single-step, reset, gravity, requested simulation speed, render
+mode, and live step/backlog metrics. A per-frame step count and physics-time
+budget prevent a high requested speed from producing an unbounded synchronous
+catch-up loop. If the browser cannot keep up, pending simulation time is shown
+and can be discarded while paused.
+
+The CPU and GPU MLS-MPM pages remain a separate same-equation numerical
+comparison. LiquidFun is a behavioral reference for contact, waves, settling,
+and stability, not an exact trajectory or constitutive-model oracle. Water
+and oil use different LiquidFun particle flags in one particle system, so they
+share its density/radius parameters. The 50 pebble triangles are rigid Box2D
+bodies, not deformable MLS-MPM triangles; fracture nodes use dynamic bodies
+and breakable distance joints. These model differences should be retained
+when interpreting the visual and timing results.
 
 ## Repeatable simulation-only benchmark
 

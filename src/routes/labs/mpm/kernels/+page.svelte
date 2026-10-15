@@ -1794,10 +1794,11 @@
 		</div>
 		<nav aria-label="実験ページ">
 			<a
-				href={`/labs/mpm/liquidfun?${GATE4_LIQUID_PARTICLE_DIAMETER_QUERY_KEY}=${appliedLiquidParticleDiameter}`}
+				href={`/labs/mpm/reference?${GATE4_LIQUID_PARTICLE_DIAMETER_QUERY_KEY}=${appliedLiquidParticleDiameter}`}
 			>
 				CPU MLS-MPM reference
 			</a>
+			<a href="/labs/mpm/liquidfun">LiquidFun WASM behavior reference</a>
 			<a href="/labs/mpm">粒子操作ラボ</a>
 			<a href="/">通常画面</a>
 		</nav>
