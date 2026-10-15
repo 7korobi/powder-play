@@ -52,6 +52,7 @@ export const LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN =
 	GATE4_FRACTURE_FAILURE_STRAIN;
 export const LIQUIDFUN_VELOCITY_ITERATIONS = 8;
 export const LIQUIDFUN_POSITION_ITERATIONS = 3;
+export const LIQUIDFUN_PEBBLE_SIZE_SCALE = 0.5;
 export const LIQUIDFUN_STATIONARY_WARMUP_MS = 600;
 export const LIQUIDFUN_GRAVITY_WARMUP_STEPS = 64;
 export const LIQUIDFUN_SAMPLE_BATCHES = 12;
@@ -97,6 +98,18 @@ export interface LiquidFunGate4Workload {
 	readonly pebbleGroups: readonly LiquidFunTriangleGroupSeed[];
 	readonly fractureNodes: readonly MpmParticle[];
 	readonly fractureBonds: readonly LiquidFunFractureBondSeed[];
+}
+
+export function scaleLiquidFunPebbleLocalVertices(
+	vertices: readonly LiquidFunVector[]
+): readonly LiquidFunVector[] {
+	if (vertices.length !== 3) {
+		throw new RangeError('A LiquidFun pebble must have exactly three triangle vertices.');
+	}
+	return vertices.map((vertex) => ({
+		x: vertex.x * LIQUIDFUN_PEBBLE_SIZE_SCALE,
+		y: vertex.y * LIQUIDFUN_PEBBLE_SIZE_SCALE
+	}));
 }
 
 export function mapGate4PositionToBox2D(position: MpmVector2): LiquidFunVector {

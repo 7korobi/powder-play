@@ -56,10 +56,15 @@ system, with a shared radius and system density.
 
 Each set of three pebble vertices initializes one dynamic Box2D polygon body,
 for 50 full-triangle collision shapes. The initial polygon keeps the three
-source positions; its center velocity is their mean, its angular velocity is
-the least-squares rigid fit to their velocities, and its mass is the sum of the
-three source-node masses. Unlike the previous three-circle representation,
-the fixture used for collision now covers the same triangle that is drawn.
+source center but scales both local axes and drawn dimensions to one half of
+the source triangle (66 world units per side rather than 132). Its center
+velocity is the vertex mean, and angular velocity is fitted to the scaled
+vertices and source velocities. Its mass remains the sum of the three
+source-node masses, so the smaller fixture has four times the density. The
+fixture used for collision covers the same three vertices that are drawn;
+the vertex array is passed through LiquidFun's contiguous `pointsToVec2Array`
+adapter before Box2D constructs the polygon, avoiding a mismatched pointer
+array or a box-shaped collision proxy.
 The 24 fracture nodes remain individual dynamic circle bodies connected by
 the same 53 Gate 4 bonds. Those bonds break when tensile strain reaches the
 Gate 4 12% threshold.

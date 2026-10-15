@@ -32,8 +32,7 @@ declare module 'liquidfun-wasm' {
 
 	export interface B2PolygonShape extends B2Shape {
 		SetAsBox(halfWidth: number, halfHeight: number): void;
-		Set?(vertices: readonly B2Vec2[], count: number): void;
-		SetAsArray?(vertices: readonly B2Vec2[], count: number): void;
+		Set(vertices: B2Vec2, count: number): void;
 	}
 
 	export interface B2CircleShape extends B2Shape {}
@@ -105,6 +104,9 @@ declare module 'liquidfun-wasm' {
 		b2ParticleSystemDef: new () => B2ParticleSystemDef;
 		HEAPF32: Float32Array;
 		getPointer(value: B2Vec2): number;
+		pointsToVec2Array(
+			points: readonly { readonly x: number; readonly y: number }[]
+		): readonly [vertices: B2Vec2, destroy: () => void];
 		b2_waterParticle: number;
 		b2_viscousParticle: number;
 	}

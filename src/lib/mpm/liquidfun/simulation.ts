@@ -26,6 +26,7 @@ import {
 	LIQUIDFUN_FRACTURE_BOND_DAMPING,
 	LIQUIDFUN_FRACTURE_BOND_STIFFNESS,
 	LIQUIDFUN_PARTICLE_RADIUS_METERS,
+	scaleLiquidFunPebbleLocalVertices,
 	LIQUIDFUN_POSITION_ITERATIONS,
 	LIQUIDFUN_SHARED_PARTICLE_DENSITY,
 	LIQUIDFUN_SOLID_NODE_AREA_SQUARE_METERS,
@@ -241,15 +242,18 @@ function createPebbleTriangleBody(
 
 	let angularVelocityNumerator = 0;
 	let angularVelocityDenominator = 0;
-	const localVertices = positions.map((position, index) => {
-		const velocity = velocities[index];
-		if (!velocity) {
-			throw new RangeError('A Gate 4 pebble must identify three node velocities.');
-		}
-		const relativePosition = {
+	const localVertices = scaleLiquidFunPebbleLocalVertices(
+		positions.map((position) => ({
 			x: position.x - center.x,
 			y: position.y - center.y
-		};
+		}))
+	);
+	for (let index = 0; index < localVertices.length; index += 1) {
+		const relativePosition = localVertices[index];
+		const velocity = velocities[index];
+		if (!relativePosition || !velocity) {
+			throw new RangeError('A Gate 4 pebble must identify three node velocities.');
+		}
 		const relativeVelocity = {
 			x: velocity.x - linearVelocity.x,
 			y: velocity.y - linearVelocity.y
@@ -259,8 +263,7 @@ function createPebbleTriangleBody(
 			relativePosition.y * relativeVelocity.x;
 		angularVelocityDenominator +=
 			relativePosition.x ** 2 + relativePosition.y ** 2;
-		return relativePosition;
-	});
+	}
 	if (angularVelocityDenominator <= Number.EPSILON) {
 		throw new RangeError('A Gate 4 pebble triangle must have nonzero area.');
 	}
@@ -289,18 +292,13 @@ function createPebbleTriangleBody(
 		angularVelocity
 	);
 	let shape: B2PolygonShape | undefined;
-	const vertices: B2Vec2[] = [];
+	let destroyVertices: (() => void) | undefined;
 	let fixture: B2Fixture | undefined;
 	try {
 		shape = new module.b2PolygonShape();
-		for (const vertex of localVertices) {
-			vertices.push(createVector(module, vertex));
-		}
-		const setVertices = shape.SetAsArray ?? shape.Set;
-		if (!setVertices) {
-			throw new Error('LiquidFun does not expose polygon vertex initialization.');
-		}
-		setVertices.call(shape, vertices, vertices.length);
+		const [vertices, destroy] = module.pointsToVec2Array(localVertices);
+		destroyVertices = destroy;
+		shape.Set(vertices, localVertices.length);
 		const triangleMass =
 			LIQUIDFUN_SOLID_NODE_AREA_SQUARE_METERS *
 			LIQUIDFUN_SOLID_NODE_DENSITY *
@@ -316,7 +314,7 @@ function createPebbleTriangleBody(
 	} finally {
 		release(fixture);
 		release(shape);
-		for (const vertex of vertices) release(vertex);
+		destroyVertices?.();
 	}
 }
 

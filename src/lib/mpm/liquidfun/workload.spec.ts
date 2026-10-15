@@ -6,11 +6,13 @@ import {
 	LIQUIDFUN_GATE4_DOMAIN,
 	LIQUIDFUN_GATE4_GRAVITY,
 	LIQUIDFUN_GATE4_UNITS_PER_METER,
+	LIQUIDFUN_PEBBLE_SIZE_SCALE,
 	LIQUIDFUN_SCENE_SEED,
 	mapBox2DPositionToGate4,
 	mapBox2DVelocityToGate4,
 	mapGate4PositionToBox2D,
 	mapGate4VelocityToBox2D,
+	scaleLiquidFunPebbleLocalVertices,
 	summarizeSamples
 } from './workload.js';
 import {
@@ -98,6 +100,28 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 					bond.restLengthMeters > 0
 			)
 		).toBe(true);
+	});
+
+	it('halves both dimensions of each LiquidFun pebble triangle', () => {
+		const originalVertices = [
+			{ x: -0.66, y: -0.66 / Math.sqrt(3) },
+			{ x: 0.66, y: -0.66 / Math.sqrt(3) },
+			{ x: 0, y: (2 * 0.66) / Math.sqrt(3) }
+		] as const;
+		const scaledVertices = scaleLiquidFunPebbleLocalVertices(originalVertices);
+		const width = (vertices: readonly { x: number; y: number }[]) =>
+			Math.max(...vertices.map((vertex) => vertex.x)) -
+			Math.min(...vertices.map((vertex) => vertex.x));
+		const height = (vertices: readonly { x: number; y: number }[]) =>
+			Math.max(...vertices.map((vertex) => vertex.y)) -
+			Math.min(...vertices.map((vertex) => vertex.y));
+
+		expect(LIQUIDFUN_PEBBLE_SIZE_SCALE).toBe(0.5);
+		expect(width(scaledVertices)).toBeCloseTo(width(originalVertices) / 2);
+		expect(height(scaledVertices)).toBeCloseTo(height(originalVertices) / 2);
+		expect(() => scaleLiquidFunPebbleLocalVertices(originalVertices.slice(0, 2))).toThrow(
+			RangeError
+		);
 	});
 
 	it('summarizes repeatable batches with the MPM benchmark quantile convention', () => {
