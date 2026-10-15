@@ -66,6 +66,7 @@ Android Chrome と iOS Safari のセンサー権限、複数指操作、画面�
 
 ## 実験中: GPU 粒子操作
 
+`/labs` は labs 配下にあるすべての実験ページへのサイトマップです。
 `/labs/mpm` は、合成粒子上でWebGPU操作を検証するGate 0の独立した実験画面です。
 `/labs/mpm/kernels` は、Gate 1のMLS-MPM数値コア、Gate 2のGPU選択・局所力ドラッグ・
 オブジェクト複製、Gate 4の水・油・弾性小石・破断固体3,674粒子の試作構成則を検証します。
