@@ -85,6 +85,18 @@ describe('CPU MLS-MPM reference', () => {
 			stepMpm([], makeConfig({ grid: { cellsX: 0, cellsY: 16, cellSize: 1 } }))
 		).toThrow(/cellsX/);
 		expect(() =>
+			stepMpm(
+				[],
+				makeConfig({
+					grid: {
+						cellsX: Number.MAX_SAFE_INTEGER - 4,
+						cellsY: 1,
+						cellSize: 1
+					}
+				})
+			)
+		).toThrow(/safe node-index range/);
+		expect(() =>
 			stepMpm([makeParticle({ position: { x: -0.01, y: 8 } })], makeConfig())
 		).toThrow(/grid domain/);
 		expect(() =>

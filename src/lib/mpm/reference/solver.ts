@@ -119,6 +119,7 @@ interface ValidatedConfig {
 	readonly domainHeight: number;
 	readonly gradientScale: number;
 	readonly stressScale: number;
+	readonly gridNodeWidth: number;
 }
 
 interface GridNode {
@@ -145,6 +146,7 @@ interface GridNode {
 
 interface TriangleContactField {
 	readonly bodyStart: number;
+	readonly nodeKey: number;
 	readonly signedDistance: number;
 	readonly normal: MpmVector2;
 	readonly barycentric: readonly [number, number, number];
@@ -152,8 +154,15 @@ interface TriangleContactField {
 	impulseY: number;
 }
 
+interface TriangleDistanceSample {
+	signedDistance: number;
+	normalX: number;
+	normalY: number;
+	barycentric: [number, number, number];
+}
+
 interface TriangleField {
-	readonly nodes: ReadonlyMap<string, TriangleContactField>;
+	readonly nodes: ReadonlyMap<number, TriangleContactField>;
 	readonly nodesByBody: ReadonlyMap<number, readonly TriangleContactField[]>;
 }
 
@@ -164,12 +173,12 @@ interface ParticlePhysicalState {
 }
 
 interface ParticleStencil {
-	readonly baseX: number;
-	readonly baseY: number;
-	readonly fx: number;
-	readonly fy: number;
-	readonly weightsX: readonly [number, number, number];
-	readonly weightsY: readonly [number, number, number];
+	baseX: number;
+	baseY: number;
+	fx: number;
+	fy: number;
+	weightsX: [number, number, number];
+	weightsY: [number, number, number];
 }
 
 interface Decomposition2 {
@@ -215,13 +224,15 @@ export function stepMpm(
 	const inputMass = totalMass(particleStates, 'input mass');
 	assertComputedFinite(inputMass, 'input mass');
 	const inputMomentum = totalMomentum(particles, particleStates, 'input momentum');
-	const grid = new Map<string, GridNode>();
+	const grid = new Map<number, GridNode>();
 	const dx = validated.grid.cellSize;
+	const inputStencil = createParticleStencil();
 
 	for (let index = 0; index < particles.length; index++) {
 		const particle = particles[index];
 		const state = particleStates[index];
-		const stencil = particleStencil(particle.position, dx);
+		updateParticleStencil(particle.position, dx, inputStencil);
+		const stencil = inputStencil;
 		const plasticVolume = particle.plasticVolume ?? 1;
 		const stressTimesFt = constitutiveStressTimesFt(
 			particle.F,
@@ -248,7 +259,7 @@ export function stepMpm(
 
 				const xIndex = stencil.baseX + ox;
 				const yIndex = stencil.baseY + oy;
-				const key = gridNodeKey(xIndex, yIndex);
+				const key = gridNodeKey(xIndex, yIndex, validated.gridNodeWidth);
 				let node = grid.get(key);
 				if (!node) {
 					node = {
@@ -290,21 +301,16 @@ export function stepMpm(
 					node.waterMomentumX += weight * particleMomentumX;
 					node.waterMomentumY += weight * particleMomentumY;
 					node.waterVolume += weight * liquidVolume;
-					assertComputedFinite(node.waterMass, 'water grid mass');
-					assertComputedFinite(node.waterVolume, 'water grid volume');
 				} else if (state.material.model === 'oil') {
 					node.oilMass += weight * state.mass;
 					node.oilMomentumX += weight * particleMomentumX;
 					node.oilMomentumY += weight * particleMomentumY;
 					node.oilVolume += weight * liquidVolume;
-					assertComputedFinite(node.oilMass, 'oil grid mass');
-					assertComputedFinite(node.oilVolume, 'oil grid volume');
 				} else {
 					node.mass += weight * state.mass;
 					node.momentumX += weight * particleMomentumX;
 					node.momentumY += weight * particleMomentumY;
 				}
-				assertGridNodeFinite(node);
 			}
 		}
 	}
@@ -313,6 +319,7 @@ export function stepMpm(
 	let gridMomentumX = 0;
 	let gridMomentumY = 0;
 	for (const node of grid.values()) {
+		assertGridNodeFinite(node);
 		gridMass += node.mass + node.waterMass + node.oilMass;
 		gridMomentumX += node.momentumX + node.waterMomentumX + node.oilMomentumX;
 		gridMomentumY += node.momentumY + node.waterMomentumY + node.oilMomentumY;
@@ -353,7 +360,11 @@ export function stepMpm(
 		node.oilVelocityY = oilVelocity.y;
 		solveLiquidGridContact(node, grid, validated);
 		const triangleContact = triangleField.nodes.get(
-			gridNodeKey(node.xIndex, node.yIndex)
+			gridNodeKey(
+				node.xIndex,
+				node.yIndex,
+				validated.gridNodeWidth
+			)
 		);
 		if (triangleContact) {
 			solveFluidTriangleGridContact(
@@ -396,9 +407,12 @@ export function stepMpm(
 		assertGridNodeFinite(node);
 	}
 
+	const outputStencil = createParticleStencil();
+	const projectionStencil = createParticleStencil();
 	const outputParticles = particles.map((particle, index) => {
 		const state = particleStates[index];
-		const stencil = particleStencil(particle.position, dx);
+		updateParticleStencil(particle.position, dx, outputStencil);
+		const stencil = outputStencil;
 		const plasticVolume = particle.plasticVolume ?? 1;
 		let velocityX = 0;
 		let velocityY = 0;
@@ -418,7 +432,13 @@ export function stepMpm(
 				assertWeight(weight);
 				if (weight === 0) continue;
 
-				const node = grid.get(gridNodeKey(stencil.baseX + ox, stencil.baseY + oy));
+				const node = grid.get(
+					gridNodeKey(
+						stencil.baseX + ox,
+						stencil.baseY + oy,
+						validated.gridNodeWidth
+					)
+				);
 				if (!node) {
 					throw new Error('particle stencil is missing a deposited grid node');
 				}
@@ -521,7 +541,8 @@ export function stepMpm(
 					{ x: boundedX.position, y: boundedY.position },
 					Math.sqrt((state.volume * determinant(F)) / Math.PI),
 					triangleField,
-					validated
+					validated,
+					projectionStencil
 				)
 			: { x: boundedX.position, y: boundedY.position };
 		const finalX = confineAxis(
@@ -654,6 +675,13 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 	if (!Number.isSafeInteger(cellsY) || cellsY < 1 || cellsY >= Number.MAX_SAFE_INTEGER) {
 		throw new RangeError('grid.cellsY must be a positive safe integer');
 	}
+	const gridNodeWidth = cellsX + 3;
+	if (
+		!Number.isSafeInteger(gridNodeWidth) ||
+		!Number.isSafeInteger(gridNodeWidth * (cellsY + 3))
+	) {
+		throw new RangeError('grid dimensions exceed the safe node-index range');
+	}
 	if (cellSize <= 0) throw new RangeError('grid.cellSize must be greater than zero');
 	if (particleMass <= 0) throw new RangeError('particleMass must be greater than zero');
 	if (particleVolume <= 0) throw new RangeError('particleVolume must be greater than zero');
@@ -706,7 +734,8 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 		domainWidth,
 		domainHeight,
 		gradientScale,
-		stressScale
+		stressScale,
+		gridNodeWidth
 	};
 }
 
@@ -829,49 +858,92 @@ function buildTriangleField(
 	particles: readonly MpmParticle[],
 	config: ValidatedConfig
 ): TriangleField {
-	const nodes = new Map<string, TriangleContactField>();
+	const nodes = new Map<number, TriangleContactField>();
 	const nodesByBody = new Map<number, TriangleContactField[]>();
+	const candidatesByBody = new Map<number, TriangleContactField[]>();
 	if (bodyStarts.length === 0) return { nodes, nodesByBody };
 
 	const { cellsX, cellsY, cellSize } = config.grid;
 	const maxDistance = cellSize * TRIANGLE_FIELD_BAND_CELLS;
-	for (let yIndex = -1; yIndex <= cellsY + 1; yIndex += 1) {
-		for (let xIndex = -1; xIndex <= cellsX + 1; xIndex += 1) {
-			const point = { x: xIndex * cellSize, y: yIndex * cellSize };
-			let nearest: TriangleContactField | undefined;
-			for (const bodyStart of bodyStarts) {
-				const triangle = getTriangleVertices(particles, bodyStart);
-				if (
-					point.x < Math.min(triangle[0].x, triangle[1].x, triangle[2].x) - maxDistance ||
-					point.x > Math.max(triangle[0].x, triangle[1].x, triangle[2].x) + maxDistance ||
-					point.y < Math.min(triangle[0].y, triangle[1].y, triangle[2].y) - maxDistance ||
-					point.y > Math.max(triangle[0].y, triangle[1].y, triangle[2].y) + maxDistance
-				) {
+	const sample: TriangleDistanceSample = {
+		signedDistance: 0,
+		normalX: 0,
+		normalY: 0,
+		barycentric: [1, 0, 0]
+	};
+	for (const bodyStart of bodyStarts) {
+		const triangle = getTriangleVertices(particles, bodyStart);
+		const minimumX = Math.min(triangle[0].x, triangle[1].x, triangle[2].x);
+		const maximumX = Math.max(triangle[0].x, triangle[1].x, triangle[2].x);
+		const minimumY = Math.min(triangle[0].y, triangle[1].y, triangle[2].y);
+		const maximumY = Math.max(triangle[0].y, triangle[1].y, triangle[2].y);
+		const minimumXIndex = Math.max(
+			-1,
+			Math.floor((minimumX - maxDistance) / cellSize) - 1
+		);
+		const maximumXIndex = Math.min(
+			cellsX + 1,
+			Math.ceil((maximumX + maxDistance) / cellSize) + 1
+		);
+		const minimumYIndex = Math.max(
+			-1,
+			Math.floor((minimumY - maxDistance) / cellSize) - 1
+		);
+		const maximumYIndex = Math.min(
+			cellsY + 1,
+			Math.ceil((maximumY + maxDistance) / cellSize) + 1
+		);
+		const minimumFieldX = minimumX - maxDistance;
+		const maximumFieldX = maximumX + maxDistance;
+		const minimumFieldY = minimumY - maxDistance;
+		const maximumFieldY = maximumY + maxDistance;
+
+		// The extra grid cell makes the integer range conservative; the exact bounds remain authoritative.
+		for (let yIndex = minimumYIndex; yIndex <= maximumYIndex; yIndex += 1) {
+			const pointY = yIndex * cellSize;
+			if (pointY < minimumFieldY || pointY > maximumFieldY) continue;
+			for (let xIndex = minimumXIndex; xIndex <= maximumXIndex; xIndex += 1) {
+				const pointX = xIndex * cellSize;
+				if (pointX < minimumFieldX || pointX > maximumFieldX) continue;
+				triangleDistanceSample(pointX, pointY, triangle, sample);
+				if (sample.signedDistance > maxDistance) continue;
+				const key = gridNodeKey(xIndex, yIndex, config.gridNodeWidth);
+				const nearest = nodes.get(key);
+				if (nearest && sample.signedDistance >= nearest.signedDistance) {
 					continue;
 				}
-				const sample = triangleDistanceSample(point, triangle);
-				if (
-					sample.signedDistance <= maxDistance &&
-					(nearest === undefined ||
-						sample.signedDistance < nearest.signedDistance)
-				) {
-					nearest = {
-						bodyStart,
-						signedDistance: sample.signedDistance,
-						normal: sample.normal,
-						barycentric: sample.barycentric,
-						impulseX: 0,
-						impulseY: 0
-					};
+				const contact: TriangleContactField = {
+					bodyStart,
+					nodeKey: key,
+					signedDistance: sample.signedDistance,
+					normal: { x: sample.normalX, y: sample.normalY },
+					barycentric: [
+						sample.barycentric[0],
+						sample.barycentric[1],
+						sample.barycentric[2]
+					],
+					impulseX: 0,
+					impulseY: 0
+				};
+				nodes.set(key, contact);
+				let bodyCandidates = candidatesByBody.get(bodyStart);
+				if (!bodyCandidates) {
+					bodyCandidates = [];
+					candidatesByBody.set(bodyStart, bodyCandidates);
 				}
-			}
-			if (nearest) {
-				nodes.set(gridNodeKey(xIndex, yIndex), nearest);
-				const bodyNodes = nodesByBody.get(nearest.bodyStart) ?? [];
-				bodyNodes.push(nearest);
-				nodesByBody.set(nearest.bodyStart, bodyNodes);
+				bodyCandidates.push(contact);
 			}
 		}
+	}
+
+	for (const bodyStart of bodyStarts) {
+		const bodyCandidates = candidatesByBody.get(bodyStart);
+		if (!bodyCandidates) continue;
+		const bodyNodes: TriangleContactField[] = [];
+		for (const contact of bodyCandidates) {
+			if (nodes.get(contact.nodeKey) === contact) bodyNodes.push(contact);
+		}
+		if (bodyNodes.length > 0) nodesByBody.set(bodyStart, bodyNodes);
 	}
 	return { nodes, nodesByBody };
 }
@@ -888,81 +960,111 @@ function getTriangleVertices(
 }
 
 function triangleDistanceSample(
-	point: MpmVector2,
-	vertices: readonly [MpmVector2, MpmVector2, MpmVector2]
-): {
-	readonly signedDistance: number;
-	readonly normal: MpmVector2;
-	readonly barycentric: readonly [number, number, number];
-} {
+	pointX: number,
+	pointY: number,
+	vertices: readonly [MpmVector2, MpmVector2, MpmVector2],
+	sample: TriangleDistanceSample
+): void {
 	const [a, b, c] = vertices;
-	const signedArea = cross2(subtractVector(b, a), subtractVector(c, a));
+	const abX = b.x - a.x;
+	const abY = b.y - a.y;
+	const acX = c.x - a.x;
+	const acY = c.y - a.y;
+	const signedArea = abX * acY - abY * acX;
 	if (!Number.isFinite(signedArea) || Math.abs(signedArea) <= 1e-10) {
 		throw new RangeError('bonded triangle became degenerate');
 	}
-	const crosses = [
-		cross2(subtractVector(b, a), subtractVector(point, a)),
-		cross2(subtractVector(c, b), subtractVector(point, b)),
-		cross2(subtractVector(a, c), subtractVector(point, c))
-	];
+	const bcX = c.x - b.x;
+	const bcY = c.y - b.y;
+	const caX = a.x - c.x;
+	const caY = a.y - c.y;
+	const apX = pointX - a.x;
+	const apY = pointY - a.y;
+	const bpX = pointX - b.x;
+	const bpY = pointY - b.y;
+	const cpX = pointX - c.x;
+	const cpY = pointY - c.y;
+	const crossAB = abX * apY - abY * apX;
+	const crossBC = bcX * bpY - bcY * bpX;
+	const crossCA = caX * cpY - caY * cpX;
 	const inside =
 		signedArea > 0
-			? crosses.every((value) => value >= -1e-10)
-			: crosses.every((value) => value <= 1e-10);
-	const edges = [
-		{ start: a, end: b, barycentric: (t: number) => [1 - t, t, 0] as const },
-		{ start: b, end: c, barycentric: (t: number) => [0, 1 - t, t] as const },
-		{ start: c, end: a, barycentric: (t: number) => [t, 0, 1 - t] as const }
-	] as const;
+			? crossAB >= -1e-10 && crossBC >= -1e-10 && crossCA >= -1e-10
+			: crossAB <= 1e-10 && crossBC <= 1e-10 && crossCA <= 1e-10;
 
 	let closestDistanceSquared = Number.POSITIVE_INFINITY;
-	let closestPoint: MpmVector2 = a;
-	let closestNormal: MpmVector2 = { x: 0, y: 0 };
-	let barycentric: readonly [number, number, number] = [1, 0, 0];
-	for (const edge of edges) {
-		const direction = subtractVector(edge.end, edge.start);
-		const lengthSquared = dot2(direction, direction);
+	let closestNormalX = 0;
+	let closestNormalY = 0;
+	for (let edgeIndex = 0; edgeIndex < 3; edgeIndex += 1) {
+		const startX = edgeIndex === 0 ? a.x : edgeIndex === 1 ? b.x : c.x;
+		const startY = edgeIndex === 0 ? a.y : edgeIndex === 1 ? b.y : c.y;
+		const endX = edgeIndex === 0 ? b.x : edgeIndex === 1 ? c.x : a.x;
+		const endY = edgeIndex === 0 ? b.y : edgeIndex === 1 ? c.y : a.y;
+		const directionX = endX - startX;
+		const directionY = endY - startY;
+		const lengthSquared =
+			directionX * directionX + directionY * directionY;
+		const offsetX = pointX - startX;
+		const offsetY = pointY - startY;
 		const t = Math.max(
 			0,
 			Math.min(
 				1,
-				dot2(subtractVector(point, edge.start), direction) / lengthSquared
+				(offsetX * directionX + offsetY * directionY) / lengthSquared
 			)
 		);
-		const candidate = addVector(edge.start, scaleVector(direction, t));
-		const difference = subtractVector(point, candidate);
-		const distanceSquared = dot2(difference, difference);
+		const candidateX = startX + directionX * t;
+		const candidateY = startY + directionY * t;
+		const differenceX = pointX - candidateX;
+		const differenceY = pointY - candidateY;
+		const distanceSquared =
+			differenceX * differenceX + differenceY * differenceY;
 		if (distanceSquared >= closestDistanceSquared) continue;
 		closestDistanceSquared = distanceSquared;
-		closestPoint = candidate;
-		barycentric = edge.barycentric(t);
+		if (edgeIndex === 0) {
+			sample.barycentric[0] = 1 - t;
+			sample.barycentric[1] = t;
+			sample.barycentric[2] = 0;
+		} else if (edgeIndex === 1) {
+			sample.barycentric[0] = 0;
+			sample.barycentric[1] = 1 - t;
+			sample.barycentric[2] = t;
+		} else {
+			sample.barycentric[0] = t;
+			sample.barycentric[1] = 0;
+			sample.barycentric[2] = 1 - t;
+		}
 		if (distanceSquared > 1e-20 && !inside) {
 			const distance = Math.sqrt(distanceSquared);
-			closestNormal = scaleVector(difference, 1 / distance);
+			const inverseDistance = 1 / distance;
+			closestNormalX = differenceX * inverseDistance;
+			closestNormalY = differenceY * inverseDistance;
 		} else {
 			const orientation = signedArea > 0 ? 1 : -1;
-			const outward = {
-				x: orientation * direction.y,
-				y: -orientation * direction.x
-			};
+			const outwardX = orientation * directionY;
+			const outwardY = -orientation * directionX;
 			const edgeLength = Math.sqrt(lengthSquared);
-			closestNormal = scaleVector(outward, 1 / edgeLength);
+			const inverseEdgeLength = 1 / edgeLength;
+			closestNormalX = outwardX * inverseEdgeLength;
+			closestNormalY = outwardY * inverseEdgeLength;
 		}
 	}
 	const distance = Math.sqrt(closestDistanceSquared);
-	if (!Number.isFinite(distance) || !isFiniteVector(closestNormal)) {
+	if (
+		!Number.isFinite(distance) ||
+		!Number.isFinite(closestNormalX) ||
+		!Number.isFinite(closestNormalY)
+	) {
 		throw new RangeError('bonded triangle contact field became non-finite');
 	}
-	return {
-		signedDistance: inside ? -distance : distance,
-		normal: closestNormal,
-		barycentric
-	};
+	sample.signedDistance = inside ? -distance : distance;
+	sample.normalX = closestNormalX;
+	sample.normalY = closestNormalY;
 }
 
 function solveLiquidGridContact(
 	node: GridNode,
-	grid: ReadonlyMap<string, GridNode>,
+	grid: ReadonlyMap<number, GridNode>,
 	config: ValidatedConfig
 ): void {
 	if (
@@ -978,8 +1080,20 @@ function solveLiquidGridContact(
 		return;
 	}
 
-	const waterGradient = volumeGradient(grid, node.xIndex, node.yIndex, 'water', config.grid.cellSize);
-	const oilGradient = volumeGradient(grid, node.xIndex, node.yIndex, 'oil', config.grid.cellSize);
+	const waterGradient = volumeGradient(
+		grid,
+		node.xIndex,
+		node.yIndex,
+		'water',
+		config
+	);
+	const oilGradient = volumeGradient(
+		grid,
+		node.xIndex,
+		node.yIndex,
+		'oil',
+		config
+	);
 	const gradient = {
 		x: oilGradient.x - waterGradient.x,
 		y: oilGradient.y - waterGradient.y
@@ -1037,21 +1151,29 @@ function solveLiquidGridContact(
 }
 
 function volumeGradient(
-	grid: ReadonlyMap<string, GridNode>,
+	grid: ReadonlyMap<number, GridNode>,
 	xIndex: number,
 	yIndex: number,
 	phase: 'water' | 'oil',
-	cellSize: number
+	config: ValidatedConfig
 ): MpmVector2 {
 	const volumeAt = (x: number, y: number): number => {
-		const node = grid.get(gridNodeKey(x, y));
+		if (
+			x < -1 ||
+			x > config.grid.cellsX + 1 ||
+			y < -1 ||
+			y > config.grid.cellsY + 1
+		) {
+			return 0;
+		}
+		const node = grid.get(gridNodeKey(x, y, config.gridNodeWidth));
 		return node === undefined
 			? 0
 			: phase === 'water'
 				? node.waterVolume
 				: node.oilVolume;
 	};
-	const scale = 1 / (2 * cellSize * cellSize);
+	const scale = 1 / (2 * config.grid.cellSize * config.grid.cellSize);
 	return {
 		x: (volumeAt(xIndex + 1, yIndex) - volumeAt(xIndex - 1, yIndex)) * scale,
 		y: (volumeAt(xIndex, yIndex + 1) - volumeAt(xIndex, yIndex - 1)) * scale
@@ -1177,10 +1299,11 @@ function projectParticleOutsideTriangles(
 	position: MpmVector2,
 	radius: number,
 	triangleField: TriangleField,
-	config: ValidatedConfig
+	config: ValidatedConfig,
+	stencil: ParticleStencil
 ): MpmVector2 {
 	if (triangleField.nodes.size === 0) return position;
-	const stencil = particleStencil(position, config.grid.cellSize);
+	updateParticleStencil(position, config.grid.cellSize, stencil);
 	const band = config.grid.cellSize * TRIANGLE_FIELD_BAND_CELLS;
 	let signedDistance = 0;
 	let closestBodyStart: number | undefined;
@@ -1190,7 +1313,11 @@ function projectParticleOutsideTriangles(
 		for (let ox = 0; ox < 3; ox += 1) {
 			const weight = stencil.weightsX[ox] * stencil.weightsY[oy];
 			const field = triangleField.nodes.get(
-				gridNodeKey(stencil.baseX + ox, stencil.baseY + oy)
+				gridNodeKey(
+					stencil.baseX + ox,
+					stencil.baseY + oy,
+					config.gridNodeWidth
+				)
 			);
 			signedDistance += weight * (field?.signedDistance ?? band);
 			if (field && field.signedDistance < closestDistance) {
@@ -1207,7 +1334,11 @@ function projectParticleOutsideTriangles(
 		for (let ox = 0; ox < 3; ox += 1) {
 			const weight = stencil.weightsX[ox] * stencil.weightsY[oy];
 			const field = triangleField.nodes.get(
-				gridNodeKey(stencil.baseX + ox, stencil.baseY + oy)
+				gridNodeKey(
+					stencil.baseX + ox,
+					stencil.baseY + oy,
+					config.gridNodeWidth
+				)
 			);
 			if (!field || field.bodyStart !== closestBodyStart) continue;
 			normalX += weight * field.normal.x;
@@ -1450,49 +1581,64 @@ function trianglePairContact(
 	let separated = false;
 	let largestGap = Number.NEGATIVE_INFINITY;
 	let smallestOverlap = Number.POSITIVE_INFINITY;
-	let contactAxis: MpmVector2 | undefined;
-	for (const triangle of [triangleA, triangleB]) {
+	let contactAxisX = 0;
+	let contactAxisY = 0;
+	let hasContactAxis = false;
+	for (let triangleIndex = 0; triangleIndex < 2; triangleIndex += 1) {
+		const triangle = triangleIndex === 0 ? triangleA : triangleB;
 		for (let edgeIndex = 0; edgeIndex < 3; edgeIndex += 1) {
 			const start = triangle[edgeIndex];
 			const end = triangle[(edgeIndex + 1) % 3];
-			const edge = subtractVector(end, start);
-			const edgeLength = Math.hypot(edge.x, edge.y);
+			const edgeX = end.x - start.x;
+			const edgeY = end.y - start.y;
+			const edgeLength = Math.hypot(edgeX, edgeY);
 			if (edgeLength <= 1e-10) return undefined;
-			const axis = { x: edge.y / edgeLength, y: -edge.x / edgeLength };
-			const project = (vertices: readonly MpmVector2[]) => {
-				const values = vertices.map((vertex) => dot2(vertex, axis));
-				return {
-					min: Math.min(...values),
-					max: Math.max(...values)
-				};
-			};
-			const projectionA = project(triangleA);
-			const projectionB = project(triangleB);
+			const axisX = edgeY / edgeLength;
+			const axisY = -edgeX / edgeLength;
+			const a0 = triangleA[0].x * axisX + triangleA[0].y * axisY;
+			const a1 = triangleA[1].x * axisX + triangleA[1].y * axisY;
+			const a2 = triangleA[2].x * axisX + triangleA[2].y * axisY;
+			const b0 = triangleB[0].x * axisX + triangleB[0].y * axisY;
+			const b1 = triangleB[1].x * axisX + triangleB[1].y * axisY;
+			const b2 = triangleB[2].x * axisX + triangleB[2].y * axisY;
+			const minA = Math.min(a0, a1, a2);
+			const maxA = Math.max(a0, a1, a2);
+			const minB = Math.min(b0, b1, b2);
+			const maxB = Math.max(b0, b1, b2);
 			const gap = Math.max(
-				projectionB.min - projectionA.max,
-				projectionA.min - projectionB.max
+				minB - maxA,
+				minA - maxB
 			);
 			if (gap > 0) {
 				separated = true;
 				if (gap > largestGap) {
 					largestGap = gap;
-					contactAxis = axis;
+					contactAxisX = axisX;
+					contactAxisY = axisY;
+					hasContactAxis = true;
 				}
 			} else if (!separated && -gap < smallestOverlap) {
 				smallestOverlap = -gap;
-				contactAxis = axis;
+				contactAxisX = axisX;
+				contactAxisY = axisY;
+				hasContactAxis = true;
 			}
 		}
 	}
 	if (separated && largestGap > skin) return undefined;
-	if (!contactAxis) return undefined;
-	const centerA = triangleCentroid(triangleA);
-	const centerB = triangleCentroid(triangleB);
-	const direction = subtractVector(centerA, centerB);
-	const normal =
-		dot2(direction, contactAxis) >= 0
-			? contactAxis
-			: scaleVector(contactAxis, -1);
+	if (!hasContactAxis) return undefined;
+	const directionX =
+		(triangleA[0].x + triangleA[1].x + triangleA[2].x) / 3 -
+		(triangleB[0].x + triangleB[1].x + triangleB[2].x) / 3;
+	const directionY =
+		(triangleA[0].y + triangleA[1].y + triangleA[2].y) / 3 -
+		(triangleB[0].y + triangleB[1].y + triangleB[2].y) / 3;
+	const normalSign =
+		directionX * contactAxisX + directionY * contactAxisY >= 0 ? 1 : -1;
+	const normal = {
+		x: normalSign * contactAxisX,
+		y: normalSign * contactAxisY
+	};
 	const penetration = separated
 		? skin - largestGap
 		: skin + smallestOverlap;
@@ -1524,9 +1670,25 @@ function triangleMeanVelocity(particles: readonly MpmParticle[], start: number):
 }
 
 function assertGridNodeFinite(node: GridNode): void {
-	for (const [name, value] of Object.entries(node)) {
-		if (typeof value === 'number') assertComputedFinite(value, `grid node ${name}`);
-	}
+	assertComputedFinite(node.xIndex, 'grid node xIndex');
+	assertComputedFinite(node.yIndex, 'grid node yIndex');
+	assertComputedFinite(node.mass, 'grid node mass');
+	assertComputedFinite(node.momentumX, 'grid node momentumX');
+	assertComputedFinite(node.momentumY, 'grid node momentumY');
+	assertComputedFinite(node.velocityX, 'grid node velocityX');
+	assertComputedFinite(node.velocityY, 'grid node velocityY');
+	assertComputedFinite(node.waterMass, 'grid node waterMass');
+	assertComputedFinite(node.waterMomentumX, 'grid node waterMomentumX');
+	assertComputedFinite(node.waterMomentumY, 'grid node waterMomentumY');
+	assertComputedFinite(node.waterVelocityX, 'grid node waterVelocityX');
+	assertComputedFinite(node.waterVelocityY, 'grid node waterVelocityY');
+	assertComputedFinite(node.waterVolume, 'grid node waterVolume');
+	assertComputedFinite(node.oilMass, 'grid node oilMass');
+	assertComputedFinite(node.oilMomentumX, 'grid node oilMomentumX');
+	assertComputedFinite(node.oilMomentumY, 'grid node oilMomentumY');
+	assertComputedFinite(node.oilVelocityX, 'grid node oilVelocityX');
+	assertComputedFinite(node.oilVelocityY, 'grid node oilVelocityY');
+	assertComputedFinite(node.oilVolume, 'grid node oilVolume');
 	if (
 		node.mass < 0 ||
 		node.waterMass < 0 ||
@@ -1562,29 +1724,34 @@ function isFiniteVector(vector: MpmVector2): boolean {
 	return Number.isFinite(vector.x) && Number.isFinite(vector.y);
 }
 
-function particleStencil(position: MpmVector2, cellSize: number): ParticleStencil {
-	const gridX = position.x / cellSize;
-	const gridY = position.y / cellSize;
-	const baseX = Math.floor(gridX - 0.5);
-	const baseY = Math.floor(gridY - 0.5);
-	const fx = gridX - baseX;
-	const fy = gridY - baseY;
+function createParticleStencil(): ParticleStencil {
 	return {
-		baseX,
-		baseY,
-		fx,
-		fy,
-		weightsX: quadraticWeights(fx),
-		weightsY: quadraticWeights(fy)
+		baseX: 0,
+		baseY: 0,
+		fx: 0,
+		fy: 0,
+		weightsX: [0, 0, 0],
+		weightsY: [0, 0, 0]
 	};
 }
 
-function quadraticWeights(fraction: number): readonly [number, number, number] {
-	return [
-		0.5 * (1.5 - fraction) ** 2,
-		0.75 - (fraction - 1) ** 2,
-		0.5 * (fraction - 0.5) ** 2
-	];
+function updateParticleStencil(
+	position: MpmVector2,
+	cellSize: number,
+	stencil: ParticleStencil
+): void {
+	const gridX = position.x / cellSize;
+	const gridY = position.y / cellSize;
+	stencil.baseX = Math.floor(gridX - 0.5);
+	stencil.baseY = Math.floor(gridY - 0.5);
+	stencil.fx = gridX - stencil.baseX;
+	stencil.fy = gridY - stencil.baseY;
+	stencil.weightsX[0] = 0.5 * (1.5 - stencil.fx) ** 2;
+	stencil.weightsX[1] = 0.75 - (stencil.fx - 1) ** 2;
+	stencil.weightsX[2] = 0.5 * (stencil.fx - 0.5) ** 2;
+	stencil.weightsY[0] = 0.5 * (1.5 - stencil.fy) ** 2;
+	stencil.weightsY[1] = 0.75 - (stencil.fy - 1) ** 2;
+	stencil.weightsY[2] = 0.5 * (stencil.fy - 0.5) ** 2;
 }
 
 function neoHookeanFirstPiola(
@@ -2105,8 +2272,12 @@ function updateDeformationGradient(
 	return updated;
 }
 
-function gridNodeKey(xIndex: number, yIndex: number): string {
-	return `${xIndex},${yIndex}`;
+function gridNodeKey(
+	xIndex: number,
+	yIndex: number,
+	gridNodeWidth: number
+): number {
+	return (yIndex + 1) * gridNodeWidth + (xIndex + 1);
 }
 
 function assertWeight(weight: number): void {
