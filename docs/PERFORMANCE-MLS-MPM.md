@@ -717,6 +717,34 @@ including the roughly 12.44 MB increase in grid-dependent buffers. The old
 0.217 ms median / 0.256 ms p95 benchmark belongs to the prior area-100 setup
 and is not a performance result for this configuration.
 
+### 2026-10-15: CPU grid and triangle-field workspace reuse
+
+The CPU reference solver now uses dense integer-indexed storage for grid nodes
+and triangle-contact fields on grids of at most one million padded nodes, with
+the sparse `Map` path retained for larger grids. `MpmCpuReferenceSimulation`
+keeps an `MpmSolverWorkspace` for its lifetime: generation stamps reset the
+active entries between steps, while grid-node and triangle-contact objects are
+reused. Disposing the simulation releases both pools.
+
+Two repeated 10-second Vitest benchmarks (2-second warmup each) used the fixed
+Gate 4 workload: 3,674 particles, the same initial state and `dt=1/240`, no
+rendering. The no-workspace and persistent-workspace paths measured:
+
+| Run | No workspace mean | Persistent workspace mean | Relative speed |
+|---|---:|---:|---:|
+| 1 | 5.828 ms/step | 4.643 ms/step | 1.26× |
+| 2 | 6.031 ms/step | 4.701 ms/step | 1.28× |
+
+Against the earlier 8.663 ms/step pre-optimization reference on this fixed
+workload, the final workspace path is about 46% lower in step latency (about
+1.85× throughput). This is a fixed-state microbenchmark, not an interactive
+frame-rate or sustained-scene guarantee.
+
+A forced-GC Node heap sample after 20 fixed-state steps measured 11.42 MB after
+the non-workspace path and 19.66 MB with the retained workspace, an increase of
+about 8.24 MB. After `dispose()`, the heap returned to 11.43 MB. This is the
+Gate 4 solver's Node/Vitest heap measurement, not total browser or GPU memory.
+
 ## 6. 参照
 
 - [WebGPU: usage scopes](https://www.w3.org/TR/webgpu/#usage-scopes) —

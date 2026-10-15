@@ -120,11 +120,12 @@ interface ValidatedConfig {
 	readonly gradientScale: number;
 	readonly stressScale: number;
 	readonly gridNodeWidth: number;
+	readonly gridNodeCount: number;
 }
 
 interface GridNode {
-	readonly xIndex: number;
-	readonly yIndex: number;
+	xIndex: number;
+	yIndex: number;
 	mass: number;
 	momentumX: number;
 	momentumY: number;
@@ -144,14 +145,80 @@ interface GridNode {
 	oilVolume: number;
 }
 
+interface NumericIndexStore<T> {
+	get(key: number): T | undefined;
+	set(key: number, value: T): void;
+}
+
+interface GridNodeStore {
+	get(key: number): GridNode | undefined;
+	getOrCreate(key: number, xIndex: number, yIndex: number): GridNode;
+	values(): Iterable<GridNode>;
+}
+
 interface TriangleContactField {
-	readonly bodyStart: number;
+	bodyStart: number;
 	readonly nodeKey: number;
-	readonly signedDistance: number;
-	readonly normal: MpmVector2;
-	readonly barycentric: readonly [number, number, number];
+	signedDistance: number;
+	readonly normal: { x: number; y: number };
+	readonly barycentric: [number, number, number];
 	impulseX: number;
 	impulseY: number;
+}
+
+interface TriangleContactStore extends NumericIndexStore<TriangleContactField> {
+	getReusable(key: number): TriangleContactField | undefined;
+}
+
+class DenseTriangleContactStore implements TriangleContactStore {
+	private readonly fields: (TriangleContactField | undefined)[];
+	private readonly generations: Uint32Array;
+	private generation = 0;
+
+	constructor(readonly nodeCount: number) {
+		this.fields = new Array<TriangleContactField | undefined>(nodeCount).fill(undefined);
+		this.generations = new Uint32Array(nodeCount);
+		this.beginStep();
+	}
+
+	beginStep(): void {
+		const nextGeneration = this.generation + 1;
+		if (nextGeneration > 0xffff_ffff) {
+			this.generations.fill(0);
+			this.generation = 1;
+		} else {
+			this.generation = nextGeneration;
+		}
+	}
+
+	get(key: number): TriangleContactField | undefined {
+		return this.generations[key] === this.generation ? this.fields[key] : undefined;
+	}
+
+	getReusable(key: number): TriangleContactField | undefined {
+		return this.fields[key];
+	}
+
+	set(key: number, value: TriangleContactField): void {
+		this.fields[key] = value;
+		this.generations[key] = this.generation;
+	}
+}
+
+class SparseTriangleContactStore implements TriangleContactStore {
+	private readonly fields = new Map<number, TriangleContactField>();
+
+	get(key: number): TriangleContactField | undefined {
+		return this.fields.get(key);
+	}
+
+	getReusable(key: number): TriangleContactField | undefined {
+		return this.fields.get(key);
+	}
+
+	set(key: number, value: TriangleContactField): void {
+		this.fields.set(key, value);
+	}
 }
 
 interface TriangleDistanceSample {
@@ -162,7 +229,7 @@ interface TriangleDistanceSample {
 }
 
 interface TriangleField {
-	readonly nodes: ReadonlyMap<number, TriangleContactField>;
+	readonly nodes: TriangleContactStore;
 	readonly nodesByBody: ReadonlyMap<number, readonly TriangleContactField[]>;
 }
 
@@ -208,10 +275,123 @@ const TRIANGLE_CONTACT_SKIN_CELLS = 0.1;
 const TRIANGLE_CONTACT_IMPULSE_RELAXATION = 0.25;
 const TRIANGLE_FIELD_BAND_CELLS = 2;
 const GRID_CONTACT_REACH_CELLS = 0.75;
+const MAX_DENSE_GRID_NODE_COUNT = 1_000_000;
+
+class DenseGridNodeStore implements GridNodeStore {
+	private readonly nodes: (GridNode | undefined)[];
+	private readonly generations: Uint32Array;
+	private readonly activeNodes: GridNode[] = [];
+	private generation = 0;
+
+	constructor(readonly nodeCount: number) {
+		this.nodes = new Array<GridNode | undefined>(nodeCount).fill(undefined);
+		this.generations = new Uint32Array(nodeCount);
+		this.beginStep();
+	}
+
+	beginStep(): void {
+		this.activeNodes.length = 0;
+		const nextGeneration = this.generation + 1;
+		if (nextGeneration > 0xffff_ffff) {
+			this.generations.fill(0);
+			this.generation = 1;
+		} else {
+			this.generation = nextGeneration;
+		}
+	}
+
+	get(key: number): GridNode | undefined {
+		return this.generations[key] === this.generation ? this.nodes[key] : undefined;
+	}
+
+	getOrCreate(key: number, xIndex: number, yIndex: number): GridNode {
+		const existing = this.nodes[key];
+		if (this.generations[key] !== this.generation) {
+			const node =
+				existing === undefined
+					? createGridNode(xIndex, yIndex)
+					: resetGridNode(existing, xIndex, yIndex);
+			this.nodes[key] = node;
+			this.generations[key] = this.generation;
+			this.activeNodes.push(node);
+			return node;
+		}
+		if (existing === undefined) {
+			throw new Error('active grid node is missing from dense storage');
+		}
+		return existing;
+	}
+
+	values(): Iterable<GridNode> {
+		return this.activeNodes;
+	}
+}
+
+class SparseGridNodeStore implements GridNodeStore {
+	private readonly nodes = new Map<number, GridNode>();
+
+	get(key: number): GridNode | undefined {
+		return this.nodes.get(key);
+	}
+
+	getOrCreate(key: number, xIndex: number, yIndex: number): GridNode {
+		let node = this.nodes.get(key);
+		if (!node) {
+			node = createGridNode(xIndex, yIndex);
+			this.nodes.set(key, node);
+		}
+		return node;
+	}
+
+	values(): Iterable<GridNode> {
+		return this.nodes.values();
+	}
+}
+
+export class MpmSolverWorkspace {
+	private denseGrid: DenseGridNodeStore | undefined;
+	private denseTriangleContacts: DenseTriangleContactStore | undefined;
+
+	beginGridStep(nodeCount: number): GridNodeStore {
+		if (nodeCount > MAX_DENSE_GRID_NODE_COUNT) {
+			this.denseGrid = undefined;
+			return new SparseGridNodeStore();
+		}
+		if (this.denseGrid?.nodeCount !== nodeCount) {
+			this.denseGrid = new DenseGridNodeStore(nodeCount);
+		} else {
+			this.denseGrid.beginStep();
+		}
+		return this.denseGrid;
+	}
+
+	beginTriangleFieldStep(nodeCount: number): TriangleContactStore {
+		if (nodeCount > MAX_DENSE_GRID_NODE_COUNT) {
+			this.denseTriangleContacts = undefined;
+			return new SparseTriangleContactStore();
+		}
+		if (this.denseTriangleContacts?.nodeCount !== nodeCount) {
+			this.denseTriangleContacts = new DenseTriangleContactStore(nodeCount);
+		} else {
+			this.denseTriangleContacts.beginStep();
+		}
+		return this.denseTriangleContacts;
+	}
+
+	clearTriangleField(): void {
+		this.denseTriangleContacts = undefined;
+	}
+
+	dispose(): void {
+		this.denseGrid = undefined;
+		this.denseTriangleContacts = undefined;
+	}
+}
 
 export function stepMpm(
 	particles: readonly MpmParticle[],
-	config: MpmStepConfig
+	config: MpmStepConfig,
+	workspace?: MpmSolverWorkspace
 ): MpmStepResult {
 	const validated = validateConfig(config);
 	validateParticles(particles, validated);
@@ -224,7 +404,9 @@ export function stepMpm(
 	const inputMass = totalMass(particleStates, 'input mass');
 	assertComputedFinite(inputMass, 'input mass');
 	const inputMomentum = totalMomentum(particles, particleStates, 'input momentum');
-	const grid = new Map<number, GridNode>();
+	const grid = workspace
+		? workspace.beginGridStep(validated.gridNodeCount)
+		: createGridNodeStore(validated.gridNodeCount);
 	const dx = validated.grid.cellSize;
 	const inputStencil = createParticleStencil();
 
@@ -260,31 +442,7 @@ export function stepMpm(
 				const xIndex = stencil.baseX + ox;
 				const yIndex = stencil.baseY + oy;
 				const key = gridNodeKey(xIndex, yIndex, validated.gridNodeWidth);
-				let node = grid.get(key);
-				if (!node) {
-					node = {
-						xIndex,
-						yIndex,
-						mass: 0,
-						momentumX: 0,
-						momentumY: 0,
-						velocityX: 0,
-						velocityY: 0,
-						waterMass: 0,
-						waterMomentumX: 0,
-						waterMomentumY: 0,
-						waterVelocityX: 0,
-						waterVelocityY: 0,
-						waterVolume: 0,
-						oilMass: 0,
-						oilMomentumX: 0,
-						oilMomentumY: 0,
-						oilVelocityX: 0,
-						oilVelocityY: 0,
-						oilVolume: 0
-					};
-					grid.set(key, node);
-				}
+				const node = grid.getOrCreate(key, xIndex, yIndex);
 
 				const dposX = (ox - stencil.fx) * dx;
 				const dposY = (oy - stencil.fy) * dx;
@@ -331,7 +489,8 @@ export function stepMpm(
 	const triangleField = buildTriangleField(
 		bondedBodyStarts,
 		particles,
-		validated
+		validated,
+		workspace
 	);
 	for (const node of grid.values()) {
 		const solidVelocity = updateGridVelocity(
@@ -676,9 +835,10 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 		throw new RangeError('grid.cellsY must be a positive safe integer');
 	}
 	const gridNodeWidth = cellsX + 3;
+	const gridNodeCount = gridNodeWidth * (cellsY + 3);
 	if (
 		!Number.isSafeInteger(gridNodeWidth) ||
-		!Number.isSafeInteger(gridNodeWidth * (cellsY + 3))
+		!Number.isSafeInteger(gridNodeCount)
 	) {
 		throw new RangeError('grid dimensions exceed the safe node-index range');
 	}
@@ -735,7 +895,8 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 		domainHeight,
 		gradientScale,
 		stressScale,
-		gridNodeWidth
+		gridNodeWidth,
+		gridNodeCount
 	};
 }
 
@@ -856,13 +1017,19 @@ function collectBondedBodyStarts(
 function buildTriangleField(
 	bodyStarts: readonly number[],
 	particles: readonly MpmParticle[],
-	config: ValidatedConfig
+	config: ValidatedConfig,
+	workspace?: MpmSolverWorkspace
 ): TriangleField {
-	const nodes = new Map<number, TriangleContactField>();
 	const nodesByBody = new Map<number, TriangleContactField[]>();
-	const candidatesByBody = new Map<number, TriangleContactField[]>();
-	if (bodyStarts.length === 0) return { nodes, nodesByBody };
+	if (bodyStarts.length === 0) {
+		workspace?.clearTriangleField();
+		return { nodes: new SparseTriangleContactStore(), nodesByBody };
+	}
 
+	const nodes = workspace
+		? workspace.beginTriangleFieldStep(config.gridNodeCount)
+		: createTriangleContactStore(config.gridNodeCount);
+	const candidatesByBody = new Map<number, TriangleContactField[]>();
 	const { cellsX, cellsY, cellSize } = config.grid;
 	const maxDistance = cellSize * TRIANGLE_FIELD_BAND_CELLS;
 	const sample: TriangleDistanceSample = {
@@ -912,19 +1079,16 @@ function buildTriangleField(
 				if (nearest && sample.signedDistance >= nearest.signedDistance) {
 					continue;
 				}
-				const contact: TriangleContactField = {
-					bodyStart,
-					nodeKey: key,
-					signedDistance: sample.signedDistance,
-					normal: { x: sample.normalX, y: sample.normalY },
-					barycentric: [
-						sample.barycentric[0],
-						sample.barycentric[1],
-						sample.barycentric[2]
-					],
-					impulseX: 0,
-					impulseY: 0
-				};
+				const contact = nodes.getReusable(key) ?? createTriangleContactField(key);
+				contact.bodyStart = bodyStart;
+				contact.signedDistance = sample.signedDistance;
+				contact.normal.x = sample.normalX;
+				contact.normal.y = sample.normalY;
+				contact.barycentric[0] = sample.barycentric[0];
+				contact.barycentric[1] = sample.barycentric[1];
+				contact.barycentric[2] = sample.barycentric[2];
+				contact.impulseX = 0;
+				contact.impulseY = 0;
 				nodes.set(key, contact);
 				let bodyCandidates = candidatesByBody.get(bodyStart);
 				if (!bodyCandidates) {
@@ -941,11 +1105,28 @@ function buildTriangleField(
 		if (!bodyCandidates) continue;
 		const bodyNodes: TriangleContactField[] = [];
 		for (const contact of bodyCandidates) {
-			if (nodes.get(contact.nodeKey) === contact) bodyNodes.push(contact);
+			if (
+				contact.bodyStart === bodyStart &&
+				nodes.get(contact.nodeKey) === contact
+			) {
+				bodyNodes.push(contact);
+			}
 		}
 		if (bodyNodes.length > 0) nodesByBody.set(bodyStart, bodyNodes);
 	}
 	return { nodes, nodesByBody };
+}
+
+function createTriangleContactField(nodeKey: number): TriangleContactField {
+	return {
+		bodyStart: -1,
+		nodeKey,
+		signedDistance: 0,
+		normal: { x: 0, y: 0 },
+		barycentric: [0, 0, 0],
+		impulseX: 0,
+		impulseY: 0
+	};
 }
 
 function getTriangleVertices(
@@ -1064,7 +1245,7 @@ function triangleDistanceSample(
 
 function solveLiquidGridContact(
 	node: GridNode,
-	grid: ReadonlyMap<number, GridNode>,
+	grid: GridNodeStore,
 	config: ValidatedConfig
 ): void {
 	if (
@@ -1151,7 +1332,7 @@ function solveLiquidGridContact(
 }
 
 function volumeGradient(
-	grid: ReadonlyMap<number, GridNode>,
+	grid: GridNodeStore,
 	xIndex: number,
 	yIndex: number,
 	phase: 'water' | 'oil',
@@ -1302,7 +1483,7 @@ function projectParticleOutsideTriangles(
 	config: ValidatedConfig,
 	stencil: ParticleStencil
 ): MpmVector2 {
-	if (triangleField.nodes.size === 0) return position;
+	if (triangleField.nodesByBody.size === 0) return position;
 	updateParticleStencil(position, config.grid.cellSize, stencil);
 	const band = config.grid.cellSize * TRIANGLE_FIELD_BAND_CELLS;
 	let signedDistance = 0;
@@ -1698,6 +1879,57 @@ function assertGridNodeFinite(node: GridNode): void {
 	) {
 		throw new RangeError('grid node mass and phase volume must be non-negative');
 	}
+}
+
+function createGridNode(xIndex: number, yIndex: number): GridNode {
+	return {
+		xIndex,
+		yIndex,
+		mass: 0,
+		momentumX: 0,
+		momentumY: 0,
+		velocityX: 0,
+		velocityY: 0,
+		waterMass: 0,
+		waterMomentumX: 0,
+		waterMomentumY: 0,
+		waterVelocityX: 0,
+		waterVelocityY: 0,
+		waterVolume: 0,
+		oilMass: 0,
+		oilMomentumX: 0,
+		oilMomentumY: 0,
+		oilVelocityX: 0,
+		oilVelocityY: 0,
+		oilVolume: 0
+	};
+}
+
+function resetGridNode(
+	node: GridNode,
+	xIndex: number,
+	yIndex: number
+): GridNode {
+	node.xIndex = xIndex;
+	node.yIndex = yIndex;
+	node.mass = 0;
+	node.momentumX = 0;
+	node.momentumY = 0;
+	node.velocityX = 0;
+	node.velocityY = 0;
+	node.waterMass = 0;
+	node.waterMomentumX = 0;
+	node.waterMomentumY = 0;
+	node.waterVelocityX = 0;
+	node.waterVelocityY = 0;
+	node.waterVolume = 0;
+	node.oilMass = 0;
+	node.oilMomentumX = 0;
+	node.oilMomentumY = 0;
+	node.oilVelocityX = 0;
+	node.oilVelocityY = 0;
+	node.oilVolume = 0;
+	return node;
 }
 
 function subtractVector(first: MpmVector2, second: MpmVector2): MpmVector2 {
@@ -2278,6 +2510,18 @@ function gridNodeKey(
 	gridNodeWidth: number
 ): number {
 	return (yIndex + 1) * gridNodeWidth + (xIndex + 1);
+}
+
+function createGridNodeStore(nodeCount: number): GridNodeStore {
+	return nodeCount > MAX_DENSE_GRID_NODE_COUNT
+		? new SparseGridNodeStore()
+		: new DenseGridNodeStore(nodeCount);
+}
+
+function createTriangleContactStore(nodeCount: number): TriangleContactStore {
+	return nodeCount > MAX_DENSE_GRID_NODE_COUNT
+		? new SparseTriangleContactStore()
+		: new DenseTriangleContactStore(nodeCount);
 }
 
 function assertWeight(weight: number): void {

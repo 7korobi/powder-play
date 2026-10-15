@@ -5,7 +5,7 @@ import type {
 	MpmStepResult,
 	MpmVector2
 } from './solver.js';
-import { stepMpm } from './solver.js';
+import { MpmSolverWorkspace, stepMpm } from './solver.js';
 import {
 	GATE4_FRACTURE_OBJECT_ID,
 	GATE4_GRID,
@@ -73,6 +73,7 @@ export class MpmCpuReferenceSimulation {
 	private currentParticles: readonly MpmParticle[];
 	private currentLiquidAreas: Float32Array;
 	private currentFractureBonds: readonly MpmSolidBond[];
+	private readonly solverWorkspace = new MpmSolverWorkspace();
 	private disposed = false;
 
 	readonly particleCount: number;
@@ -134,7 +135,7 @@ export class MpmCpuReferenceSimulation {
 		const result = stepMpm(this.currentParticles, {
 			...config,
 			fractureBonds: this.currentFractureBonds
-		});
+		}, this.solverWorkspace);
 		this.currentParticles = result.particles;
 		this.currentLiquidAreas = this.calculateCurrentLiquidAreas(result.particles);
 		this.currentFractureBonds = result.fractureBonds ?? this.currentFractureBonds;
@@ -276,6 +277,7 @@ export class MpmCpuReferenceSimulation {
 		this.currentParticles = [];
 		this.currentLiquidAreas = new Float32Array();
 		this.currentFractureBonds = [];
+		this.solverWorkspace.dispose();
 	}
 
 	private drawLiquidPhase(

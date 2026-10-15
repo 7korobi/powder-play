@@ -14,6 +14,7 @@ import {
 	GATE4_WATER_PARTICLE_COUNT
 } from '../scenes/gate4.js';
 import { MpmCpuReferenceSimulation } from './cpu-simulation.js';
+import { stepMpm } from './solver.js';
 
 describe('MpmCpuReferenceSimulation', () => {
 	it('exposes the shared Gate 4 workload and liquid particle area', () => {
@@ -95,16 +96,21 @@ describe('MpmCpuReferenceSimulation', () => {
 	it('updates its particle and fracture state through the shared MPM stepper', () => {
 		const scene = createMpmGate4Scene(GATE4_SCENE_SEED);
 		const simulation = new MpmCpuReferenceSimulation(scene);
-		const result = simulation.step(
-			createMpmGate4StepConfig(
-				{ x: 0, y: 0 },
-				GATE4_FIXED_STEP_SECONDS / 8,
-				scene.fractureBonds
-			)
+		const config = createMpmGate4StepConfig(
+			{ x: 0, y: 0 },
+			GATE4_FIXED_STEP_SECONDS / 8,
+			scene.fractureBonds
 		);
+		const result = simulation.step(config);
+		const expectedNext = stepMpm(result.particles, {
+			...config,
+			fractureBonds: simulation.fractureBonds
+		});
+		const nextResult = simulation.step(config);
 
-		expect(simulation.particles).toBe(result.particles);
-		expect(simulation.fractureBonds).toBe(result.fractureBonds);
+		expect(nextResult).toEqual(expectedNext);
+		expect(simulation.particles).toBe(nextResult.particles);
+		expect(simulation.fractureBonds).toBe(nextResult.fractureBonds);
 		expect(simulation.particles).toHaveLength(GATE4_PARTICLE_COUNT);
 		expect(simulation.activeFractureBondCount).toBe(GATE4_FRACTURE_BOND_COUNT);
 	});

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+	MpmSolverWorkspace,
 	stepMpm,
 	type MpmMaterialParameters,
 	type MpmMatrix2,
@@ -71,6 +72,59 @@ describe('CPU MLS-MPM reference', () => {
 			gridMomentum: { x: 0, y: 0 },
 			outputMomentum: { x: 0, y: 0 }
 		});
+	});
+
+	it('uses sparse grid storage when the padded grid is too large for direct indexing', () => {
+		const particle = makeParticle({ position: { x: 8, y: 8 } });
+		const result = stepMpm(
+			[particle],
+			makeConfig({
+				grid: { cellsX: 2_000, cellsY: 2_000, cellSize: 1 }
+			})
+		);
+
+		expect(result.particles[0]?.position).toEqual(particle.position);
+		expect(result.diagnostics.gridMass).toBeCloseTo(0.1);
+	});
+
+	it('reuses dense grid workspace without retaining values between steps', () => {
+		const particles = [
+			makeParticle({
+				position: { x: 7.8, y: 7.5 },
+				velocity: { x: 0.2, y: 0.1 }
+			}),
+			makeParticle({
+				position: { x: 8.3, y: 7.7 },
+				velocity: { x: -0.1, y: 0.3 }
+			})
+		];
+		const config = makeConfig({
+			grid: { cellsX: 13, cellsY: 17, cellSize: 1 }
+		});
+		const alternateGridConfig = makeConfig({
+			grid: { cellsX: 17, cellsY: 13, cellSize: 1 }
+		});
+		const workspace = new MpmSolverWorkspace();
+		const expected = stepMpm(particles, config);
+
+		expect(stepMpm(particles, config, workspace)).toEqual(expected);
+		expect(stepMpm(particles, config, workspace)).toEqual(expected);
+		expect(stepMpm(particles, alternateGridConfig, workspace)).toEqual(
+			stepMpm(particles, alternateGridConfig)
+		);
+		expect(stepMpm([], config, workspace).diagnostics.gridMass).toBe(0);
+		expect(stepMpm(particles, config, workspace)).toEqual(expected);
+
+		const largeGridConfig = makeConfig({
+			grid: { cellsX: 2_000, cellsY: 2_000, cellSize: 1 }
+		});
+		const largeGridParticle = makeParticle({ position: { x: 8, y: 8 } });
+		expect(
+			stepMpm([largeGridParticle], largeGridConfig, workspace)
+		).toEqual(stepMpm([largeGridParticle], largeGridConfig));
+		expect(stepMpm(particles, config, workspace)).toEqual(expected);
+
+		workspace.dispose();
 	});
 
 	it('rejects invalid or omitted step parameters and particle state', () => {
