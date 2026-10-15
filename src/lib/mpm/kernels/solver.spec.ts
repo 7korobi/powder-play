@@ -13,21 +13,27 @@ beforeEach(() => {
 	vi.clearAllMocks();
 });
 
-function setupDevice() {
-	const dispatches: { pipeline: string; input?: string; workgroups: number }[] = [];
+function setupDevice(maxComputeWorkgroupsPerDimension = 65_535) {
+	const dispatches: {
+		pipeline: string;
+		input?: string;
+		workgroups: number;
+		workgroupsY: number;
+	}[] = [];
 	const buffers: { label: string; size: number; destroy: ReturnType<typeof vi.fn> }[] = [];
 	let mappedBytes: ArrayBuffer | (() => ArrayBuffer) | null = null;
 	const pass = {
 		setPipeline: vi.fn(),
 		setBindGroup: vi.fn(),
-		dispatchWorkgroups: vi.fn((workgroups: number) => {
+		dispatchWorkgroups: vi.fn((workgroups: number, workgroupsY = 1) => {
 			const pipeline = pass.setPipeline.mock.lastCall?.[0];
 			const bindGroup = pass.setBindGroup.mock.lastCall?.[1];
 			const input = bindGroup.entries.find((entry: GPUBindGroupEntry) => entry.binding === 1);
 			dispatches.push({
 				pipeline: pipeline.label,
 				input: input?.resource.buffer.label,
-				workgroups
+				workgroups,
+				workgroupsY
 			});
 		}),
 		end: vi.fn()
@@ -58,7 +64,7 @@ function setupDevice() {
 			maxBufferSize: 256 * 1024 * 1024,
 			maxStorageBufferBindingSize: 128 * 1024 * 1024,
 			maxUniformBufferBindingSize: 64 * 1024,
-			maxComputeWorkgroupsPerDimension: 65_535,
+			maxComputeWorkgroupsPerDimension,
 			maxStorageBuffersPerShaderStage: 8
 		},
 		lost: new Promise<GPUDeviceLostInfo>(() => {}),
@@ -855,6 +861,9 @@ describe('GPU MLS-MPM batch encoding', () => {
 
 			const wordsPerTile = Math.ceil(bodyCount / 32);
 			const candidateWordCount = tileCount * wordsPerTile;
+			const contactDispatch = gpu.dispatches.find(
+				({ pipeline }) => pipeline === 'MLS-MPM applyTriangleContactImpulses pipeline'
+			);
 			expect(
 				gpu.buffers.find(({ label }) =>
 					label.includes('triangle field candidate bitset')
@@ -866,8 +875,33 @@ describe('GPU MLS-MPM batch encoding', () => {
 						pipeline === 'MLS-MPM buildTriangleFieldCandidates pipeline'
 				)?.workgroups
 			).toBe(Math.ceil(candidateWordCount / 64));
+			expect(contactDispatch).toMatchObject({
+				workgroups: bodyCount,
+				workgroupsY: 1
+			});
 			solver.dispose();
 		}
+	});
+
+	it('maps bonded triangle workgroups across the device dimension limit', async () => {
+		const bodyCount = 17;
+		const gpu = setupDevice(4);
+		const particles = makeBondedTriangleParticles(bodyCount);
+		const solver = await createMpmMlsGpuSolver(CANVAS, particles, {
+			...CONFIG,
+			capacity: particles.length,
+			bondRestLength: 0.6
+		});
+
+		solver.step(0.001, { x: 0, y: 0 });
+
+		expect(
+			gpu.dispatches.find(
+				({ pipeline }) =>
+					pipeline === 'MLS-MPM applyTriangleContactImpulses pipeline'
+			)
+		).toMatchObject({ workgroups: 4, workgroupsY: 4 });
+		solver.dispose();
 	});
 
 	it('grows candidate storage and rebinds when cloning crosses a body-word boundary', async () => {

@@ -717,6 +717,55 @@ including the roughly 12.44 MB increase in grid-dependent buffers. The old
 0.217 ms median / 0.256 ms p95 benchmark belongs to the prior area-100 setup
 and is not a performance result for this configuration.
 
+### 2026-10-15: triangle-contact impulse gather parallelization
+
+`applyTriangleContactImpulses` previously assigned one invocation to each
+bonded body; that invocation serially scanned every grid node in the body's
+triangle AABB. The new kernel assigns one 64-lane workgroup per body. Lanes
+scan the AABB in strides of 64, accumulate the three barycentric impulse sums,
+and reduce those sums in workgroup memory before lane 0 updates the vertices.
+The solver dispatches the body workgroups in 2D when needed to respect
+`maxComputeWorkgroupsPerDimension`. No persistent GPU buffer was added.
+
+The A/B used the same Gate 4 workload on Headless Chrome 155 / macOS / Apple
+Metal 3 (hardware adapter, `timestamp-query`): 3,674 particles, capacity
+1,000,000, 220×150 grid, seed `0x4d504d34`, `dt=1/240`, gravity `(0, 90)`,
+no rendering, and eight fixed steps per batch. Each of three warmups and twelve
+measured samples created a fresh solver from the same initial scene. The
+baseline was clean revision `ae52454`; the candidate was the same revision
+with the kernel/dispatch change.
+
+| One-pass `profile=batch` | Baseline | Candidate | Change |
+|---|---:|---:|---:|
+| GPU step median | 0.704512 ms | 0.458752 ms | −34.9% |
+| GPU step p95 | 0.729088 ms | 0.565248 ms | −22.5% |
+
+The repeated batch median exceeds the 10% adoption threshold. In a separate
+eight-sample `profile=stages` diagnostic, `applyTriangleContactImpulses`
+decreased from 0.286720 to 0.024576 ms/step (−91.4%). That profile splits
+dispatches into separate passes and is attribution-only; its timings are not
+directly comparable to the one-pass batch results.
+
+On the actual GPU, two four-particle liquid/triangle fixtures were compared
+against the CPU reference for eight steps. The maximum absolute state error
+was 0.0004162 for normal reaction and 0.00003474 for tangential drag, both
+below the 0.001 tolerance; the GPU numerical-status check remained clear.
+The 3,674-particle scene does not currently provide a tight CPU/GPU parity
+oracle: its original serial-kernel baseline already differs by 0.56928 after
+one fixed step and 111.65262 after eight; the candidate measured 0.56928 and
+111.65383 respectively. This pre-existing full-scene discrepancy was not
+used as an acceptance gate and remains an investigation item.
+
+This is a short, no-render, fixed-step experiment on one adapter, with
+fresh-state batches rather than sustained adaptive-CFL simulation. It does not
+establish mobile-GPU performance, rendered frame time, or long-duration
+contact quality. Baseline/candidate SHA-256 (`shaders.ts`, `solver.ts`):
+`91ae2b6fb5586ca02a3690cb85a6b726f1c1bd2494b1b0802742c15980271bc1` /
+`fefc0422eb347a8367d2e5dd49f0244ad0254f22e8732aba677e6d598a1e274c` and
+`a9ae917f62b66b0075d1cd43b031cb2a384aa70ec2af6be7ce20e916f74f3afb` /
+`17b072fd0015a36745f14b93d7e46cb88471ca6b71f3b1055d04ae7bacffb9ca`,
+respectively.
+
 ### 2026-10-15: CPU grid and triangle-field workspace reuse
 
 The CPU reference solver now uses dense integer-indexed storage for grid nodes

@@ -54,6 +54,13 @@ struct TriangleFieldBody {
 	valid: u32,
 }
 
+struct TriangleContactImpulseBody {
+	minimumNode: vec2<i32>,
+	maximumNode: vec2<i32>,
+	bodyStart: u32,
+	valid: u32,
+}
+
 struct TriangleContactState {
 	velocity: vec2<f32>,
 	contactCount: atomic<u32>,
@@ -140,6 +147,10 @@ const WALL_CUSHION_CELLS: f32 = 8.0;
 
 var<workgroup> cflSpeedReduction: array<f32, 64>;
 var<workgroup> triangleFieldBodyCache: array<TriangleFieldBody, 64>;
+var<workgroup> triangleContactImpulseBody: TriangleContactImpulseBody;
+var<workgroup> triangleContactImpulseFirst: array<vec2<f32>, 64>;
+var<workgroup> triangleContactImpulseSecond: array<vec2<f32>, 64>;
+var<workgroup> triangleContactImpulseThird: array<vec2<f32>, 64>;
 
 const ERROR_STENCIL: u32 = 1u;
 const ERROR_DEFORMATION: u32 = 2u;
@@ -2306,69 +2317,139 @@ fn reduceParticleSpeedPartials(
 
 @compute @workgroup_size(64)
 fn applyTriangleContactImpulses(
-	@builtin(global_invocation_id) invocation: vec3<u32>,
+	@builtin(workgroup_id) workgroup: vec3<u32>,
+	@builtin(local_invocation_index) localIndex: u32,
+	@builtin(num_workgroups) numWorkgroups: vec3<u32>,
 ) {
-	let bodyIndex = invocation.x;
-	if (bodyIndex >= params.counts.w || atomicLoad(&stateError[0]) != 0u) {
-		return;
-	}
-	let bodyStart = bondedBodyStarts[bodyIndex];
-	if (
-		bodyStart + 2u >= params.counts.x ||
-		particlesIn[bodyStart].bondedTriangleVertex != 1u ||
-		particlesIn[bodyStart + 1u].bondedTriangleVertex != 2u ||
-		particlesIn[bodyStart + 2u].bondedTriangleVertex != 3u
-	) {
-		atomicMin(&stateError[1], bodyStart);
-		atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
-		return;
-	}
-	let first = particlesIn[bodyStart].position;
-	let second = particlesIn[bodyStart + 1u].position;
-	let third = particlesIn[bodyStart + 2u].position;
-	let minimum = min(first, min(second, third)) - vec2<f32>(params.bonding.w);
-	let maximum = max(first, max(second, third)) + vec2<f32>(params.bonding.w);
-	let minimumNode = clamp(
-		vec2<i32>(floor(minimum / params.physical.x)),
-		vec2<i32>(-1),
-		vec2<i32>(i32(params.grid.x + 1u), i32(params.grid.y + 1u)),
-	);
-	let maximumNode = clamp(
-		vec2<i32>(ceil(maximum / params.physical.x)),
-		vec2<i32>(-1),
-		vec2<i32>(i32(params.grid.x + 1u), i32(params.grid.y + 1u)),
-	);
-	var impulseFirst = vec2<f32>(0.0, 0.0);
-	var impulseSecond = vec2<f32>(0.0, 0.0);
-	var impulseThird = vec2<f32>(0.0, 0.0);
-	for (var y = minimumNode.y; y <= maximumNode.y; y += 1) {
-		for (var x = minimumNode.x; x <= maximumNode.x; x += 1) {
-			let field = triangleFieldNodes[gridIndex(vec2<i32>(x, y))];
-			if (field.bodyStartPlusOne != bodyStart + 1u) {
-				continue;
-			}
-			let firstWeight = 1.0 - field.barycentric.x - field.barycentric.y;
-			impulseFirst += firstWeight * field.impulse;
-			impulseSecond += field.barycentric.x * field.impulse;
-			impulseThird += field.barycentric.y * field.impulse;
+	let workgroupCount = numWorkgroups.x * numWorkgroups.y;
+	var bodyIndex = workgroup.x + workgroup.y * numWorkgroups.x;
+	loop {
+		if (bodyIndex >= params.counts.w) {
+			break;
 		}
+		if (localIndex == 0u) {
+			var body = TriangleContactImpulseBody(
+				vec2<i32>(0),
+				vec2<i32>(0),
+				0u,
+				0u,
+			);
+			if (atomicLoad(&stateError[0]) == 0u) {
+				let bodyStart = bondedBodyStarts[bodyIndex];
+				if (
+					bodyStart + 2u >= params.counts.x ||
+					particlesIn[bodyStart].bondedTriangleVertex != 1u ||
+					particlesIn[bodyStart + 1u].bondedTriangleVertex != 2u ||
+					particlesIn[bodyStart + 2u].bondedTriangleVertex != 3u
+				) {
+					atomicMin(&stateError[1], bodyStart);
+					atomicOr(&stateError[0], ERROR_TRIANGLE_BOND);
+				} else {
+					let first = particlesIn[bodyStart].position;
+					let second = particlesIn[bodyStart + 1u].position;
+					let third = particlesIn[bodyStart + 2u].position;
+					let minimum = min(first, min(second, third)) -
+						vec2<f32>(params.bonding.w);
+					let maximum = max(first, max(second, third)) +
+						vec2<f32>(params.bonding.w);
+					body.minimumNode = clamp(
+						vec2<i32>(floor(minimum / params.physical.x)),
+						vec2<i32>(-1),
+						vec2<i32>(i32(params.grid.x + 1u), i32(params.grid.y + 1u)),
+					);
+					body.maximumNode = clamp(
+						vec2<i32>(ceil(maximum / params.physical.x)),
+						vec2<i32>(-1),
+						vec2<i32>(i32(params.grid.x + 1u), i32(params.grid.y + 1u)),
+					);
+					body.bodyStart = bodyStart;
+					body.valid = 1u;
+				}
+			}
+			triangleContactImpulseBody = body;
+		}
+		workgroupBarrier();
+
+		let body = triangleContactImpulseBody;
+		var impulseFirst = vec2<f32>(0.0, 0.0);
+		var impulseSecond = vec2<f32>(0.0, 0.0);
+		var impulseThird = vec2<f32>(0.0, 0.0);
+		if (body.valid != 0u) {
+			let nodeWidth = u32(body.maximumNode.x - body.minimumNode.x + 1);
+			let nodeHeight = u32(body.maximumNode.y - body.minimumNode.y + 1);
+			let nodeCount = nodeWidth * nodeHeight;
+			var nodeIndex = localIndex;
+			loop {
+				if (nodeIndex >= nodeCount) {
+					break;
+				}
+				let node = vec2<i32>(
+					body.minimumNode.x + i32(nodeIndex % nodeWidth),
+					body.minimumNode.y + i32(nodeIndex / nodeWidth),
+				);
+				let field = triangleFieldNodes[gridIndex(node)];
+				if (field.bodyStartPlusOne == body.bodyStart + 1u) {
+					let firstWeight = 1.0 - field.barycentric.x - field.barycentric.y;
+					impulseFirst += firstWeight * field.impulse;
+					impulseSecond += field.barycentric.x * field.impulse;
+					impulseThird += field.barycentric.y * field.impulse;
+				}
+				nodeIndex += 64u;
+			}
+		}
+		triangleContactImpulseFirst[localIndex] = impulseFirst;
+		triangleContactImpulseSecond[localIndex] = impulseSecond;
+		triangleContactImpulseThird[localIndex] = impulseThird;
+		workgroupBarrier();
+
+		var stride = 32u;
+		loop {
+			if (stride == 0u) {
+				break;
+			}
+			if (localIndex < stride) {
+				triangleContactImpulseFirst[localIndex] +=
+					triangleContactImpulseFirst[localIndex + stride];
+				triangleContactImpulseSecond[localIndex] +=
+					triangleContactImpulseSecond[localIndex + stride];
+				triangleContactImpulseThird[localIndex] +=
+					triangleContactImpulseThird[localIndex + stride];
+			}
+			workgroupBarrier();
+			stride = stride / 2u;
+		}
+
+		if (
+			localIndex == 0u &&
+			body.valid != 0u &&
+			atomicLoad(&stateError[0]) == 0u
+		) {
+			let inverseMass = 1.0 / params.physical.y;
+			let firstVelocity =
+				particlesOut[body.bodyStart].velocity +
+				inverseMass * triangleContactImpulseFirst[0];
+			let secondVelocity =
+				particlesOut[body.bodyStart + 1u].velocity +
+				inverseMass * triangleContactImpulseSecond[0];
+			let thirdVelocity =
+				particlesOut[body.bodyStart + 2u].velocity +
+				inverseMass * triangleContactImpulseThird[0];
+			if (
+				!finiteVec2(firstVelocity) ||
+				!finiteVec2(secondVelocity) ||
+				!finiteVec2(thirdVelocity)
+			) {
+				atomicMin(&stateError[1], body.bodyStart);
+				atomicOr(&stateError[0], ERROR_TRIANGLE_CONTACT);
+			} else {
+				particlesOut[body.bodyStart].velocity = firstVelocity;
+				particlesOut[body.bodyStart + 1u].velocity = secondVelocity;
+				particlesOut[body.bodyStart + 2u].velocity = thirdVelocity;
+			}
+		}
+		workgroupBarrier();
+		bodyIndex += workgroupCount;
 	}
-	let inverseMass = 1.0 / params.physical.y;
-	let firstVelocity = particlesOut[bodyStart].velocity + inverseMass * impulseFirst;
-	let secondVelocity = particlesOut[bodyStart + 1u].velocity + inverseMass * impulseSecond;
-	let thirdVelocity = particlesOut[bodyStart + 2u].velocity + inverseMass * impulseThird;
-	if (
-		!finiteVec2(firstVelocity) ||
-		!finiteVec2(secondVelocity) ||
-		!finiteVec2(thirdVelocity)
-	) {
-		atomicMin(&stateError[1], bodyStart);
-		atomicOr(&stateError[0], ERROR_TRIANGLE_CONTACT);
-		return;
-	}
-	particlesOut[bodyStart].velocity = firstVelocity;
-	particlesOut[bodyStart + 1u].velocity = secondVelocity;
-	particlesOut[bodyStart + 2u].velocity = thirdVelocity;
 }
 
 @compute @workgroup_size(64)

@@ -158,6 +158,10 @@ the three vertices. Tangential relative velocity is exponentially relaxed at
 a rate of 4 s⁻¹, with each CFL microstep applying `1 - exp(-4 × dt)`. This
 rate-based drag transfers some wave motion into pebble translation and rotation;
 it is not Coulomb friction.
+The reaction gather assigns one 64-lane workgroup to each bonded body. Lanes
+cooperatively scan the body's field AABB, accumulate barycentric impulse shares,
+and reduce them before lane 0 updates the three vertex velocities. A 2D workgroup
+dispatch keeps the launch within the device's per-dimension workgroup limit.
 Pebble pairs use triangle SAT contact to reduce approaching normal velocity;
 the pair impulse pass does not translate triangle vertices. Repeated post-G2P
 position corrections destabilized the triangle contact field during CFL

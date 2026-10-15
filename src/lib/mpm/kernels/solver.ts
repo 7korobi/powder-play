@@ -1471,11 +1471,12 @@ function createSolver(
 					particleSlotCount
 				);
 				if (bondedBodyCount > 0) {
-					dispatchCompute(
+					dispatchComputeWorkgroups2D(
 						pass,
 						runtime.pipelines.applyTriangleContactImpulses,
 						groups.applyTriangleContactImpulses,
-						bondedBodyCount
+						bondedBodyCount,
+						session.device.limits.maxComputeWorkgroupsPerDimension
 					);
 					dispatchCompute(
 						pass,
@@ -2974,6 +2975,24 @@ function dispatchCompute(
 	pass.setPipeline(pipeline);
 	pass.setBindGroup(0, bindGroup);
 	pass.dispatchWorkgroups(workgroups);
+}
+
+function dispatchComputeWorkgroups2D(
+	pass: GPUComputePassEncoder,
+	pipeline: GPUComputePipeline,
+	bindGroup: GPUBindGroup,
+	workgroupCount: number,
+	maxWorkgroupsPerDimension: number
+): void {
+	if (workgroupCount === 0) return;
+	const workgroupsX = Math.min(workgroupCount, maxWorkgroupsPerDimension);
+	const workgroupsY = Math.min(
+		Math.ceil(workgroupCount / workgroupsX),
+		maxWorkgroupsPerDimension
+	);
+	pass.setPipeline(pipeline);
+	pass.setBindGroup(0, bindGroup);
+	pass.dispatchWorkgroups(workgroupsX, workgroupsY);
 }
 
 async function createComputePipeline(
