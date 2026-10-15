@@ -2,6 +2,11 @@
 	import { onMount } from 'svelte';
 	import type { MpmVector2 } from '#lib/mpm/reference/solver.js';
 	import {
+		MPM_RENDER_FPS_OPTIONS,
+		MpmFramePacer,
+		type MpmRenderFps
+	} from '#lib/mpm/kernels/frame-pacer.js';
+	import {
 		createLiquidFunSimulation,
 		type LiquidFunRenderMode,
 		type LiquidFunSimulation
@@ -23,7 +28,9 @@
 	const MAX_STEPS_PER_FRAME = 8;
 	const MAX_PHYSICS_FRAME_BUDGET_MS = 8;
 	const SIMULATION_SPEED_OPTIONS = [0.25, 0.5, 1, 2, 4, 8, 16, 32] as const;
+	const DEFAULT_RENDER_FPS: MpmRenderFps = 60;
 	const METRICS_INTERVAL_MS = 500;
+	const framePacer = new MpmFramePacer();
 
 	type Phase = 'loading' | 'ready' | 'error';
 
@@ -37,6 +44,7 @@
 	let gravityX = $state(LIQUIDFUN_GATE4_GRAVITY.x);
 	let gravityY = $state(LIQUIDFUN_GATE4_GRAVITY.y);
 	let simulationSpeed = $state(1);
+	let renderTargetFps: MpmRenderFps = $state(DEFAULT_RENDER_FPS);
 	let renderMode = $state<LiquidFunRenderMode>('surface');
 	let fps = $state(0);
 	let stepsPerSecond = $state(0);
@@ -49,7 +57,7 @@
 	let lastFrameTime = 0;
 	let lastMetricsTime = 0;
 	let accumulatorSeconds = 0;
-	let framesForMetrics = 0;
+	let renderedFramesForMetrics = 0;
 	let stepsForMetrics = 0;
 	let physicsMsForMetrics = 0;
 
@@ -81,7 +89,7 @@
 		stepsPerSecond = 0;
 		physicsMsPerStep = 0;
 		lastMetricsTime = 0;
-		framesForMetrics = 0;
+		renderedFramesForMetrics = 0;
 		stepsForMetrics = 0;
 		physicsMsForMetrics = 0;
 	}
@@ -195,6 +203,7 @@
 	function handleVisibilityChange(): void {
 		pageVisible = document.visibilityState === 'visible';
 		lastFrameTime = 0;
+		framePacer.reset();
 		resetMetrics();
 	}
 
@@ -205,8 +214,6 @@
 		const elapsedSeconds =
 			lastFrameTime === 0 ? 0 : Math.max(0, (now - lastFrameTime) / 1_000);
 		lastFrameTime = now;
-		framesForMetrics += 1;
-
 		if (simulation && phase === 'ready' && !paused && pageVisible) {
 			try {
 				accumulatorSeconds += elapsedSeconds * simulationSpeed;
@@ -238,11 +245,14 @@
 
 		pendingSimulationMs = accumulatorSeconds * 1_000;
 
-		if (context && canvas && simulation && phase === 'ready') {
-			try {
-				simulation.draw(context, canvas.width, canvas.height, renderMode);
-			} catch (error) {
-				failSimulation(error);
+		if (pageVisible && framePacer.shouldRender(now, renderTargetFps)) {
+			if (context && canvas && simulation && phase === 'ready') {
+				try {
+					simulation.draw(context, canvas.width, canvas.height, renderMode);
+					renderedFramesForMetrics += 1;
+				} catch (error) {
+					failSimulation(error);
+				}
 			}
 		}
 
@@ -250,12 +260,12 @@
 			lastMetricsTime = now;
 		} else if (now - lastMetricsTime >= METRICS_INTERVAL_MS) {
 			const elapsedMs = now - lastMetricsTime;
-			fps = (framesForMetrics * 1_000) / elapsedMs;
+			fps = (renderedFramesForMetrics * 1_000) / elapsedMs;
 			stepsPerSecond = (stepsForMetrics * 1_000) / elapsedMs;
 			physicsMsPerStep =
 				stepsForMetrics > 0 ? physicsMsForMetrics / stepsForMetrics : 0;
 			lastMetricsTime = now;
-			framesForMetrics = 0;
+			renderedFramesForMetrics = 0;
 			stepsForMetrics = 0;
 			physicsMsForMetrics = 0;
 		}
@@ -372,7 +382,7 @@
 			</div>
 
 			<fieldset class="gravity-controls">
-				<legend>Gravity · Gate 4 units/s²</legend>
+				<legend>Manual 2D gravity · Gate 4 units/s²</legend>
 				<label class="range-control">
 					<span>X</span>
 					<output>{gravityX}</output>
@@ -399,6 +409,9 @@
 						disabled={phase !== 'ready'}
 					/>
 				</label>
+				<p class="control-note">
+					Gravity is applied immediately on both axes. The default (0, 90) matches the Gate 4 scene.
+				</p>
 			</fieldset>
 
 			<div class="setting-controls">
@@ -417,6 +430,14 @@
 						<option value="particles">Particle markers</option>
 					</select>
 				</label>
+				<label>
+					<span>Render target FPS</span>
+					<select bind:value={renderTargetFps}>
+						{#each MPM_RENDER_FPS_OPTIONS as targetFps}
+							<option value={targetFps}>{targetFps} FPS</option>
+						{/each}
+					</select>
+				</label>
 			</div>
 
 			<div class="backlog-controls">
@@ -432,7 +453,8 @@
 				<p class="control-note">
 					Per-frame physics budget: up to {MAX_STEPS_PER_FRAME} steps and
 					{MAX_PHYSICS_FRAME_BUDGET_MS} ms. If the requested speed is too high, the backlog grows instead
-					of triggering an unbounded catch-up loop.
+					of triggering an unbounded catch-up loop. Render target FPS caps Canvas drawing only; physics
+					continues to use the same fixed timestep.
 				</p>
 			</div>
 
@@ -441,6 +463,10 @@
 				<div>
 					<dt>Render FPS</dt>
 					<dd>{fps.toFixed(1)}</dd>
+				</div>
+				<div>
+					<dt>Render target (cap)</dt>
+					<dd>{renderTargetFps} FPS</dd>
 				</div>
 				<div>
 					<dt>Completed steps / s</dt>
