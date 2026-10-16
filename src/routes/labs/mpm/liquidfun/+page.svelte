@@ -34,7 +34,7 @@
 	const MAX_STEPS_PER_FRAME = 8;
 	const MAX_PHYSICS_FRAME_BUDGET_MS = 8;
 	const SIMULATION_SPEED_OPTIONS = [0.25, 0.5, 1, 2, 4, 8, 16, 32] as const;
-	const MANUAL_GRAVITY_COMPONENT_LIMIT = 250_000;
+	const MANUAL_GRAVITY_COMPONENT_LIMIT = 125_000;
 	const DEFAULT_LIQUIDFUN_OSCILLATION_AMPLITUDE = 1_000;
 	const MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE = 250_000;
 	const DEFAULT_RENDER_FPS: MpmRenderFps = 90;
@@ -445,7 +445,8 @@
 					/>
 				</label>
 				<p class="control-note">
-					Manual gravity defaults to (0, 0). Horizontal oscillation, when enabled, is added to X.
+					Manual gravity defaults to (0, 0); its ±125000 limit is provisional. Disable horizontal
+					oscillation to isolate manual-gravity tests.
 				</p>
 			</fieldset>
 
