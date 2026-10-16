@@ -49,12 +49,14 @@ and physical meters are deliberately distinct. The LiquidFun scene regrids its
 fluid particles to fit the specified 140 × 75 mm visible domain; the CPU/GPU
 MPM source scene is unchanged.
 
-Four static polygon walls have inner faces on the domain edges and extend 5 m
-(5,000 Box2D units) outward, with overlapping corners. This remains about 36
-visible-domain widths. Their fixtures are not drawn, and particle/body
-rendering is clipped to the visible domain. This deep solid is intended to
-contain particles that cross the inner face; it cannot guarantee containment
-for arbitrarily large per-step displacements.
+Four static polygon walls have inner faces on the domain edges and extend 50 mm
+(50 Box2D units) outward. They overlap at the corners by 2 mm (two fluid
+particle radii), rather than extending the full wall depth along both axes.
+The previous multi-meter fixtures allowed fluid particles to penetrate the
+walls. Their fixtures are not drawn, and particle/body rendering is clipped to
+the visible domain. A 50 mm wall contains particles at the current forcing and
+fixed timestep, but no finite wall guarantees containment for arbitrarily
+large per-step displacements.
 
 Gate 4 coordinates are y-down; Box2D engine coordinates are y-up:
 

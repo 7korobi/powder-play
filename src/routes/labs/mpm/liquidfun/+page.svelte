@@ -607,7 +607,7 @@
 						{(LIQUIDFUN_PHYSICAL_DOMAIN_METERS.height * 1_000).toFixed(0)} mm visible domain
 					</li>
 					<li>
-						{LIQUIDFUN_WALL_THICKNESS_METERS.toLocaleString()} m of static wall depth beyond each visible
+						{(LIQUIDFUN_WALL_THICKNESS_METERS * 1_000).toLocaleString()} mm of static wall depth beyond each visible
 						domain edge · {LIQUIDFUN_BOX2D_DOMAIN_UNITS.width} ×
 						{LIQUIDFUN_BOX2D_DOMAIN_UNITS.height} Box2D engine units
 					</li>

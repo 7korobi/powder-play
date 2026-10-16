@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { LIQUIDFUN_BOX2D_DOMAIN_UNITS } from './workload.js';
+import {
+	LIQUIDFUN_BOX2D_DOMAIN_UNITS,
+	LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS
+} from './workload.js';
 import {
 	createLiquidFunWallDefinitions,
 	LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS,
@@ -7,13 +10,15 @@ import {
 } from './wall-geometry.js';
 
 describe('LiquidFun wall geometry', () => {
-	it('keeps inner faces at the domain edges and extends five meters outward', () => {
+	it('keeps inner faces at the domain edges and overlaps corners by two particle radii', () => {
 		const { width, height } = LIQUIDFUN_BOX2D_DOMAIN_UNITS;
 		const walls = createLiquidFunWallDefinitions(width, height);
 		const [left, right, bottom, top] = walls;
+		const cornerOverlap = LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS * 2;
 
-		expect(LIQUIDFUN_WALL_THICKNESS_METERS).toBe(5);
-		expect(LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS).toBe(5_000);
+		expect(LIQUIDFUN_WALL_THICKNESS_METERS).toBe(0.05);
+		expect(LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS).toBe(50);
+		expect(cornerOverlap).toBe(2);
 		expect([
 			{
 				minX: left.position.x - left.halfWidth,
@@ -43,24 +48,24 @@ describe('LiquidFun wall geometry', () => {
 			{
 				minX: -LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS,
 				maxX: 0,
-				minY: -LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS,
-				maxY: height + LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS
+				minY: -cornerOverlap,
+				maxY: height + cornerOverlap
 			},
 			{
 				minX: width,
 				maxX: width + LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS,
-				minY: -LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS,
-				maxY: height + LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS
+				minY: -cornerOverlap,
+				maxY: height + cornerOverlap
 			},
 			{
-				minX: -LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS,
-				maxX: width + LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS,
+				minX: -cornerOverlap,
+				maxX: width + cornerOverlap,
 				minY: -LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS,
 				maxY: 0
 			},
 			{
-				minX: -LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS,
-				maxX: width + LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS,
+				minX: -cornerOverlap,
+				maxX: width + cornerOverlap,
 				minY: height,
 				maxY: height + LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS
 			}

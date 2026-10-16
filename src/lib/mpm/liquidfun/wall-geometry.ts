@@ -1,9 +1,10 @@
 import {
 	LIQUIDFUN_BOX2D_UNITS_PER_METER,
+	LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS,
 	type LiquidFunVector
 } from './workload.js';
 
-export const LIQUIDFUN_WALL_THICKNESS_METERS = 5;
+export const LIQUIDFUN_WALL_THICKNESS_METERS = 0.05;
 export const LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS =
 	LIQUIDFUN_WALL_THICKNESS_METERS * LIQUIDFUN_BOX2D_UNITS_PER_METER;
 
@@ -13,8 +14,9 @@ export function createLiquidFunWallDefinitions(width: number, height: number) {
 	}
 
 	const halfThickness = LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS / 2;
-	const sideHalfHeight = height / 2 + LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS;
-	const horizontalHalfWidth = width / 2 + LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS;
+	const cornerOverlap = LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS * 2;
+	const sideHalfHeight = height / 2 + cornerOverlap;
+	const horizontalHalfWidth = width / 2 + cornerOverlap;
 
 	return [
 		{
