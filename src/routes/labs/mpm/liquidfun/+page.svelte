@@ -21,13 +21,14 @@
 		LIQUIDFUN_BOX2D_UNITS_PER_METER,
 		LIQUIDFUN_DT_SECONDS,
 		LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN,
-		LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER,
 		LIQUIDFUN_GATE4_DOMAIN,
 		LIQUIDFUN_GATE4_ACCELERATION_UNITS_PER_METER_PER_SECOND_SQUARED,
 		LIQUIDFUN_GATE4_UNITS_PER_METER,
 		LIQUIDFUN_OIL_PARTICLE_COUNT,
+		LIQUIDFUN_OIL_PARTICLE_COUNT_MULTIPLIER,
 		LIQUIDFUN_PACKAGE_VERSION,
 		LIQUIDFUN_PARTICLE_RADIUS_METERS,
+		LIQUIDFUN_PARTICLE_SPACING_METERS,
 		LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS,
 		LIQUIDFUN_PEBBLE_MASS,
 		LIQUIDFUN_PHYSICAL_DOMAIN_METERS,
@@ -35,6 +36,7 @@
 		LIQUIDFUN_SHARED_PARTICLE_MASS,
 		LIQUIDFUN_VELOCITY_ITERATIONS,
 		LIQUIDFUN_POSITION_ITERATIONS,
+		LIQUIDFUN_WATER_PARTICLE_COUNT_MULTIPLIER,
 		LIQUIDFUN_WATER_PARTICLE_COUNT
 	} from '#lib/mpm/liquidfun/workload.js';
 
@@ -595,7 +597,9 @@
 					<li>
 						{LIQUIDFUN_WATER_PARTICLE_COUNT.toLocaleString()} water /
 						{' '}{LIQUIDFUN_OIL_PARTICLE_COUNT.toLocaleString()} oil particles ·
-						{LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER}× source count and placement area · source spacing retained
+						water {LIQUIDFUN_WATER_PARTICLE_COUNT_MULTIPLIER}× / oil
+						{LIQUIDFUN_OIL_PARTICLE_COUNT_MULTIPLIER}× source count ·
+						{(LIQUIDFUN_PARTICLE_SPACING_METERS * 1_000).toFixed(1)} mm spacing
 					</li>
 					<li>
 						{LIQUIDFUN_GATE4_DOMAIN.width} × {LIQUIDFUN_GATE4_DOMAIN.height} Gate 4 units ·
@@ -637,7 +641,7 @@
 			</li>
 			<li>
 				Water and oil use separate LiquidFun particle flags in one particle system, so both use the same
-				0.5 mm radius and 0.05 simulation mass units and retain mutual particle collisions. The triangular pebbles are
+				1.0 mm radius and 0.05 simulation mass units and retain mutual particle collisions. The triangular pebbles are
 				rigid approximations, not deformable MLS-MPM triangles. Do not interpret their paths as a
 				matched-physics comparison.
 			</li>

@@ -3,13 +3,16 @@ import {
 	createLiquidFunGate4Workload,
 	LIQUIDFUN_BOX2D_DOMAIN_UNITS,
 	LIQUIDFUN_BOX2D_GRAVITY_UNITS_PER_SECOND_SQUARED,
+	LIQUIDFUN_BOX2D_UNITS_PER_GATE4_UNIT,
 	LIQUIDFUN_GATE4_ACCELERATION_UNITS_PER_METER_PER_SECOND_SQUARED,
 	LIQUIDFUN_GATE4_DOMAIN,
 	LIQUIDFUN_GATE4_GRAVITY,
 	LIQUIDFUN_GATE4_UNITS_PER_METER,
-	LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER,
+	LIQUIDFUN_OIL_PARTICLE_COUNT_MULTIPLIER,
 	LIQUIDFUN_OIL_PARTICLE_COUNT,
 	LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS,
+	LIQUIDFUN_PARTICLE_SPACING_METERS,
+	LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS,
 	LIQUIDFUN_PEBBLE_SIZE_SCALE,
 	LIQUIDFUN_PEBBLE_EDGE_LENGTH_BOX2D_UNITS,
 	LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS,
@@ -20,6 +23,9 @@ import {
 	LIQUIDFUN_PHYSICAL_DOMAIN_METERS,
 	LIQUIDFUN_SCENE_SEED,
 	LIQUIDFUN_SOLID_NODE_RADIUS_METERS,
+	LIQUIDFUN_WATER_PARTICLE_COUNT_MULTIPLIER,
+	LIQUIDFUN_WATER_PARTICLE_ROWS,
+	LIQUIDFUN_OIL_PARTICLE_ROWS,
 	LIQUIDFUN_WATER_PARTICLE_COUNT,
 	mapBox2DPositionToGate4,
 	mapBox2DVelocityToGate4,
@@ -35,8 +41,8 @@ import {
 	GATE4_FRACTURE_FAILURE_STRAIN,
 	GATE4_FRACTURE_OBJECT_ID,
 	GATE4_FRACTURE_PARTICLE_COUNT,
-	GATE4_LIQUID_PARTICLE_SPACING,
 	GATE4_PARTICLE_COUNT,
+	GATE4_PEBBLE_EDGE_LENGTH,
 	GATE4_OIL_PARTICLE_COLUMNS,
 	GATE4_PEBBLE_COUNT,
 	GATE4_PEBBLE_PARTICLE_COUNT,
@@ -75,12 +81,14 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 	});
 
 	it('calibrates particle and pebble masses at the requested millimeter scale', () => {
-		expect(LIQUIDFUN_PARTICLE_RADIUS_METERS).toBe(0.0005);
-		expect(LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS).toBe(0.5);
+		expect(LIQUIDFUN_PARTICLE_RADIUS_METERS).toBe(0.001);
+		expect(LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS).toBe(1);
+		expect(LIQUIDFUN_PARTICLE_SPACING_METERS).toBe(0.0015);
+		expect(LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS).toBe(30);
 		expect(LIQUIDFUN_SHARED_PARTICLE_MASS).toBe(0.05);
-		expect(LIQUIDFUN_SHARED_PARTICLE_DENSITY * 0.75 ** 2).toBeCloseTo(0.05);
-		expect(LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS).toBe(0.0015);
-		expect(LIQUIDFUN_PEBBLE_EDGE_LENGTH_BOX2D_UNITS).toBe(1.5);
+		expect(LIQUIDFUN_SHARED_PARTICLE_DENSITY * 1.5 ** 2).toBeCloseTo(0.05);
+		expect(LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS).toBe(0.003);
+		expect(LIQUIDFUN_PEBBLE_EDGE_LENGTH_BOX2D_UNITS).toBe(3);
 		expect(LIQUIDFUN_PEBBLE_MASS).toBe(0.045);
 	});
 
@@ -106,11 +114,14 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 		expect(workload.sourceMpmNodeCount).toBe(3_674);
 		expect(workload.mappedMpmNodeCount).toBe(GATE4_PARTICLE_COUNT);
 		expect(workload.mappedMpmNodeCount).toBe(3_674);
-		expect(LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER).toBe(3);
+		expect(LIQUIDFUN_WATER_PARTICLE_COUNT_MULTIPLIER).toBe(1);
+		expect(LIQUIDFUN_OIL_PARTICLE_COUNT_MULTIPLIER).toBe(1);
 		expect(GATE4_WATER_PARTICLE_COUNT).toBe(2_000);
 		expect(GATE4_OIL_PARTICLE_COUNT).toBe(1_500);
-		expect(LIQUIDFUN_WATER_PARTICLE_COUNT).toBe(6_000);
-		expect(LIQUIDFUN_OIL_PARTICLE_COUNT).toBe(4_500);
+		expect(LIQUIDFUN_WATER_PARTICLE_COUNT).toBe(2_000);
+		expect(LIQUIDFUN_OIL_PARTICLE_COUNT).toBe(1_500);
+		expect(LIQUIDFUN_WATER_PARTICLE_ROWS).toBe(23);
+		expect(LIQUIDFUN_OIL_PARTICLE_ROWS).toBe(20);
 		expect(waterParticles).toHaveLength(GATE4_WATER_PARTICLE_COUNT);
 		expect(oilParticles).toHaveLength(GATE4_OIL_PARTICLE_COUNT);
 		expect(workload.waterParticles).toHaveLength(LIQUIDFUN_WATER_PARTICLE_COUNT);
@@ -150,7 +161,7 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 		).toBe(true);
 	});
 
-	it('expands each fluid footprint threefold while retaining source particle spacing', () => {
+	it('regrids the requested fluid counts at the radius-based particle stride', () => {
 		const workload = createLiquidFunGate4Workload();
 		const scene = createMpmGate4Scene(LIQUIDFUN_SCENE_SEED);
 		const sourceWaterParticles = scene.particles.filter(
@@ -174,8 +185,9 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 			sourceColumns: number,
 			sourceRows: number,
 			targetParticleCount: number,
+			countMultiplier: number,
 			targetRows: number,
-			verticalOffset: number
+			targetStartY: number
 		) => {
 			const first = sourceParticles[0];
 			if (!first) {
@@ -183,26 +195,23 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 			}
 			const targetColumns = Math.ceil(targetParticleCount / targetRows);
 			expect(targetParticles).toHaveLength(targetParticleCount);
-			expect(targetParticleCount).toBe(
-				sourceParticles.length * LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER
-			);
+			expect(targetParticleCount).toBe(sourceParticles.length * countMultiplier);
 			expect(Math.min(...targetParticles.map(({ position }) => position.x))).toBeCloseTo(
 				first.position.x
 			);
 			expect(Math.max(...targetParticles.map(({ position }) => position.x))).toBeCloseTo(
-				first.position.x + (targetColumns - 1) * GATE4_LIQUID_PARTICLE_SPACING
+				first.position.x +
+					(targetColumns - 1) * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS
 			);
 			expect(
 				first.position.x +
-					targetColumns * GATE4_LIQUID_PARTICLE_SPACING
+					targetColumns * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS
 			).toBeLessThanOrEqual(LIQUIDFUN_GATE4_DOMAIN.width);
 			expect(Math.min(...targetParticles.map(({ position }) => position.y))).toBeCloseTo(
-				first.position.y + verticalOffset
+				targetStartY
 			);
 			expect(Math.max(...targetParticles.map(({ position }) => position.y))).toBeCloseTo(
-				first.position.y +
-					verticalOffset +
-					(targetRows - 1) * GATE4_LIQUID_PARTICLE_SPACING
+				targetStartY + (targetRows - 1) * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS
 			);
 			expect(
 				new Set(
@@ -218,13 +227,15 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 				);
 				const particlesInRow = rowEndIndex - rowStartIndex;
 				const columnOffset =
-					((targetColumns - particlesInRow) * GATE4_LIQUID_PARTICLE_SPACING) /
+					((targetColumns - particlesInRow) *
+						LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS) /
 					2;
+				const sourceRow = Math.floor((row * sourceRows) / targetRows);
 				for (let column = 0; column < particlesInRow; column += 1) {
 					const targetParticle =
 						targetParticles[rowStartIndex + column];
 					const sourceParticle =
-						sourceParticles[row * sourceColumns + (column % sourceColumns)];
+						sourceParticles[sourceRow * sourceColumns + (column % sourceColumns)];
 					if (!targetParticle || !sourceParticle) {
 						throw new Error('The expanded Gate 4 fluid grid is incomplete.');
 					}
@@ -232,18 +243,19 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 						x:
 							first.position.x +
 							columnOffset +
-							column * GATE4_LIQUID_PARTICLE_SPACING,
-						y:
-							first.position.y +
-							verticalOffset +
-							row * GATE4_LIQUID_PARTICLE_SPACING
+							column * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS,
+						y: targetStartY + row * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS
 					});
 					expect(targetParticle.velocity).toEqual(sourceParticle.velocity);
 				}
 			}
 		};
-		const waterTargetRows = GATE4_WATER_PARTICLE_ROWS;
-		const fluidVerticalOffset = -GATE4_LIQUID_PARTICLE_SPACING / 2;
+		const waterTargetRows = LIQUIDFUN_WATER_PARTICLE_ROWS;
+		const oilTargetRows = LIQUIDFUN_OIL_PARTICLE_ROWS;
+		const oilStartY =
+			2 * LIQUIDFUN_PARTICLE_RADIUS_METERS * LIQUIDFUN_GATE4_UNITS_PER_METER;
+		const waterStartY =
+			oilStartY + oilTargetRows * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS;
 
 		expectExpandedGrid(
 			sourceWaterParticles,
@@ -251,8 +263,9 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 			GATE4_WATER_PARTICLE_COLUMNS,
 			GATE4_WATER_PARTICLE_ROWS,
 			LIQUIDFUN_WATER_PARTICLE_COUNT,
+			LIQUIDFUN_WATER_PARTICLE_COUNT_MULTIPLIER,
 			waterTargetRows,
-			fluidVerticalOffset
+			waterStartY
 		);
 		expectExpandedGrid(
 			sourceOilParticles,
@@ -260,10 +273,11 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 			GATE4_OIL_PARTICLE_COLUMNS,
 			GATE4_OIL_PARTICLE_ROWS,
 			LIQUIDFUN_OIL_PARTICLE_COUNT,
-			GATE4_OIL_PARTICLE_ROWS,
-			fluidVerticalOffset
+			LIQUIDFUN_OIL_PARTICLE_COUNT_MULTIPLIER,
+			oilTargetRows,
+			oilStartY
 		);
-		expect(LIQUIDFUN_PARTICLE_RADIUS_METERS).toBe(0.0005);
+		expect(LIQUIDFUN_PARTICLE_RADIUS_METERS).toBe(0.001);
 		const fractureTopY = Math.min(
 			...sourceFractureParticles.map(({ position }) => position.y)
 		);
@@ -274,20 +288,26 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 			(LIQUIDFUN_PARTICLE_RADIUS_METERS + LIQUIDFUN_SOLID_NODE_RADIUS_METERS) *
 				LIQUIDFUN_GATE4_UNITS_PER_METER
 		);
+		expect(
+			waterBottomY +
+				LIQUIDFUN_PARTICLE_RADIUS_METERS * LIQUIDFUN_GATE4_UNITS_PER_METER
+		).toBeLessThan(LIQUIDFUN_GATE4_DOMAIN.height);
 		const oilBottomY = Math.max(
 			...workload.oilParticles.map(({ position }) => position.y)
 		);
 		const waterTopY = Math.min(
 			...workload.waterParticles.map(({ position }) => position.y)
 		);
-		expect(waterTopY - oilBottomY).toBe(GATE4_LIQUID_PARTICLE_SPACING);
+		expect(waterTopY - oilBottomY).toBe(LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS);
 	});
 
 	it('sets each LiquidFun pebble triangle to the requested physical edge length', () => {
+		const sourceEdgeBox2DUnits =
+			GATE4_PEBBLE_EDGE_LENGTH * LIQUIDFUN_BOX2D_UNITS_PER_GATE4_UNIT;
 		const originalVertices = [
-			{ x: -3.3, y: -3.3 / Math.sqrt(3) },
-			{ x: 3.3, y: -3.3 / Math.sqrt(3) },
-			{ x: 0, y: (2 * 3.3) / Math.sqrt(3) }
+			{ x: -sourceEdgeBox2DUnits / 2, y: -sourceEdgeBox2DUnits / (2 * Math.sqrt(3)) },
+			{ x: sourceEdgeBox2DUnits / 2, y: -sourceEdgeBox2DUnits / (2 * Math.sqrt(3)) },
+			{ x: 0, y: sourceEdgeBox2DUnits / Math.sqrt(3) }
 		] as const;
 		const scaledVertices = scaleLiquidFunPebbleLocalVertices(originalVertices);
 		const width = (vertices: readonly { x: number; y: number }[]) =>

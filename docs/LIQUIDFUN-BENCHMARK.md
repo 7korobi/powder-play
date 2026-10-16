@@ -39,20 +39,22 @@ The benchmark calls `createMpmGate4Scene(0x4d504d34)` and uses the current
 1,500 Gate 4 unit domain (220 × 150 cells, 10 units per cell). The LiquidFun
 domain is expanded horizontally to 2,800 × 1,500 Gate 4 units to fit its wider
 fluid grids, with at least one source particle spacing between their right edge
-and the wall. This corresponds to a physical domain of 140 × 75 mm.
+and the wall. The visible LiquidFun domain is 140 × 75 mm.
 
 Physical Gate 4 positions use 20,000 units/m. Box2D runs in internal units at
 1,000 units/m (one internal unit represents 1 mm), so one Gate 4 unit maps to
-0.05 Box2D units. This keeps the 0.5 mm fluid radius and 1.5 mm pebble geometry
+0.05 Box2D units. This keeps the 1 mm fluid radius and 3 mm pebble geometry
 large relative to Box2D's fixed length tolerance. Internal Box2D coordinates
-and physical meters are deliberately distinct.
+and physical meters are deliberately distinct. The LiquidFun scene regrids its
+fluid particles to fit the specified 140 × 75 mm visible domain; the CPU/GPU
+MPM source scene is unchanged.
 
 Four static polygon walls have inner faces on the domain edges and extend 5 m
-(5,000 Box2D units) outward, with overlapping corners. The depth retains the
-previous wall-to-domain-width ratio. Their fixtures are not drawn, and
-particle/body rendering is clipped to the visible domain. This deep solid is
-intended to contain particles that cross the inner face; it cannot guarantee
-containment for arbitrarily large per-step displacements.
+(5,000 Box2D units) outward, with overlapping corners. This remains about 36
+visible-domain widths. Their fixtures are not drawn, and particle/body
+rendering is clipped to the visible domain. This deep solid is intended to
+contain particles that cross the inner face; it cannot guarantee containment
+for arbitrarily large per-step displacements.
 
 Gate 4 coordinates are y-down; Box2D engine coordinates are y-up:
 
@@ -68,30 +70,38 @@ Gate 4 coordinates are y-down; Box2D engine coordinates are y-up:
   timestep, or source scene counts.
 
 The source has 3,674 MPM nodes: 2,000 water, 1,500 oil, 150 pebble vertices,
-and 24 fracture nodes. Water uses the default `b2_waterParticle` flag; oil uses
+and 24 fracture nodes. The LiquidFun workload uses 2,000 water and 1,500 oil
+particles. Water uses the default `b2_waterParticle` flag; oil uses
 `b2_viscousParticle`. Both are created in the **same** LiquidFun particle
-system, with a shared radius of 0.5 mm and a shared particle mass of 0.05
+system, with a shared radius of 1 mm and a shared particle mass of 0.05
 simulation mass units. LiquidFun sets density at the particle-system level, so
 the oil particles also use mass 0.05; assigning oil mass 0.04 independently
 would require separate systems and remove water/oil particle-to-particle
 contacts. These are simulation mass units, not calibrated kilograms; because
 LiquidFun is two-dimensional, its density is per area rather than volumetric.
+LiquidFun represents fluid with radius-bearing particles and neighbor pressure
+and contact solves; triangular fluid elements are not required. The application
+does not override `pressureStrength`; the installed `liquidfun-wasm@7.0.0`
+default is 0.05. This is a solver coefficient, not a physical pressure unit.
+Observed bulk-volume contraction under gravity should be investigated by
+measuring and tuning pressure separately from the particle geometry.
 
-For the LiquidFun workload only, each fluid grid grows at the original
-18-unit spacing: water expands from 50 × 40 to 150 × 40 (6,000 particles),
-and oil from 50 × 30 to 150 × 30 (4,500 particles). Both fluid bands shift up
-by half a spacing so the widened water grid remains clear of the fracture
-nodes while the water/oil gap stays unchanged. Source velocities repeat
-horizontally to fill the wider grids. The 0.5 mm particle radius and shared
-mass stay fixed while each phase's placed area increases threefold. The grids
-extend to x = 2,782 Gate 4 units, leaving one source
-particle spacing to the expanded LiquidFun wall. The source Gate 4 scene,
-including all 3,674 mapped nodes, its 2,000/1,500 fluid-node counts, and its
-2,200 × 1,500 domain used by the CPU and GPU MLS-MPM pages, is unchanged.
+For the LiquidFun workload only, the source fluids are regridded at a 30-unit
+stride, which maps to 1.5 mm (75% of the 2 mm particle diameter): water uses
+87 columns × 23 rows for 2,000 particles, and oil uses 75 columns × 20 rows
+for 1,500 particles. The different row counts let both bands fit within the
+140 × 75 mm visible domain while keeping the particle spacing proportional to
+the radius. Oil particle centers start 2 mm below the top wall; water follows
+oil by one stride and remains clear of the fracture nodes. Source velocities
+are sampled across the source rows and repeated horizontally. The maximum
+fluid center x is 2,680 Gate 4 units (134 mm), within the 2,800-unit (140 mm)
+domain. The source Gate 4 scene, including all 3,674 mapped nodes, its
+2,000/1,500 fluid-node counts, and its 2,200 × 1,500 domain used by the CPU
+and GPU MLS-MPM pages, is unchanged.
 
 Each set of three pebble vertices initializes one dynamic Box2D polygon body,
 for 50 full-triangle collision shapes. Each is an equilateral triangle with
-1.5 mm sides and mass 0.045 simulation mass units. The initial polygon keeps
+3 mm sides and mass 0.045 simulation mass units. The initial polygon keeps
 the source triangle's center and scales its local vertices to the target edge
 length. Its center velocity is the vertex mean, and angular velocity is fitted
 to the scaled vertices and source velocities. Fixture density is derived from

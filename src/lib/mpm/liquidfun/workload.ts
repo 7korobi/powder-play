@@ -6,7 +6,6 @@ import {
 	GATE4_FRACTURE_PARTICLE_COUNT,
 	GATE4_FRACTURE_OBJECT_ID,
 	GATE4_GRID,
-	GATE4_LIQUID_PARTICLE_SPACING,
 	GATE4_LIQUID_START_X,
 	GATE4_OIL_PARTICLE_COLUMNS,
 	GATE4_OIL_PARTICLE_COUNT,
@@ -40,19 +39,26 @@ export const LIQUIDFUN_BOX2D_GRAVITY_UNITS_PER_SECOND_SQUARED: MpmVector2 = {
 		LIQUIDFUN_GATE4_ACCELERATION_UNITS_PER_METER_PER_SECOND_SQUARED
 };
 export const LIQUIDFUN_SHARED_PARTICLE_MASS = 0.05;
-export const LIQUIDFUN_PARTICLE_RADIUS_METERS = 0.5e-3;
+export const LIQUIDFUN_PARTICLE_RADIUS_METERS = 1e-3;
 export const LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS =
 	LIQUIDFUN_PARTICLE_RADIUS_METERS * LIQUIDFUN_BOX2D_UNITS_PER_METER;
 const LIQUIDFUN_PARTICLE_STRIDE_BOX2D_UNITS =
 	LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS * 2 * 0.75;
+export const LIQUIDFUN_PARTICLE_SPACING_METERS =
+	LIQUIDFUN_PARTICLE_STRIDE_BOX2D_UNITS / LIQUIDFUN_BOX2D_UNITS_PER_METER;
+export const LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS =
+	LIQUIDFUN_PARTICLE_SPACING_METERS * LIQUIDFUN_GATE4_UNITS_PER_METER;
 // LiquidFun estimates particle mass as density times the squared 0.75-diameter stride.
 export const LIQUIDFUN_SHARED_PARTICLE_DENSITY =
 	LIQUIDFUN_SHARED_PARTICLE_MASS / LIQUIDFUN_PARTICLE_STRIDE_BOX2D_UNITS ** 2;
-export const LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER = 3;
+export const LIQUIDFUN_WATER_PARTICLE_COUNT_MULTIPLIER = 1;
+export const LIQUIDFUN_OIL_PARTICLE_COUNT_MULTIPLIER = 1;
 export const LIQUIDFUN_WATER_PARTICLE_COUNT =
-	GATE4_WATER_PARTICLE_COUNT * LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER;
+	GATE4_WATER_PARTICLE_COUNT * LIQUIDFUN_WATER_PARTICLE_COUNT_MULTIPLIER;
 export const LIQUIDFUN_OIL_PARTICLE_COUNT =
-	GATE4_OIL_PARTICLE_COUNT * LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER;
+	GATE4_OIL_PARTICLE_COUNT * LIQUIDFUN_OIL_PARTICLE_COUNT_MULTIPLIER;
+export const LIQUIDFUN_WATER_PARTICLE_ROWS = 23;
+export const LIQUIDFUN_OIL_PARTICLE_ROWS = 20;
 export const LIQUIDFUN_SOLID_NODE_AREA_SQUARE_METERS =
 	GATE4_PARTICLE_AREA / LIQUIDFUN_GATE4_UNITS_PER_METER ** 2;
 export const LIQUIDFUN_SOLID_NODE_AREA_BOX2D_UNITS_SQUARED =
@@ -64,7 +70,7 @@ export const LIQUIDFUN_SOLID_NODE_RADIUS_BOX2D_UNITS =
 	LIQUIDFUN_SOLID_NODE_RADIUS_METERS * LIQUIDFUN_BOX2D_UNITS_PER_METER;
 export const LIQUIDFUN_SOLID_NODE_DENSITY =
 	GATE4_SOLID_PARTICLE_MASS / LIQUIDFUN_SOLID_NODE_AREA_BOX2D_UNITS_SQUARED;
-export const LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS = 1.5e-3;
+export const LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS = 3e-3;
 export const LIQUIDFUN_PEBBLE_EDGE_LENGTH_BOX2D_UNITS =
 	LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS * LIQUIDFUN_BOX2D_UNITS_PER_METER;
 export const LIQUIDFUN_PEBBLE_MASS = 0.045;
@@ -93,23 +99,30 @@ export const LIQUIDFUN_GRAVITY_WARMUP_STEPS = 64;
 export const LIQUIDFUN_SAMPLE_BATCHES = 12;
 export const LIQUIDFUN_STEPS_PER_BATCH = 8;
 
-// Keep the widened water footprint one grid row clear of the fracture nodes.
-// Shift both bands by half a spacing to keep water clear of the fracture network.
-const LIQUIDFUN_FLUID_VERTICAL_OFFSET = -GATE4_LIQUID_PARTICLE_SPACING / 2;
 const LIQUIDFUN_WATER_GRID = {
-	columns: Math.ceil(LIQUIDFUN_WATER_PARTICLE_COUNT / GATE4_WATER_PARTICLE_ROWS),
-	rows: GATE4_WATER_PARTICLE_ROWS
+	columns: Math.ceil(LIQUIDFUN_WATER_PARTICLE_COUNT / LIQUIDFUN_WATER_PARTICLE_ROWS),
+	rows: LIQUIDFUN_WATER_PARTICLE_ROWS
 } as const;
 const LIQUIDFUN_OIL_GRID = {
-	rows: GATE4_OIL_PARTICLE_ROWS,
-	columns: Math.ceil(LIQUIDFUN_OIL_PARTICLE_COUNT / GATE4_OIL_PARTICLE_ROWS)
+	rows: LIQUIDFUN_OIL_PARTICLE_ROWS,
+	columns: Math.ceil(LIQUIDFUN_OIL_PARTICLE_COUNT / LIQUIDFUN_OIL_PARTICLE_ROWS)
 } as const;
+const LIQUIDFUN_OIL_START_Y =
+	2 * LIQUIDFUN_PARTICLE_RADIUS_METERS * LIQUIDFUN_GATE4_UNITS_PER_METER;
+const LIQUIDFUN_WATER_START_Y =
+	LIQUIDFUN_OIL_START_Y +
+	LIQUIDFUN_OIL_GRID.rows * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS;
 const LIQUIDFUN_FLUID_RIGHT_EDGE =
 	GATE4_LIQUID_START_X +
 	(Math.max(LIQUIDFUN_WATER_GRID.columns, LIQUIDFUN_OIL_GRID.columns) - 1) *
-		GATE4_LIQUID_PARTICLE_SPACING;
-const LIQUIDFUN_DOMAIN_RIGHT_MARGIN = GATE4_LIQUID_PARTICLE_SPACING;
-const LIQUIDFUN_BASE_DOMAIN_WIDTH = GATE4_GRID.cellsX * GATE4_GRID.cellSize;
+		LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS;
+const LIQUIDFUN_DOMAIN_RIGHT_MARGIN = LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS;
+const LIQUIDFUN_MINIMUM_DOMAIN_WIDTH_MILLIMETERS = 140;
+const LIQUIDFUN_BASE_DOMAIN_WIDTH = Math.max(
+	GATE4_GRID.cellsX * GATE4_GRID.cellSize,
+	(LIQUIDFUN_MINIMUM_DOMAIN_WIDTH_MILLIMETERS * LIQUIDFUN_GATE4_UNITS_PER_METER) /
+		1_000
+);
 
 export const LIQUIDFUN_GATE4_DOMAIN = {
 	width:
@@ -181,7 +194,7 @@ function expandLiquidParticles(
 	sourceRows: number,
 	targetParticleCount: number,
 	targetRows: number,
-	verticalOffset: number
+	targetStartY: number
 ): readonly MpmParticle[] {
 	if (sourceParticles.length !== sourceColumns * sourceRows) {
 		throw new Error('LiquidFun source particle count does not match its grid dimensions.');
@@ -191,10 +204,9 @@ function expandLiquidParticles(
 		targetParticleCount < targetRows ||
 		!Number.isSafeInteger(targetRows) ||
 		targetRows < 2 ||
-		targetRows !== sourceRows ||
-		!Number.isFinite(verticalOffset)
+		!Number.isFinite(targetStartY)
 	) {
-		throw new RangeError('LiquidFun fluid grids must expand horizontally without changing rows.');
+		throw new RangeError('LiquidFun fluid grids must have finite origins and at least two rows.');
 	}
 	const firstSourceParticle = sourceParticles[0];
 	if (firstSourceParticle === undefined) {
@@ -207,10 +219,11 @@ function expandLiquidParticles(
 		const rowEndIndex = Math.floor(((row + 1) * targetParticleCount) / targetRows);
 		const particlesInRow = rowEndIndex - rowStartIndex;
 		const columnOffset =
-			((targetColumns - particlesInRow) * GATE4_LIQUID_PARTICLE_SPACING) / 2;
+			((targetColumns - particlesInRow) * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS) / 2;
+		const sourceRow = Math.floor((row * sourceRows) / targetRows);
 		for (let column = 0; column < particlesInRow; column += 1) {
 			const sourceParticle =
-				sourceParticles[row * sourceColumns + (column % sourceColumns)];
+				sourceParticles[sourceRow * sourceColumns + (column % sourceColumns)];
 			if (sourceParticle === undefined) {
 				throw new Error('LiquidFun expansion could not find a source particle.');
 			}
@@ -220,11 +233,8 @@ function expandLiquidParticles(
 					x:
 						firstSourceParticle.position.x +
 						columnOffset +
-						column * GATE4_LIQUID_PARTICLE_SPACING,
-					y:
-						firstSourceParticle.position.y +
-						verticalOffset +
-						row * GATE4_LIQUID_PARTICLE_SPACING
+						column * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS,
+					y: targetStartY + row * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS
 				}
 			});
 		}
@@ -388,7 +398,7 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 			GATE4_WATER_PARTICLE_ROWS,
 			LIQUIDFUN_WATER_PARTICLE_COUNT,
 			LIQUIDFUN_WATER_GRID.rows,
-			LIQUIDFUN_FLUID_VERTICAL_OFFSET
+			LIQUIDFUN_WATER_START_Y
 		),
 		oilParticles: expandLiquidParticles(
 			sourceOilParticles,
@@ -396,7 +406,7 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 			GATE4_OIL_PARTICLE_ROWS,
 			LIQUIDFUN_OIL_PARTICLE_COUNT,
 			LIQUIDFUN_OIL_GRID.rows,
-			LIQUIDFUN_FLUID_VERTICAL_OFFSET
+			LIQUIDFUN_OIL_START_Y
 		),
 		pebbleNodes,
 		pebbleGroups,
