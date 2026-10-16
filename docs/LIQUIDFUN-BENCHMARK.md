@@ -82,8 +82,8 @@ physical response.
 
 The live LiquidFun route executes the WASM engine described above and exposes
 pause/resume, single-step, reset, manual 2D gravity (each component ranges to
-±10000 Gate 4 units/s², initially (0, 0)), horizontal oscillation (default
-amplitude ±1000 Gate 4 units/s² at 0.16 Hz, adjustable up to ±10000), requested
+±50000 Gate 4 units/s², initially (0, 0)), horizontal oscillation (default
+amplitude ±1000 Gate 4 units/s² at 0.16 Hz, adjustable up to ±50000), requested
 simulation speed (default 0.5×), render mode, render-target FPS (default 90),
 and live step/backlog metrics. The oscillation is added to X gravity and
 integrated as the average acceleration over each fixed step using simulation
