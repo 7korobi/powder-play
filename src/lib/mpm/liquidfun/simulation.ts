@@ -39,10 +39,10 @@ import {
 	type LiquidFunFractureBondSeed,
 	type LiquidFunVector
 } from './workload.js';
+import { createLiquidFunWallDefinitions } from './wall-geometry.js';
 
 const B2_STATIC_BODY = 0;
 const B2_DYNAMIC_BODY = 2;
-const WALL_THICKNESS_METERS = 0.1;
 
 export type LiquidFunRenderMode = 'surface' | 'particles';
 
@@ -408,28 +408,7 @@ function breakStretchedFractureBonds(
 function createStaticWalls(module: LiquidFunModule, world: B2World): number {
 	const width = LIQUIDFUN_BOX2D_DOMAIN_METERS.width;
 	const height = LIQUIDFUN_BOX2D_DOMAIN_METERS.height;
-	const walls = [
-		{
-			position: { x: -WALL_THICKNESS_METERS, y: height / 2 },
-			halfWidth: WALL_THICKNESS_METERS,
-			halfHeight: height / 2 + WALL_THICKNESS_METERS
-		},
-		{
-			position: { x: width + WALL_THICKNESS_METERS, y: height / 2 },
-			halfWidth: WALL_THICKNESS_METERS,
-			halfHeight: height / 2 + WALL_THICKNESS_METERS
-		},
-		{
-			position: { x: width / 2, y: -WALL_THICKNESS_METERS },
-			halfWidth: width / 2 + WALL_THICKNESS_METERS,
-			halfHeight: WALL_THICKNESS_METERS
-		},
-		{
-			position: { x: width / 2, y: height + WALL_THICKNESS_METERS },
-			halfWidth: width / 2 + WALL_THICKNESS_METERS,
-			halfHeight: WALL_THICKNESS_METERS
-		}
-	] as const;
+	const walls = createLiquidFunWallDefinitions(width, height);
 
 	for (const wall of walls) {
 		const body = createBody(
@@ -781,47 +760,53 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 					(width - LIQUIDFUN_BOX2D_DOMAIN_METERS.width * pixelsPerMeter) / 2;
 				const offsetY =
 					(height - LIQUIDFUN_BOX2D_DOMAIN_METERS.height * pixelsPerMeter) / 2;
+				const domainWidth = LIQUIDFUN_BOX2D_DOMAIN_METERS.width * pixelsPerMeter;
+				const domainHeight = LIQUIDFUN_BOX2D_DOMAIN_METERS.height * pixelsPerMeter;
 
-				drawParticles(
-					module,
-					context,
-					activeParticleSystem,
-					workload.waterParticles.length + workload.oilParticles.length,
-					renderMode,
-					width,
-					height,
-					pixelsPerMeter,
-					offsetX,
-					offsetY
-				);
-				drawPebbleTriangles(
-					context,
-					pebbleTriangleBodies,
-					width,
-					height,
-					pixelsPerMeter,
-					offsetX,
-					offsetY
-				);
-				drawFractureNetwork(
-					context,
-					fractureNodeBodies,
-					fractureBondJoints,
-					width,
-					height,
-					pixelsPerMeter,
-					offsetX,
-					offsetY
-				);
+				context.save();
+				try {
+					context.beginPath();
+					context.rect(offsetX, offsetY, domainWidth, domainHeight);
+					context.clip();
+
+					drawParticles(
+						module,
+						context,
+						activeParticleSystem,
+						workload.waterParticles.length + workload.oilParticles.length,
+						renderMode,
+						width,
+						height,
+						pixelsPerMeter,
+						offsetX,
+						offsetY
+					);
+					drawPebbleTriangles(
+						context,
+						pebbleTriangleBodies,
+						width,
+						height,
+						pixelsPerMeter,
+						offsetX,
+						offsetY
+					);
+					drawFractureNetwork(
+						context,
+						fractureNodeBodies,
+						fractureBondJoints,
+						width,
+						height,
+						pixelsPerMeter,
+						offsetX,
+						offsetY
+					);
+				} finally {
+					context.restore();
+				}
 
 				context.strokeStyle = '#d6e3f1';
 				context.lineWidth = 1;
-				context.strokeRect(
-					offsetX,
-					offsetY,
-					LIQUIDFUN_BOX2D_DOMAIN_METERS.width * pixelsPerMeter,
-					LIQUIDFUN_BOX2D_DOMAIN_METERS.height * pixelsPerMeter
-				);
+				context.strokeRect(offsetX, offsetY, domainWidth, domainHeight);
 			},
 			dispose(): void {
 				if (disposed) return;

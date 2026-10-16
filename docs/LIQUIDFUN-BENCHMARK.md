@@ -39,7 +39,12 @@ The benchmark calls `createMpmGate4Scene(0x4d504d34)` and uses the current
 1,500 Gate 4 unit domain (220 × 150 cells, 10 units per cell). The LiquidFun
 Box2D domain is expanded horizontally to 2,800 × 1,500 units (28 × 15 m) to
 fit its wider fluid grids, with at least one source particle spacing between
-their right edge and the wall.
+their right edge and the wall. Four static polygon walls have inner faces on
+the domain edges and extend 1,000 m outward, with overlapping corners. Their
+fixtures are not drawn, and particle/body rendering is clipped to the visible
+domain. This deep solid is intended to contain particles that cross the inner
+face; it cannot guarantee containment for arbitrarily large per-step
+displacements.
 
 Gate 4 coordinates are y-down; Box2D coordinates are y-up:
 
@@ -96,7 +101,7 @@ physical response.
 
 The live LiquidFun route executes the WASM engine described above and exposes
 pause/resume, single-step, reset, manual 2D gravity (each component ranges to
-±125000 Gate 4 units/s², initially (0, 0)), horizontal oscillation (default
+±250000 Gate 4 units/s², initially (0, 0)), horizontal oscillation (default
 amplitude ±1000 Gate 4 units/s² at 0.16 Hz, adjustable up to ±250000), requested
 simulation speed (default 0.5×), render mode, render-target FPS (default 90),
 and live step/backlog metrics. The oscillation is added to X gravity and
@@ -108,10 +113,10 @@ requested speed from producing an unbounded synchronous catch-up loop. If the
 browser cannot keep up, pending simulation time is shown and can be discarded
 while paused.
 
-The manual-gravity limit is a provisional 125,000-unit/s² test ceiling after
-wall breakthrough was observed at 250,000; it is not a validated safe bound.
-Horizontal oscillation remains a separate input with a 250,000-unit/s² limit.
-Disable oscillation when testing manual gravity in isolation.
+The 250,000 manual-gravity range is retained for further wall experiments, not
+as a stability guarantee. Leakage was reported around 30,000 with the previous
+0.2 m-thick walls. Horizontal oscillation is a separate input added to X
+gravity; isolate it from manual-gravity tests by setting its amplitude to zero.
 
 The CPU and GPU MLS-MPM pages remain a separate same-equation numerical
 comparison. LiquidFun is a behavioral reference for contact, waves, settling,

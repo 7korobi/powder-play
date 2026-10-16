@@ -15,6 +15,7 @@
 		type LiquidFunRenderMode,
 		type LiquidFunSimulation
 	} from '#lib/mpm/liquidfun/simulation.js';
+	import { LIQUIDFUN_WALL_THICKNESS_METERS } from '#lib/mpm/liquidfun/wall-geometry.js';
 	import {
 		LIQUIDFUN_BOX2D_DOMAIN_METERS,
 		LIQUIDFUN_DT_SECONDS,
@@ -34,7 +35,7 @@
 	const MAX_STEPS_PER_FRAME = 8;
 	const MAX_PHYSICS_FRAME_BUDGET_MS = 8;
 	const SIMULATION_SPEED_OPTIONS = [0.25, 0.5, 1, 2, 4, 8, 16, 32] as const;
-	const MANUAL_GRAVITY_COMPONENT_LIMIT = 125_000;
+	const MANUAL_GRAVITY_COMPONENT_LIMIT = 250_000;
 	const DEFAULT_LIQUIDFUN_OSCILLATION_AMPLITUDE = 1_000;
 	const MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE = 250_000;
 	const DEFAULT_RENDER_FPS: MpmRenderFps = 90;
@@ -445,8 +446,8 @@
 					/>
 				</label>
 				<p class="control-note">
-					Manual gravity defaults to (0, 0); its ±125000 limit is provisional. Disable horizontal
-					oscillation to isolate manual-gravity tests.
+					Manual gravity defaults to (0, 0). The ±{MANUAL_GRAVITY_COMPONENT_LIMIT.toLocaleString()}
+					range is experimental, not a safe-limit guarantee.
 				</p>
 			</fieldset>
 
@@ -590,6 +591,10 @@
 					<li>
 						{LIQUIDFUN_GATE4_DOMAIN.width} × {LIQUIDFUN_GATE4_DOMAIN.height} Gate 4 units ·
 						{LIQUIDFUN_BOX2D_DOMAIN_METERS.width} × {LIQUIDFUN_BOX2D_DOMAIN_METERS.height} m Box2D world
+					</li>
+					<li>
+						{LIQUIDFUN_WALL_THICKNESS_METERS.toLocaleString()} m of static wall depth beyond each visible
+						domain edge
 					</li>
 					<li>
 						dt = 1/{Math.round(1 / LIQUIDFUN_DT_SECONDS)} s · scale {LIQUIDFUN_GATE4_UNITS_PER_METER}
