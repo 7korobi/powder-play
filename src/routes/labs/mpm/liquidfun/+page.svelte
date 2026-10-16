@@ -32,6 +32,7 @@
 		LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS,
 		LIQUIDFUN_PEBBLE_MASS,
 		LIQUIDFUN_PHYSICAL_DOMAIN_METERS,
+		LIQUIDFUN_PRESSURE_STRENGTH,
 		LIQUIDFUN_SCENE_SEED,
 		LIQUIDFUN_SHARED_PARTICLE_MASS,
 		LIQUIDFUN_VELOCITY_ITERATIONS,
@@ -625,6 +626,10 @@
 						{(LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS * 1_000).toFixed(1)} mm / mass
 						{LIQUIDFUN_PEBBLE_MASS} simulation units · fracture threshold
 						{(LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN * 100).toFixed(0)}%
+					</li>
+					<li>
+						Pressure strength {LIQUIDFUN_PRESSURE_STRENGTH} · one shared particle-system coefficient for
+						water and oil
 					</li>
 				</ul>
 			</div>

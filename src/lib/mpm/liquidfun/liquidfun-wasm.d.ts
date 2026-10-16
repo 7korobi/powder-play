@@ -66,6 +66,7 @@ declare module 'liquidfun-wasm' {
 		density: number;
 		gravityScale: number;
 		radius: number;
+		pressureStrength: number;
 		delete?(): void;
 	}
 

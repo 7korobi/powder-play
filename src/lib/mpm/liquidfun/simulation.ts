@@ -37,6 +37,7 @@ import {
 	LIQUIDFUN_SOLID_NODE_RADIUS_BOX2D_UNITS,
 	LIQUIDFUN_SHARED_PARTICLE_MASS,
 	LIQUIDFUN_PHYSICAL_DOMAIN_METERS,
+	LIQUIDFUN_PRESSURE_STRENGTH,
 	LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS,
 	LIQUIDFUN_VELOCITY_ITERATIONS,
 	mapGate4AccelerationToBox2D,
@@ -648,6 +649,7 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 		const particleSystemDefinition: B2ParticleSystemDef =
 			new module.b2ParticleSystemDef();
 		particleSystemDefinition.density = LIQUIDFUN_SHARED_PARTICLE_DENSITY;
+		particleSystemDefinition.pressureStrength = LIQUIDFUN_PRESSURE_STRENGTH;
 		particleSystemDefinition.gravityScale = 1;
 		particleSystemDefinition.radius = LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS;
 		try {

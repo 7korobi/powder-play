@@ -83,10 +83,11 @@ contacts. These are simulation mass units, not calibrated kilograms; because
 LiquidFun is two-dimensional, its density is per area rather than volumetric.
 LiquidFun represents fluid with radius-bearing particles and neighbor pressure
 and contact solves; triangular fluid elements are not required. The application
-does not override `pressureStrength`; the installed `liquidfun-wasm@7.0.0`
-default is 0.05. This is a solver coefficient, not a physical pressure unit.
-Observed bulk-volume contraction under gravity should be investigated by
-measuring and tuning pressure separately from the particle geometry.
+sets the shared particle-system `pressureStrength` to 0.5, ten times the
+installed `liquidfun-wasm@7.0.0` default of 0.05. This is a solver coefficient,
+not a physical pressure unit or a per-material setting. The increased value is
+a tuning experiment; check volume retention, oscillation, and stability under
+the target forcing rather than treating it as a calibrated material parameter.
 
 For the LiquidFun workload only, the source fluids are regridded at a 30-unit
 stride, which maps to 1.5 mm (75% of the 2 mm particle diameter): water uses
