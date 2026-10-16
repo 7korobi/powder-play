@@ -17,16 +17,22 @@
 	} from '#lib/mpm/liquidfun/simulation.js';
 	import { LIQUIDFUN_WALL_THICKNESS_METERS } from '#lib/mpm/liquidfun/wall-geometry.js';
 	import {
-		LIQUIDFUN_BOX2D_DOMAIN_METERS,
+		LIQUIDFUN_BOX2D_DOMAIN_UNITS,
+		LIQUIDFUN_BOX2D_UNITS_PER_METER,
 		LIQUIDFUN_DT_SECONDS,
 		LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN,
 		LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER,
 		LIQUIDFUN_GATE4_DOMAIN,
+		LIQUIDFUN_GATE4_ACCELERATION_UNITS_PER_METER_PER_SECOND_SQUARED,
 		LIQUIDFUN_GATE4_UNITS_PER_METER,
 		LIQUIDFUN_OIL_PARTICLE_COUNT,
 		LIQUIDFUN_PACKAGE_VERSION,
+		LIQUIDFUN_PARTICLE_RADIUS_METERS,
+		LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS,
+		LIQUIDFUN_PEBBLE_MASS,
+		LIQUIDFUN_PHYSICAL_DOMAIN_METERS,
 		LIQUIDFUN_SCENE_SEED,
-		LIQUIDFUN_SHARED_PARTICLE_DENSITY,
+		LIQUIDFUN_SHARED_PARTICLE_MASS,
 		LIQUIDFUN_VELOCITY_ITERATIONS,
 		LIQUIDFUN_POSITION_ITERATIONS,
 		LIQUIDFUN_WATER_PARTICLE_COUNT
@@ -35,9 +41,9 @@
 	const MAX_STEPS_PER_FRAME = 8;
 	const MAX_PHYSICS_FRAME_BUDGET_MS = 8;
 	const SIMULATION_SPEED_OPTIONS = [0.25, 0.5, 1, 2, 4, 8, 16, 32] as const;
-	const MANUAL_GRAVITY_COMPONENT_LIMIT = 250_000;
-	const DEFAULT_LIQUIDFUN_OSCILLATION_AMPLITUDE = 1_000;
-	const MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE = 250_000;
+	const MANUAL_GRAVITY_COMPONENT_LIMIT = 999;
+	const DEFAULT_LIQUIDFUN_OSCILLATION_AMPLITUDE = 999;
+	const MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE = 999;
 	const DEFAULT_RENDER_FPS: MpmRenderFps = 90;
 	const METRICS_INTERVAL_MS = 500;
 	const framePacer = new MpmFramePacer();
@@ -426,7 +432,7 @@
 						type="range"
 						min={-MANUAL_GRAVITY_COMPONENT_LIMIT}
 						max={MANUAL_GRAVITY_COMPONENT_LIMIT}
-						step="5"
+						step="1"
 						bind:value={gravityX}
 						oninput={setGravity}
 						disabled={phase !== 'ready'}
@@ -439,15 +445,16 @@
 						type="range"
 						min={-MANUAL_GRAVITY_COMPONENT_LIMIT}
 						max={MANUAL_GRAVITY_COMPONENT_LIMIT}
-						step="5"
+						step="1"
 						bind:value={gravityY}
 						oninput={setGravity}
 						disabled={phase !== 'ready'}
 					/>
 				</label>
 				<p class="control-note">
-					Manual gravity defaults to (0, 0). The ±{MANUAL_GRAVITY_COMPONENT_LIMIT.toLocaleString()}
-					range is experimental, not a safe-limit guarantee.
+					Manual gravity defaults to (0, 0). {LIQUIDFUN_GATE4_ACCELERATION_UNITS_PER_METER_PER_SECOND_SQUARED}
+					Gate 4 units/s² = 1 m/s², so 980 is approximately 1G. The configured range is experimental,
+					not a safe-limit guarantee.
 				</p>
 			</fieldset>
 
@@ -460,7 +467,7 @@
 						type="range"
 						min="0"
 						max={MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE}
-						step="10"
+						step="1"
 						bind:value={horizontalOscillationAmplitude}
 						oninput={setGravity}
 						disabled={phase !== 'ready'}
@@ -477,10 +484,12 @@
 				>
 					{horizontalOscillationAmplitude > 0
 						? 'Stop horizontal oscillation'
-						: 'Start horizontal oscillation (±1000)'}
+						: '						Start horizontal oscillation (±{DEFAULT_LIQUIDFUN_OSCILLATION_AMPLITUDE})'}
 				</button>
 				<p class="control-note">
 					Added to manual X gravity; amplitude can reach ±{MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE}
+					Gate 4 units/s² (about ±{(MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE /
+						LIQUIDFUN_GATE4_ACCELERATION_UNITS_PER_METER_PER_SECOND_SQUARED).toFixed(2)} m/s²)
 					and is synchronized to simulation time. Set it to 0 to disable.
 				</p>
 			</fieldset>
@@ -590,22 +599,27 @@
 					</li>
 					<li>
 						{LIQUIDFUN_GATE4_DOMAIN.width} × {LIQUIDFUN_GATE4_DOMAIN.height} Gate 4 units ·
-						{LIQUIDFUN_BOX2D_DOMAIN_METERS.width} × {LIQUIDFUN_BOX2D_DOMAIN_METERS.height} m Box2D world
+						{(LIQUIDFUN_PHYSICAL_DOMAIN_METERS.width * 1_000).toFixed(0)} ×
+						{(LIQUIDFUN_PHYSICAL_DOMAIN_METERS.height * 1_000).toFixed(0)} mm visible domain
 					</li>
 					<li>
 						{LIQUIDFUN_WALL_THICKNESS_METERS.toLocaleString()} m of static wall depth beyond each visible
-						domain edge
+						domain edge · {LIQUIDFUN_BOX2D_DOMAIN_UNITS.width} ×
+						{LIQUIDFUN_BOX2D_DOMAIN_UNITS.height} Box2D engine units
 					</li>
 					<li>
-						dt = 1/{Math.round(1 / LIQUIDFUN_DT_SECONDS)} s · scale {LIQUIDFUN_GATE4_UNITS_PER_METER}
-						Gate 4 units / m
+						dt = 1/{Math.round(1 / LIQUIDFUN_DT_SECONDS)} s · position scale {LIQUIDFUN_GATE4_UNITS_PER_METER}
+						Gate 4 units / m · Box2D scale {LIQUIDFUN_BOX2D_UNITS_PER_METER} units / m
 					</li>
 					<li>
 						{LIQUIDFUN_VELOCITY_ITERATIONS} velocity + {LIQUIDFUN_POSITION_ITERATIONS} position
 						iterations · particle iterations {simulation?.particleIterations ?? '…'}
 					</li>
 					<li>
-						Shared particle-system density {LIQUIDFUN_SHARED_PARTICLE_DENSITY} · fracture threshold
+						Fluid radius {(LIQUIDFUN_PARTICLE_RADIUS_METERS * 1_000).toFixed(1)} mm · shared water/oil
+						particle mass {LIQUIDFUN_SHARED_PARTICLE_MASS} simulation units · pebble edge
+						{(LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS * 1_000).toFixed(1)} mm / mass
+						{LIQUIDFUN_PEBBLE_MASS} simulation units · fracture threshold
 						{(LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN * 100).toFixed(0)}%
 					</li>
 				</ul>
@@ -622,9 +636,10 @@
 				distance joints. Canvas2D is only the renderer.
 			</li>
 			<li>
-				The water and oil flags share one LiquidFun particle system and its density/radius settings.
-				The triangular pebbles are rigid approximations, not deformable MLS-MPM triangles. Do not
-				interpret their paths as a matched-physics comparison.
+				Water and oil use separate LiquidFun particle flags in one particle system, so both use the same
+				0.5 mm radius and 0.05 simulation mass units and retain mutual particle collisions. The triangular pebbles are
+				rigid approximations, not deformable MLS-MPM triangles. Do not interpret their paths as a
+				matched-physics comparison.
 			</li>
 			<li>
 				Use the CPU MLS-MPM page at <a href="/labs/mpm/reference">/labs/mpm/reference</a> as the

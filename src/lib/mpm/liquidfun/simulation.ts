@@ -17,22 +17,29 @@ import type { MpmParticle, MpmVector2 } from '../reference/solver.js';
 import { readLiquidFunParticlePosition } from './particle-buffer.js';
 import {
 	createLiquidFunGate4Workload,
-	LIQUIDFUN_BOX2D_DOMAIN_METERS,
-	LIQUIDFUN_BOX2D_GRAVITY,
+	LIQUIDFUN_BOX2D_DOMAIN_UNITS,
+	LIQUIDFUN_BOX2D_GRAVITY_UNITS_PER_SECOND_SQUARED,
+	LIQUIDFUN_BOX2D_UNITS_PER_METER,
 	LIQUIDFUN_DT_SECONDS,
 	LIQUIDFUN_GATE4_DOMAIN,
 	LIQUIDFUN_GATE4_GRAVITY,
+	LIQUIDFUN_GATE4_ACCELERATION_UNITS_PER_METER_PER_SECOND_SQUARED,
 	LIQUIDFUN_GATE4_UNITS_PER_METER,
 	LIQUIDFUN_FRACTURE_BOND_DAMPING,
 	LIQUIDFUN_FRACTURE_BOND_STIFFNESS,
 	LIQUIDFUN_PARTICLE_RADIUS_METERS,
+	LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS,
+	LIQUIDFUN_PEBBLE_MASS,
 	scaleLiquidFunPebbleLocalVertices,
 	LIQUIDFUN_POSITION_ITERATIONS,
 	LIQUIDFUN_SHARED_PARTICLE_DENSITY,
-	LIQUIDFUN_SOLID_NODE_AREA_SQUARE_METERS,
 	LIQUIDFUN_SOLID_NODE_DENSITY,
-	LIQUIDFUN_SOLID_NODE_RADIUS_METERS,
+	LIQUIDFUN_SOLID_NODE_RADIUS_BOX2D_UNITS,
+	LIQUIDFUN_SHARED_PARTICLE_MASS,
+	LIQUIDFUN_PHYSICAL_DOMAIN_METERS,
+	LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS,
 	LIQUIDFUN_VELOCITY_ITERATIONS,
+	mapGate4AccelerationToBox2D,
 	mapGate4PositionToBox2D,
 	mapGate4VelocityToBox2D,
 	type LiquidFunBondSeed,
@@ -190,7 +197,7 @@ function addSolidNodeFixture(module: LiquidFunModule, body: B2Body): void {
 	const shape: B2CircleShape = new module.b2CircleShape();
 	let fixture: B2Fixture | undefined;
 	try {
-		shape.m_radius = LIQUIDFUN_SOLID_NODE_RADIUS_METERS;
+		shape.m_radius = LIQUIDFUN_SOLID_NODE_RADIUS_BOX2D_UNITS;
 		fixture = body.CreateFixture(shape, LIQUIDFUN_SOLID_NODE_DENSITY);
 		if (!fixture) {
 			throw new Error('LiquidFun did not create a Gate 4 solid-node fixture.');
@@ -278,8 +285,11 @@ function createPebbleTriangleBody(
 		}
 		twiceArea += current.x * next.y - next.x * current.y;
 	}
-	const areaSquareMeters = Math.abs(twiceArea) / 2;
-	if (!Number.isFinite(areaSquareMeters) || areaSquareMeters <= Number.EPSILON) {
+	const areaBox2DUnitsSquared = Math.abs(twiceArea) / 2;
+	if (
+		!Number.isFinite(areaBox2DUnitsSquared) ||
+		areaBox2DUnitsSquared <= Number.EPSILON
+	) {
 		throw new RangeError('A Gate 4 pebble triangle must have finite, nonzero area.');
 	}
 
@@ -299,11 +309,8 @@ function createPebbleTriangleBody(
 		const [vertices, destroy] = module.pointsToVec2Array(localVertices);
 		destroyVertices = destroy;
 		shape.Set(vertices, localVertices.length);
-		const triangleMass =
-			LIQUIDFUN_SOLID_NODE_AREA_SQUARE_METERS *
-			LIQUIDFUN_SOLID_NODE_DENSITY *
-			nodes.length;
-		fixture = body.CreateFixture(shape, triangleMass / areaSquareMeters);
+		const triangleMass = LIQUIDFUN_PEBBLE_MASS;
+		fixture = body.CreateFixture(shape, triangleMass / areaBox2DUnitsSquared);
 		if (!fixture) {
 			throw new Error('LiquidFun did not create a Gate 4 pebble polygon fixture.');
 		}
@@ -344,7 +351,7 @@ function createBondJoint(
 	const definition: B2DistanceJointDef = new module.b2DistanceJointDef();
 	try {
 		definition.Initialize(firstBody, secondBody, firstAnchor, secondAnchor);
-		definition.length = bond.restLengthMeters;
+		definition.length = bond.restLengthBox2DUnits;
 		definition.stiffness = stiffness;
 		definition.damping = damping;
 		definition.collideConnected = false;
@@ -392,8 +399,10 @@ function breakStretchedFractureBonds(
 			throw new RangeError('A Gate 4 fracture bond must identify existing nodes.');
 		}
 		const tensileStrain =
-			Math.max(0, bodyDistance(firstBody, secondBody) - bond.restLengthMeters) /
-			bond.restLengthMeters;
+			Math.max(
+				0,
+				bodyDistance(firstBody, secondBody) - bond.restLengthBox2DUnits
+			) / bond.restLengthBox2DUnits;
 		if (tensileStrain >= bond.failureStrain) {
 			world.DestroyJoint(joint);
 			bond.joint = null;
@@ -406,8 +415,8 @@ function breakStretchedFractureBonds(
 }
 
 function createStaticWalls(module: LiquidFunModule, world: B2World): number {
-	const width = LIQUIDFUN_BOX2D_DOMAIN_METERS.width;
-	const height = LIQUIDFUN_BOX2D_DOMAIN_METERS.height;
+	const width = LIQUIDFUN_BOX2D_DOMAIN_UNITS.width;
+	const height = LIQUIDFUN_BOX2D_DOMAIN_UNITS.height;
 	const walls = createLiquidFunWallDefinitions(width, height);
 
 	for (const wall of walls) {
@@ -453,13 +462,13 @@ function pointOnCanvas(
 	position: LiquidFunVector,
 	width: number,
 	height: number,
-	pixelsPerMeter: number,
+	pixelsPerBox2DUnit: number,
 	offsetX: number,
 	offsetY: number
 ): LiquidFunVector {
 	return {
-		x: offsetX + position.x * pixelsPerMeter,
-		y: height - offsetY - position.y * pixelsPerMeter
+		x: offsetX + position.x * pixelsPerBox2DUnit,
+		y: height - offsetY - position.y * pixelsPerBox2DUnit
 	};
 }
 
@@ -471,7 +480,7 @@ function drawParticles(
 	renderMode: LiquidFunRenderMode,
 	width: number,
 	height: number,
-	pixelsPerMeter: number,
+	pixelsPerBox2DUnit: number,
 	offsetX: number,
 	offsetY: number
 ): void {
@@ -482,8 +491,14 @@ function drawParticles(
 	const count = Math.min(particleCount, particleSystem.GetParticleCount());
 	const radius =
 		renderMode === 'surface'
-			? Math.max(2.2, LIQUIDFUN_PARTICLE_RADIUS_METERS * pixelsPerMeter * 1.35)
-			: Math.max(1.8, LIQUIDFUN_PARTICLE_RADIUS_METERS * pixelsPerMeter * 0.48);
+			? Math.max(
+					2.2,
+					LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS * pixelsPerBox2DUnit * 1.35
+				)
+			: Math.max(
+					1.8,
+					LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS * pixelsPerBox2DUnit * 0.48
+				);
 	for (let index = 0; index < count; index += 1) {
 		const position = readLiquidFunParticlePosition(
 			positionBufferHeap,
@@ -494,7 +509,7 @@ function drawParticles(
 			position,
 			width,
 			height,
-			pixelsPerMeter,
+			pixelsPerBox2DUnit,
 			offsetX,
 			offsetY
 		);
@@ -522,7 +537,7 @@ function drawPebbleTriangles(
 	triangleBodies: readonly PebbleTriangleBody[],
 	width: number,
 	height: number,
-	pixelsPerMeter: number,
+	pixelsPerBox2DUnit: number,
 	offsetX: number,
 	offsetY: number
 ): void {
@@ -542,7 +557,7 @@ function drawPebbleTriangles(
 				},
 				width,
 				height,
-				pixelsPerMeter,
+				pixelsPerBox2DUnit,
 				offsetX,
 				offsetY
 			)
@@ -569,7 +584,7 @@ function drawFractureNetwork(
 	fractureBonds: readonly FractureBondJoint[],
 	width: number,
 	height: number,
-	pixelsPerMeter: number,
+	pixelsPerBox2DUnit: number,
 	offsetX: number,
 	offsetY: number
 ): void {
@@ -578,7 +593,7 @@ function drawFractureNetwork(
 			readBodyPosition(body),
 			width,
 			height,
-			pixelsPerMeter,
+			pixelsPerBox2DUnit,
 			offsetX,
 			offsetY
 		)
@@ -598,7 +613,10 @@ function drawFractureNetwork(
 	}
 	context.stroke();
 	context.fillStyle = '#f5d77a';
-	const radius = Math.max(1.5, LIQUIDFUN_SOLID_NODE_RADIUS_METERS * pixelsPerMeter * 0.65);
+	const radius = Math.max(
+		1.5,
+		LIQUIDFUN_SOLID_NODE_RADIUS_BOX2D_UNITS * pixelsPerBox2DUnit * 0.65
+	);
 	for (const point of points) {
 		context.beginPath();
 		context.arc(point.x, point.y, radius, 0, Math.PI * 2);
@@ -610,7 +628,10 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 	const workload = createLiquidFunGate4Workload();
 	const moduleFactory = (await import('liquidfun-wasm')).default;
 	const module = await moduleFactory();
-	const gravity = createVector(module, LIQUIDFUN_BOX2D_GRAVITY);
+	const gravity = createVector(
+		module,
+		LIQUIDFUN_BOX2D_GRAVITY_UNITS_PER_SECOND_SQUARED
+	);
 	let world: B2World;
 	try {
 		world = new module.b2World(gravity);
@@ -628,7 +649,7 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 			new module.b2ParticleSystemDef();
 		particleSystemDefinition.density = LIQUIDFUN_SHARED_PARTICLE_DENSITY;
 		particleSystemDefinition.gravityScale = 1;
-		particleSystemDefinition.radius = LIQUIDFUN_PARTICLE_RADIUS_METERS;
+		particleSystemDefinition.radius = LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS;
 		try {
 			particleSystem = world.CreateParticleSystem(particleSystemDefinition);
 		} finally {
@@ -733,7 +754,7 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 				if (disposed) throw new Error('The LiquidFun simulation has been disposed.');
 				const vector = createVector(
 					module,
-					mapGate4VelocityToBox2D(gravityInGate4Units)
+					mapGate4AccelerationToBox2D(gravityInGate4Units)
 				);
 				try {
 					world.SetGravity(vector);
@@ -752,16 +773,18 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 				context.fillStyle = '#101a28';
 				context.fillRect(0, 0, width, height);
 
-				const pixelsPerMeter = Math.min(
-					width / LIQUIDFUN_BOX2D_DOMAIN_METERS.width,
-					height / LIQUIDFUN_BOX2D_DOMAIN_METERS.height
+				const pixelsPerBox2DUnit = Math.min(
+					width / LIQUIDFUN_BOX2D_DOMAIN_UNITS.width,
+					height / LIQUIDFUN_BOX2D_DOMAIN_UNITS.height
 				);
 				const offsetX =
-					(width - LIQUIDFUN_BOX2D_DOMAIN_METERS.width * pixelsPerMeter) / 2;
+					(width - LIQUIDFUN_BOX2D_DOMAIN_UNITS.width * pixelsPerBox2DUnit) / 2;
 				const offsetY =
-					(height - LIQUIDFUN_BOX2D_DOMAIN_METERS.height * pixelsPerMeter) / 2;
-				const domainWidth = LIQUIDFUN_BOX2D_DOMAIN_METERS.width * pixelsPerMeter;
-				const domainHeight = LIQUIDFUN_BOX2D_DOMAIN_METERS.height * pixelsPerMeter;
+					(height - LIQUIDFUN_BOX2D_DOMAIN_UNITS.height * pixelsPerBox2DUnit) / 2;
+				const domainWidth =
+					LIQUIDFUN_BOX2D_DOMAIN_UNITS.width * pixelsPerBox2DUnit;
+				const domainHeight =
+					LIQUIDFUN_BOX2D_DOMAIN_UNITS.height * pixelsPerBox2DUnit;
 
 				context.save();
 				try {
@@ -777,7 +800,7 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 						renderMode,
 						width,
 						height,
-						pixelsPerMeter,
+						pixelsPerBox2DUnit,
 						offsetX,
 						offsetY
 					);
@@ -786,7 +809,7 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 						pebbleTriangleBodies,
 						width,
 						height,
-						pixelsPerMeter,
+						pixelsPerBox2DUnit,
 						offsetX,
 						offsetY
 					);
@@ -796,7 +819,7 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 						fractureBondJoints,
 						width,
 						height,
-						pixelsPerMeter,
+						pixelsPerBox2DUnit,
 						offsetX,
 						offsetY
 					);
@@ -838,8 +861,17 @@ export const LIQUIDFUN_REALTIME_CONFIG = {
 	dtSeconds: LIQUIDFUN_DT_SECONDS,
 	gate4Gravity: LIQUIDFUN_GATE4_GRAVITY,
 	gate4UnitsPerMeter: LIQUIDFUN_GATE4_UNITS_PER_METER,
+	gate4AccelerationUnitsPerMeterPerSecondSquared:
+		LIQUIDFUN_GATE4_ACCELERATION_UNITS_PER_METER_PER_SECOND_SQUARED,
 	domainGate4Units: LIQUIDFUN_GATE4_DOMAIN,
+	domainMeters: LIQUIDFUN_PHYSICAL_DOMAIN_METERS,
+	box2dUnitsPerMeter: LIQUIDFUN_BOX2D_UNITS_PER_METER,
+	domainBox2dUnits: LIQUIDFUN_BOX2D_DOMAIN_UNITS,
 	particleRadiusMeters: LIQUIDFUN_PARTICLE_RADIUS_METERS,
+	particleRadiusBox2dUnits: LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS,
+	sharedParticleMass: LIQUIDFUN_SHARED_PARTICLE_MASS,
+	pebbleEdgeLengthMeters: LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS,
+	pebbleMass: LIQUIDFUN_PEBBLE_MASS,
 	velocityIterations: LIQUIDFUN_VELOCITY_ITERATIONS,
 	positionIterations: LIQUIDFUN_POSITION_ITERATIONS
 } as const;

@@ -1,15 +1,20 @@
-import type { LiquidFunVector } from './workload.js';
+import {
+	LIQUIDFUN_BOX2D_UNITS_PER_METER,
+	type LiquidFunVector
+} from './workload.js';
 
-export const LIQUIDFUN_WALL_THICKNESS_METERS = 1_000;
+export const LIQUIDFUN_WALL_THICKNESS_METERS = 5;
+export const LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS =
+	LIQUIDFUN_WALL_THICKNESS_METERS * LIQUIDFUN_BOX2D_UNITS_PER_METER;
 
 export function createLiquidFunWallDefinitions(width: number, height: number) {
 	if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
 		throw new RangeError('LiquidFun wall dimensions must be finite and positive.');
 	}
 
-	const halfThickness = LIQUIDFUN_WALL_THICKNESS_METERS / 2;
-	const sideHalfHeight = height / 2 + LIQUIDFUN_WALL_THICKNESS_METERS;
-	const horizontalHalfWidth = width / 2 + LIQUIDFUN_WALL_THICKNESS_METERS;
+	const halfThickness = LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS / 2;
+	const sideHalfHeight = height / 2 + LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS;
+	const horizontalHalfWidth = width / 2 + LIQUIDFUN_WALL_THICKNESS_BOX2D_UNITS;
 
 	return [
 		{

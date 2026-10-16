@@ -1,20 +1,29 @@
 import { describe, expect, it } from 'vitest';
 import {
 	createLiquidFunGate4Workload,
-	LIQUIDFUN_BOX2D_DOMAIN_METERS,
-	LIQUIDFUN_BOX2D_GRAVITY,
+	LIQUIDFUN_BOX2D_DOMAIN_UNITS,
+	LIQUIDFUN_BOX2D_GRAVITY_UNITS_PER_SECOND_SQUARED,
+	LIQUIDFUN_GATE4_ACCELERATION_UNITS_PER_METER_PER_SECOND_SQUARED,
 	LIQUIDFUN_GATE4_DOMAIN,
 	LIQUIDFUN_GATE4_GRAVITY,
 	LIQUIDFUN_GATE4_UNITS_PER_METER,
 	LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER,
 	LIQUIDFUN_OIL_PARTICLE_COUNT,
+	LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS,
 	LIQUIDFUN_PEBBLE_SIZE_SCALE,
+	LIQUIDFUN_PEBBLE_EDGE_LENGTH_BOX2D_UNITS,
+	LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS,
+	LIQUIDFUN_PEBBLE_MASS,
 	LIQUIDFUN_PARTICLE_RADIUS_METERS,
+	LIQUIDFUN_SHARED_PARTICLE_DENSITY,
+	LIQUIDFUN_SHARED_PARTICLE_MASS,
+	LIQUIDFUN_PHYSICAL_DOMAIN_METERS,
 	LIQUIDFUN_SCENE_SEED,
 	LIQUIDFUN_SOLID_NODE_RADIUS_METERS,
 	LIQUIDFUN_WATER_PARTICLE_COUNT,
 	mapBox2DPositionToGate4,
 	mapBox2DVelocityToGate4,
+	mapGate4AccelerationToBox2D,
 	mapGate4PositionToBox2D,
 	mapGate4VelocityToBox2D,
 	scaleLiquidFunPebbleLocalVertices,
@@ -40,20 +49,39 @@ import {
 
 describe('LiquidFun Gate 4 workload mapping', () => {
 	it('converts Gate 4 screen/world coordinates and velocity to Box2D y-up units', () => {
-		expect(LIQUIDFUN_GATE4_UNITS_PER_METER).toBe(100);
+		expect(LIQUIDFUN_GATE4_UNITS_PER_METER).toBe(20_000);
+		expect(LIQUIDFUN_GATE4_ACCELERATION_UNITS_PER_METER_PER_SECOND_SQUARED).toBe(100);
 		expect(LIQUIDFUN_GATE4_DOMAIN).toEqual({ width: 2_800, height: 1_500 });
-		expect(LIQUIDFUN_BOX2D_DOMAIN_METERS).toEqual({ width: 28, height: 15 });
+		expect(LIQUIDFUN_PHYSICAL_DOMAIN_METERS).toEqual({ width: 0.14, height: 0.075 });
+		expect(LIQUIDFUN_BOX2D_DOMAIN_UNITS).toEqual({ width: 140, height: 75 });
 		expect(LIQUIDFUN_GATE4_GRAVITY).toEqual({ x: 0, y: 90 });
-		expect(LIQUIDFUN_BOX2D_GRAVITY).toEqual({ x: 0, y: -0.9 });
+		expect(LIQUIDFUN_BOX2D_GRAVITY_UNITS_PER_SECOND_SQUARED).toEqual({
+			x: 0,
+			y: -900
+		});
 
 		const screenPosition = { x: 100, y: 640 };
 		const screenVelocity = { x: 32, y: -64 };
 		const box2dPosition = mapGate4PositionToBox2D(screenPosition);
 		const box2dVelocity = mapGate4VelocityToBox2D(screenVelocity);
-		expect(box2dPosition).toEqual({ x: 1, y: 8.6 });
-		expect(box2dVelocity).toEqual({ x: 0.32, y: 0.64 });
+		expect(box2dPosition).toEqual({ x: 5, y: 43 });
+		expect(box2dVelocity).toEqual({ x: 1.6, y: 3.2 });
 		expect(mapBox2DPositionToGate4(box2dPosition)).toEqual(screenPosition);
 		expect(mapBox2DVelocityToGate4(box2dVelocity)).toEqual(screenVelocity);
+		expect(mapGate4AccelerationToBox2D({ x: 0, y: 980 })).toEqual({
+			x: 0,
+			y: -9_800
+		});
+	});
+
+	it('calibrates particle and pebble masses at the requested millimeter scale', () => {
+		expect(LIQUIDFUN_PARTICLE_RADIUS_METERS).toBe(0.0005);
+		expect(LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS).toBe(0.5);
+		expect(LIQUIDFUN_SHARED_PARTICLE_MASS).toBe(0.05);
+		expect(LIQUIDFUN_SHARED_PARTICLE_DENSITY * 0.75 ** 2).toBeCloseTo(0.05);
+		expect(LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS).toBe(0.0015);
+		expect(LIQUIDFUN_PEBBLE_EDGE_LENGTH_BOX2D_UNITS).toBe(1.5);
+		expect(LIQUIDFUN_PEBBLE_MASS).toBe(0.045);
 	});
 
 	it('preserves source counts and solid topology while expanding liquid flags', () => {
@@ -117,7 +145,7 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 					bond.firstNodeIndex < workload.fractureNodes.length &&
 					bond.secondNodeIndex >= 0 &&
 					bond.secondNodeIndex < workload.fractureNodes.length &&
-					bond.restLengthMeters > 0
+					bond.restLengthBox2DUnits > 0
 			)
 		).toBe(true);
 	});
@@ -235,10 +263,7 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 			GATE4_OIL_PARTICLE_ROWS,
 			fluidVerticalOffset
 		);
-		expect(LIQUIDFUN_PARTICLE_RADIUS_METERS).toBeCloseTo(
-			GATE4_LIQUID_PARTICLE_SPACING /
-				(2 * LIQUIDFUN_GATE4_UNITS_PER_METER)
-		);
+		expect(LIQUIDFUN_PARTICLE_RADIUS_METERS).toBe(0.0005);
 		const fractureTopY = Math.min(
 			...sourceFractureParticles.map(({ position }) => position.y)
 		);
@@ -258,11 +283,11 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 		expect(waterTopY - oilBottomY).toBe(GATE4_LIQUID_PARTICLE_SPACING);
 	});
 
-	it('halves both dimensions of each LiquidFun pebble triangle', () => {
+	it('sets each LiquidFun pebble triangle to the requested physical edge length', () => {
 		const originalVertices = [
-			{ x: -0.66, y: -0.66 / Math.sqrt(3) },
-			{ x: 0.66, y: -0.66 / Math.sqrt(3) },
-			{ x: 0, y: (2 * 0.66) / Math.sqrt(3) }
+			{ x: -3.3, y: -3.3 / Math.sqrt(3) },
+			{ x: 3.3, y: -3.3 / Math.sqrt(3) },
+			{ x: 0, y: (2 * 3.3) / Math.sqrt(3) }
 		] as const;
 		const scaledVertices = scaleLiquidFunPebbleLocalVertices(originalVertices);
 		const width = (vertices: readonly { x: number; y: number }[]) =>
@@ -272,9 +297,13 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 			Math.max(...vertices.map((vertex) => vertex.y)) -
 			Math.min(...vertices.map((vertex) => vertex.y));
 
-		expect(LIQUIDFUN_PEBBLE_SIZE_SCALE).toBe(0.5);
-		expect(width(scaledVertices)).toBeCloseTo(width(originalVertices) / 2);
-		expect(height(scaledVertices)).toBeCloseTo(height(originalVertices) / 2);
+		expect(width(scaledVertices)).toBeCloseTo(LIQUIDFUN_PEBBLE_EDGE_LENGTH_BOX2D_UNITS);
+		expect(width(scaledVertices)).toBeCloseTo(
+			width(originalVertices) * LIQUIDFUN_PEBBLE_SIZE_SCALE
+		);
+		expect(height(scaledVertices)).toBeCloseTo(
+			height(originalVertices) * LIQUIDFUN_PEBBLE_SIZE_SCALE
+		);
 		expect(() => scaleLiquidFunPebbleLocalVertices(originalVertices.slice(0, 2))).toThrow(
 			RangeError
 		);

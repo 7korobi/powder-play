@@ -37,53 +37,68 @@ the LiquidFun engine.
 The benchmark calls `createMpmGate4Scene(0x4d504d34)` and uses the current
 `GATE4_*` source dimensions and counts. The source MPM scene has a 2,200 ×
 1,500 Gate 4 unit domain (220 × 150 cells, 10 units per cell). The LiquidFun
-Box2D domain is expanded horizontally to 2,800 × 1,500 units (28 × 15 m) to
-fit its wider fluid grids, with at least one source particle spacing between
-their right edge and the wall. Four static polygon walls have inner faces on
-the domain edges and extend 1,000 m outward, with overlapping corners. Their
-fixtures are not drawn, and particle/body rendering is clipped to the visible
-domain. This deep solid is intended to contain particles that cross the inner
-face; it cannot guarantee containment for arbitrarily large per-step
-displacements.
+domain is expanded horizontally to 2,800 × 1,500 Gate 4 units to fit its wider
+fluid grids, with at least one source particle spacing between their right edge
+and the wall. This corresponds to a physical domain of 140 × 75 mm.
 
-Gate 4 coordinates are y-down; Box2D coordinates are y-up:
+Physical Gate 4 positions use 20,000 units/m. Box2D runs in internal units at
+1,000 units/m (one internal unit represents 1 mm), so one Gate 4 unit maps to
+0.05 Box2D units. This keeps the 0.5 mm fluid radius and 1.5 mm pebble geometry
+large relative to Box2D's fixed length tolerance. Internal Box2D coordinates
+and physical meters are deliberately distinct.
 
-- `box2d.x = gate4.x / 100`
-- `box2d.y = (1500 - gate4.y) / 100`
-- `box2d.vx = gate4.vx / 100`
-- `box2d.vy = -gate4.vy / 100`
-- Gate 4 gravity `(0, 90 units/s²)` becomes Box2D gravity `(0, -0.9 m/s²)`
+Four static polygon walls have inner faces on the domain edges and extend 5 m
+(5,000 Box2D units) outward, with overlapping corners. The depth retains the
+previous wall-to-domain-width ratio. Their fixtures are not drawn, and
+particle/body rendering is clipped to the visible domain. This deep solid is
+intended to contain particles that cross the inner face; it cannot guarantee
+containment for arbitrarily large per-step displacements.
+
+Gate 4 coordinates are y-down; Box2D engine coordinates are y-up:
+
+- `box2d.x = gate4.x × 0.05`
+- `box2d.y = (1500 - gate4.y) × 0.05`
+- Box2D velocities use the same `0.05` position scale
+- `physical gravity (m/s²) = Gate 4 gravity / 100`
+- `box2d gravity (internal units/s²) = Gate 4 gravity × 10`
+- Gate 4 gravity `(0, 90 units/s²)` is `0.9 m/s²` physically and `(0, -900)`
+  in Box2D engine coordinates
+- A control value of `980` is approximately `9.8 m/s²`, or `1G`
 - Every step uses `dt = 1/240 s`; the benchmark does not change the seed,
   timestep, or source scene counts.
 
 The source has 3,674 MPM nodes: 2,000 water, 1,500 oil, 150 pebble vertices,
 and 24 fracture nodes. Water uses the default `b2_waterParticle` flag; oil uses
 `b2_viscousParticle`. Both are created in the **same** LiquidFun particle
-system, with a shared radius and system density.
+system, with a shared radius of 0.5 mm and a shared particle mass of 0.05
+simulation mass units. LiquidFun sets density at the particle-system level, so
+the oil particles also use mass 0.05; assigning oil mass 0.04 independently
+would require separate systems and remove water/oil particle-to-particle
+contacts. These are simulation mass units, not calibrated kilograms; because
+LiquidFun is two-dimensional, its density is per area rather than volumetric.
 
 For the LiquidFun workload only, each fluid grid grows at the original
 18-unit spacing: water expands from 50 × 40 to 150 × 40 (6,000 particles),
 and oil from 50 × 30 to 150 × 30 (4,500 particles). Both fluid bands shift up
 by half a spacing so the widened water grid remains clear of the fracture
 nodes while the water/oil gap stays unchanged. Source velocities repeat
-horizontally to fill the wider grids. The particle radius remains 0.09 m, so
-each phase's placed area and nominal mass increase threefold at the shared
-density. The grids extend to x = 2,782 Gate 4 units, leaving one source
+horizontally to fill the wider grids. The 0.5 mm particle radius and shared
+mass stay fixed while each phase's placed area increases threefold. The grids
+extend to x = 2,782 Gate 4 units, leaving one source
 particle spacing to the expanded LiquidFun wall. The source Gate 4 scene,
 including all 3,674 mapped nodes, its 2,000/1,500 fluid-node counts, and its
 2,200 × 1,500 domain used by the CPU and GPU MLS-MPM pages, is unchanged.
 
 Each set of three pebble vertices initializes one dynamic Box2D polygon body,
-for 50 full-triangle collision shapes. The initial polygon keeps the three
-source center but scales both local axes and drawn dimensions to one half of
-the source triangle (66 world units per side rather than 132). Its center
-velocity is the vertex mean, and angular velocity is fitted to the scaled
-vertices and source velocities. Its mass remains the sum of the three
-source-node masses, so the smaller fixture has four times the density. The
-fixture used for collision covers the same three vertices that are drawn;
-the vertex array is passed through LiquidFun's contiguous `pointsToVec2Array`
-adapter before Box2D constructs the polygon, avoiding a mismatched pointer
-array or a box-shaped collision proxy.
+for 50 full-triangle collision shapes. Each is an equilateral triangle with
+1.5 mm sides and mass 0.045 simulation mass units. The initial polygon keeps
+the source triangle's center and scales its local vertices to the target edge
+length. Its center velocity is the vertex mean, and angular velocity is fitted
+to the scaled vertices and source velocities. Fixture density is derived from
+the target body mass and polygon area. The fixture used for collision covers
+the same three vertices that are drawn; the vertex array is passed through
+LiquidFun's contiguous `pointsToVec2Array` adapter before Box2D constructs the
+polygon, avoiding a mismatched pointer array or a box-shaped collision proxy.
 The 24 fracture nodes remain individual dynamic circle bodies connected by
 the same 53 Gate 4 bonds. Those bonds break when tensile strain reaches the
 Gate 4 12% threshold.
@@ -101,20 +116,24 @@ physical response.
 
 The live LiquidFun route executes the WASM engine described above and exposes
 pause/resume, single-step, reset, manual 2D gravity (each component ranges to
-±250000 Gate 4 units/s², initially (0, 0)), horizontal oscillation (default
-amplitude ±1000 Gate 4 units/s² at 0.16 Hz, adjustable up to ±250000), requested
+±999 Gate 4 units/s², initially (0, 0)), horizontal oscillation (default
+amplitude ±999 Gate 4 units/s² at 0.16 Hz, adjustable up to ±999), requested
 simulation speed (default 0.5×), render mode, render-target FPS (default 90),
-and live step/backlog metrics. The oscillation is added to X gravity and
-integrated as the average acceleration over each fixed step using simulation
-time; setting its amplitude to zero disables it. The FPS target limits Canvas
-drawing only; the accumulator and LiquidFun fixed simulation timestep are
-unchanged. A per-frame step count and physics-time budget prevent a high
-requested speed from producing an unbounded synchronous catch-up loop. If the
-browser cannot keep up, pending simulation time is shown and can be discarded
-while paused.
+and live step/backlog metrics. The gravity range corresponds to approximately
+±9.99 m/s² (about ±1.02G). The oscillation is added to X gravity and integrated
+as the average acceleration over each fixed step using simulation time; setting
+its amplitude to zero disables it. The FPS target limits Canvas drawing only;
+the accumulator and LiquidFun fixed simulation timestep are unchanged. A
+per-frame step count and physics-time budget prevent a high requested speed
+from producing an unbounded synchronous catch-up loop. If the browser cannot
+keep up, pending simulation time is shown and can be discarded while paused.
 
-The 250,000 manual-gravity range is retained for further wall experiments, not
-as a stability guarantee. Leakage was reported around 30,000 with the previous
+In an observation reported by the user, rigid-body collision calculations up
+to a manual-gravity input of 250,000 showed no clearly severe visible failure.
+With the documented conversion of 100 Gate 4 acceleration units per m/s², that
+input is 2,500 m/s² (about 255G), not 25,000 m/s² (about 2,550G). This is a
+limited visual observation, not a stability guarantee or safe upper bound.
+Leakage was previously reported around an input of 30,000 with the former
 0.2 m-thick walls. Horizontal oscillation is a separate input added to X
 gravity; isolate it from manual-gravity tests by setting its amplitude to zero.
 
@@ -122,10 +141,10 @@ The CPU and GPU MLS-MPM pages remain a separate same-equation numerical
 comparison. LiquidFun is a behavioral reference for contact, waves, settling,
 and stability, not an exact trajectory or constitutive-model oracle. Water
 and oil use different LiquidFun particle flags in one particle system, so they
-share its density/radius parameters. The 50 pebble triangles are rigid Box2D
-bodies, not deformable MLS-MPM triangles; fracture nodes use dynamic bodies
-and breakable distance joints. These model differences should be retained
-when interpreting the visual and timing results.
+share its density, radius, and 0.05 particle mass. The 50 pebble triangles are
+rigid Box2D bodies, not deformable MLS-MPM triangles; fracture nodes use
+dynamic bodies and breakable distance joints. These model differences should
+be retained when interpreting the visual and timing results.
 
 ## Repeatable simulation-only benchmark
 
