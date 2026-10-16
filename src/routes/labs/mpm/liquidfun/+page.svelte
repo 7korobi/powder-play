@@ -74,7 +74,7 @@
 	let gravityX = $state(0);
 	let gravityY = $state(0);
 	let horizontalOscillationAmplitude = $state(DEFAULT_LIQUIDFUN_OSCILLATION_AMPLITUDE);
-	let simulationSpeed = $state(0.5);
+	let simulationSpeed = $state(1);
 	let renderTargetFps: MpmRenderFps = $state(DEFAULT_RENDER_FPS);
 	let renderMode = $state<LiquidFunRenderMode>('surface');
 	let fps = $state(0);
@@ -646,7 +646,7 @@
 						{(LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN * 100).toFixed(0)}%
 					</li>
 					<li>
-						Pressure strength {LIQUIDFUN_PRESSURE_STRENGTH} · one shared particle-system coefficient for
+						Pressure strength {LIQUIDFUN_PRESSURE_STRENGTH.toFixed(2)} · one shared particle-system coefficient for
 						water and oil
 					</li>
 				</ul>
@@ -664,7 +664,7 @@
 			</li>
 			<li>
 				Water and oil use separate LiquidFun particle flags in one particle system, so both use the same
-				1.0 mm radius and 0.03 simulation mass units and retain mutual particle collisions. The triangular
+				1.0 mm radius and 0.01 simulation mass units and retain mutual particle collisions. The triangular
 				pebbles are
 				rigid approximations, not deformable MLS-MPM triangles. Do not interpret their paths as a
 				matched-physics comparison.
