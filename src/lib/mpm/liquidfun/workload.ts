@@ -7,13 +7,18 @@ import {
 	GATE4_FRACTURE_OBJECT_ID,
 	GATE4_GRID,
 	GATE4_LIQUID_PARTICLE_SPACING,
+	GATE4_LIQUID_START_X,
+	GATE4_OIL_PARTICLE_COLUMNS,
 	GATE4_OIL_PARTICLE_COUNT,
+	GATE4_OIL_PARTICLE_ROWS,
 	GATE4_PARTICLE_AREA,
 	GATE4_PARTICLE_COUNT,
 	GATE4_PEBBLE_COUNT,
 	GATE4_PEBBLE_PARTICLE_COUNT,
 	GATE4_SOLID_PARTICLE_MASS,
-	GATE4_WATER_PARTICLE_COUNT
+	GATE4_WATER_PARTICLE_COLUMNS,
+	GATE4_WATER_PARTICLE_COUNT,
+	GATE4_WATER_PARTICLE_ROWS
 } from '../scenes/gate4.js';
 
 export const LIQUIDFUN_PACKAGE_VERSION = '7.0.0';
@@ -26,6 +31,11 @@ export const LIQUIDFUN_BOX2D_GRAVITY: MpmVector2 = {
 	y: -LIQUIDFUN_GATE4_GRAVITY.y / LIQUIDFUN_GATE4_UNITS_PER_METER
 };
 export const LIQUIDFUN_SHARED_PARTICLE_DENSITY = 1;
+export const LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER = 3;
+export const LIQUIDFUN_WATER_PARTICLE_COUNT =
+	GATE4_WATER_PARTICLE_COUNT * LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER;
+export const LIQUIDFUN_OIL_PARTICLE_COUNT =
+	GATE4_OIL_PARTICLE_COUNT * LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER;
 export const LIQUIDFUN_PARTICLE_RADIUS_METERS =
 	GATE4_LIQUID_PARTICLE_SPACING / LIQUIDFUN_GATE4_UNITS_PER_METER / 2;
 export const LIQUIDFUN_SOLID_NODE_AREA_SQUARE_METERS =
@@ -58,8 +68,32 @@ export const LIQUIDFUN_GRAVITY_WARMUP_STEPS = 64;
 export const LIQUIDFUN_SAMPLE_BATCHES = 12;
 export const LIQUIDFUN_STEPS_PER_BATCH = 8;
 
+// Keep the widened water footprint one grid row clear of the fracture nodes.
+// Shift both bands by half a spacing to keep water clear of the fracture network.
+const LIQUIDFUN_FLUID_VERTICAL_OFFSET = -GATE4_LIQUID_PARTICLE_SPACING / 2;
+const LIQUIDFUN_WATER_GRID = {
+	columns: Math.ceil(LIQUIDFUN_WATER_PARTICLE_COUNT / GATE4_WATER_PARTICLE_ROWS),
+	rows: GATE4_WATER_PARTICLE_ROWS
+} as const;
+const LIQUIDFUN_OIL_GRID = {
+	rows: GATE4_OIL_PARTICLE_ROWS,
+	columns: Math.ceil(LIQUIDFUN_OIL_PARTICLE_COUNT / GATE4_OIL_PARTICLE_ROWS)
+} as const;
+const LIQUIDFUN_FLUID_RIGHT_EDGE =
+	GATE4_LIQUID_START_X +
+	(Math.max(LIQUIDFUN_WATER_GRID.columns, LIQUIDFUN_OIL_GRID.columns) - 1) *
+		GATE4_LIQUID_PARTICLE_SPACING;
+const LIQUIDFUN_DOMAIN_RIGHT_MARGIN = GATE4_LIQUID_PARTICLE_SPACING;
+const LIQUIDFUN_BASE_DOMAIN_WIDTH = GATE4_GRID.cellsX * GATE4_GRID.cellSize;
+
 export const LIQUIDFUN_GATE4_DOMAIN = {
-	width: GATE4_GRID.cellsX * GATE4_GRID.cellSize,
+	width:
+		Math.ceil(
+			Math.max(
+				LIQUIDFUN_BASE_DOMAIN_WIDTH,
+				LIQUIDFUN_FLUID_RIGHT_EDGE + LIQUIDFUN_DOMAIN_RIGHT_MARGIN
+			) / GATE4_GRID.cellSize
+		) * GATE4_GRID.cellSize,
 	height: GATE4_GRID.cellsY * GATE4_GRID.cellSize
 } as const;
 
@@ -112,6 +146,63 @@ export function scaleLiquidFunPebbleLocalVertices(
 	}));
 }
 
+function expandLiquidParticles(
+	sourceParticles: readonly MpmParticle[],
+	sourceColumns: number,
+	sourceRows: number,
+	targetParticleCount: number,
+	targetRows: number,
+	verticalOffset: number
+): readonly MpmParticle[] {
+	if (sourceParticles.length !== sourceColumns * sourceRows) {
+		throw new Error('LiquidFun source particle count does not match its grid dimensions.');
+	}
+	if (
+		!Number.isSafeInteger(targetParticleCount) ||
+		targetParticleCount < targetRows ||
+		!Number.isSafeInteger(targetRows) ||
+		targetRows < 2 ||
+		targetRows !== sourceRows ||
+		!Number.isFinite(verticalOffset)
+	) {
+		throw new RangeError('LiquidFun fluid grids must expand horizontally without changing rows.');
+	}
+	const firstSourceParticle = sourceParticles[0];
+	if (firstSourceParticle === undefined) {
+		throw new Error('LiquidFun source particle grid is incomplete.');
+	}
+	const targetColumns = Math.ceil(targetParticleCount / targetRows);
+	const expandedParticles: MpmParticle[] = [];
+	for (let row = 0; row < targetRows; row += 1) {
+		const rowStartIndex = Math.floor((row * targetParticleCount) / targetRows);
+		const rowEndIndex = Math.floor(((row + 1) * targetParticleCount) / targetRows);
+		const particlesInRow = rowEndIndex - rowStartIndex;
+		const columnOffset =
+			((targetColumns - particlesInRow) * GATE4_LIQUID_PARTICLE_SPACING) / 2;
+		for (let column = 0; column < particlesInRow; column += 1) {
+			const sourceParticle =
+				sourceParticles[row * sourceColumns + (column % sourceColumns)];
+			if (sourceParticle === undefined) {
+				throw new Error('LiquidFun expansion could not find a source particle.');
+			}
+			expandedParticles.push({
+				...sourceParticle,
+				position: {
+					x:
+						firstSourceParticle.position.x +
+						columnOffset +
+						column * GATE4_LIQUID_PARTICLE_SPACING,
+					y:
+						firstSourceParticle.position.y +
+						verticalOffset +
+						row * GATE4_LIQUID_PARTICLE_SPACING
+				}
+			});
+		}
+	}
+	return expandedParticles;
+}
+
 export function mapGate4PositionToBox2D(position: MpmVector2): LiquidFunVector {
 	return {
 		x: position.x / LIQUIDFUN_GATE4_UNITS_PER_METER,
@@ -146,8 +237,8 @@ export function mapBox2DVelocityToGate4(velocity: LiquidFunVector): MpmVector2 {
 
 export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 	const scene = createMpmGate4Scene(LIQUIDFUN_SCENE_SEED);
-	const waterParticles: MpmParticle[] = [];
-	const oilParticles: MpmParticle[] = [];
+	const sourceWaterParticles: MpmParticle[] = [];
+	const sourceOilParticles: MpmParticle[] = [];
 	const pebbleNodesByObject = new Map<number, MpmParticle[]>();
 	const fractureNodes: MpmParticle[] = [];
 	const fractureNodeIndices = new Map<number, number>();
@@ -156,9 +247,9 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 		const particle = scene.particles[sourceIndex];
 		const material = particle.material?.model;
 		if (material === 'water') {
-			waterParticles.push(particle);
+			sourceWaterParticles.push(particle);
 		} else if (material === 'oil') {
-			oilParticles.push(particle);
+			sourceOilParticles.push(particle);
 		} else if (particle.bondedTriangleVertex !== undefined) {
 			if (particle.objectId === undefined) {
 				throw new Error('Every Gate 4 pebble node must have an object id.');
@@ -220,15 +311,15 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 		}
 	);
 	const mappedMpmNodeCount =
-		waterParticles.length +
-		oilParticles.length +
+		sourceWaterParticles.length +
+		sourceOilParticles.length +
 		pebbleNodes.length +
 		fractureNodes.length;
 
 	if (
 		scene.particles.length !== GATE4_PARTICLE_COUNT ||
-		waterParticles.length !== GATE4_WATER_PARTICLE_COUNT ||
-		oilParticles.length !== GATE4_OIL_PARTICLE_COUNT ||
+		sourceWaterParticles.length !== GATE4_WATER_PARTICLE_COUNT ||
+		sourceOilParticles.length !== GATE4_OIL_PARTICLE_COUNT ||
 		pebbleGroups.length !== GATE4_PEBBLE_COUNT ||
 		pebbleNodes.length !== GATE4_PEBBLE_PARTICLE_COUNT ||
 		fractureNodes.length !== GATE4_FRACTURE_PARTICLE_COUNT ||
@@ -250,8 +341,22 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 		seed: LIQUIDFUN_SCENE_SEED,
 		sourceMpmNodeCount: scene.particles.length,
 		mappedMpmNodeCount,
-		waterParticles,
-		oilParticles,
+		waterParticles: expandLiquidParticles(
+			sourceWaterParticles,
+			GATE4_WATER_PARTICLE_COLUMNS,
+			GATE4_WATER_PARTICLE_ROWS,
+			LIQUIDFUN_WATER_PARTICLE_COUNT,
+			LIQUIDFUN_WATER_GRID.rows,
+			LIQUIDFUN_FLUID_VERTICAL_OFFSET
+		),
+		oilParticles: expandLiquidParticles(
+			sourceOilParticles,
+			GATE4_OIL_PARTICLE_COLUMNS,
+			GATE4_OIL_PARTICLE_ROWS,
+			LIQUIDFUN_OIL_PARTICLE_COUNT,
+			LIQUIDFUN_OIL_GRID.rows,
+			LIQUIDFUN_FLUID_VERTICAL_OFFSET
+		),
 		pebbleNodes,
 		pebbleGroups,
 		fractureNodes,

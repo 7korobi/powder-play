@@ -19,21 +19,24 @@
 		LIQUIDFUN_BOX2D_DOMAIN_METERS,
 		LIQUIDFUN_DT_SECONDS,
 		LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN,
+		LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER,
 		LIQUIDFUN_GATE4_DOMAIN,
 		LIQUIDFUN_GATE4_UNITS_PER_METER,
+		LIQUIDFUN_OIL_PARTICLE_COUNT,
 		LIQUIDFUN_PACKAGE_VERSION,
 		LIQUIDFUN_SCENE_SEED,
 		LIQUIDFUN_SHARED_PARTICLE_DENSITY,
 		LIQUIDFUN_VELOCITY_ITERATIONS,
-		LIQUIDFUN_POSITION_ITERATIONS
+		LIQUIDFUN_POSITION_ITERATIONS,
+		LIQUIDFUN_WATER_PARTICLE_COUNT
 	} from '#lib/mpm/liquidfun/workload.js';
 
 	const MAX_STEPS_PER_FRAME = 8;
 	const MAX_PHYSICS_FRAME_BUDGET_MS = 8;
 	const SIMULATION_SPEED_OPTIONS = [0.25, 0.5, 1, 2, 4, 8, 16, 32] as const;
-	const MANUAL_GRAVITY_COMPONENT_LIMIT = 50_000;
+	const MANUAL_GRAVITY_COMPONENT_LIMIT = 250_000;
 	const DEFAULT_LIQUIDFUN_OSCILLATION_AMPLITUDE = 1_000;
-	const MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE = 50_000;
+	const MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE = 250_000;
 	const DEFAULT_RENDER_FPS: MpmRenderFps = 90;
 	const METRICS_INTERVAL_MS = 500;
 	const framePacer = new MpmFramePacer();
@@ -575,7 +578,13 @@
 				<ul>
 					<li>
 						Seed <code>0x{LIQUIDFUN_SCENE_SEED.toString(16)}</code> ·
-						{simulation?.mappedMpmNodeCount.toLocaleString() ?? '3,674'} mapped source nodes
+						{simulation?.sourceMpmNodeCount.toLocaleString() ?? '3,674'} source nodes ·
+						{simulation?.mappedMpmNodeCount.toLocaleString() ?? '3,674'} mapped
+					</li>
+					<li>
+						{LIQUIDFUN_WATER_PARTICLE_COUNT.toLocaleString()} water /
+						{' '}{LIQUIDFUN_OIL_PARTICLE_COUNT.toLocaleString()} oil particles ·
+						{LIQUIDFUN_FLUID_PARTICLE_COUNT_MULTIPLIER}× source count and placement area · source spacing retained
 					</li>
 					<li>
 						{LIQUIDFUN_GATE4_DOMAIN.width} × {LIQUIDFUN_GATE4_DOMAIN.height} Gate 4 units ·

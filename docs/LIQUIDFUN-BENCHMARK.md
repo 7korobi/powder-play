@@ -35,9 +35,11 @@ the LiquidFun engine.
 ## Benchmark workload and coordinate mapping
 
 The benchmark calls `createMpmGate4Scene(0x4d504d34)` and uses the current
-`GATE4_*` dimensions and counts. The mapped scene has a 2,200 × 1,500 Gate 4
-unit domain (220 × 150 cells, 10 units per cell). With the declared scale of
-100 Gate 4 units per meter, the Box2D world is 22 × 15 m.
+`GATE4_*` source dimensions and counts. The source MPM scene has a 2,200 ×
+1,500 Gate 4 unit domain (220 × 150 cells, 10 units per cell). The LiquidFun
+Box2D domain is expanded horizontally to 2,800 × 1,500 units (28 × 15 m) to
+fit its wider fluid grids, with at least one source particle spacing between
+their right edge and the wall.
 
 Gate 4 coordinates are y-down; Box2D coordinates are y-up:
 
@@ -53,6 +55,18 @@ The source has 3,674 MPM nodes: 2,000 water, 1,500 oil, 150 pebble vertices,
 and 24 fracture nodes. Water uses the default `b2_waterParticle` flag; oil uses
 `b2_viscousParticle`. Both are created in the **same** LiquidFun particle
 system, with a shared radius and system density.
+
+For the LiquidFun workload only, each fluid grid grows at the original
+18-unit spacing: water expands from 50 × 40 to 150 × 40 (6,000 particles),
+and oil from 50 × 30 to 150 × 30 (4,500 particles). Both fluid bands shift up
+by half a spacing so the widened water grid remains clear of the fracture
+nodes while the water/oil gap stays unchanged. Source velocities repeat
+horizontally to fill the wider grids. The particle radius remains 0.09 m, so
+each phase's placed area and nominal mass increase threefold at the shared
+density. The grids extend to x = 2,782 Gate 4 units, leaving one source
+particle spacing to the expanded LiquidFun wall. The source Gate 4 scene,
+including all 3,674 mapped nodes, its 2,000/1,500 fluid-node counts, and its
+2,200 × 1,500 domain used by the CPU and GPU MLS-MPM pages, is unchanged.
 
 Each set of three pebble vertices initializes one dynamic Box2D polygon body,
 for 50 full-triangle collision shapes. The initial polygon keeps the three
@@ -82,8 +96,8 @@ physical response.
 
 The live LiquidFun route executes the WASM engine described above and exposes
 pause/resume, single-step, reset, manual 2D gravity (each component ranges to
-±50000 Gate 4 units/s², initially (0, 0)), horizontal oscillation (default
-amplitude ±1000 Gate 4 units/s² at 0.16 Hz, adjustable up to ±50000), requested
+±250000 Gate 4 units/s², initially (0, 0)), horizontal oscillation (default
+amplitude ±1000 Gate 4 units/s² at 0.16 Hz, adjustable up to ±250000), requested
 simulation speed (default 0.5×), render mode, render-target FPS (default 90),
 and live step/backlog metrics. The oscillation is added to X gravity and
 integrated as the average acceleration over each fixed step using simulation
