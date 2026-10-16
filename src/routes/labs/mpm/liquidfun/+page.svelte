@@ -7,10 +7,7 @@
 		type MpmRenderFps
 	} from '#lib/mpm/kernels/frame-pacer.js';
 	import {
-		DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE,
-		HORIZONTAL_OSCILLATION_FREQUENCY_HZ,
-		INITIAL_HORIZONTAL_OSCILLATION_AMPLITUDE,
-		MAX_HORIZONTAL_OSCILLATION_AMPLITUDE
+		HORIZONTAL_OSCILLATION_FREQUENCY_HZ
 	} from '#lib/mpm/kernels/oscillation.js';
 	import { calculateLiquidFunStepGravity } from '#lib/mpm/liquidfun/oscillation.js';
 	import {
@@ -23,7 +20,6 @@
 		LIQUIDFUN_DT_SECONDS,
 		LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN,
 		LIQUIDFUN_GATE4_DOMAIN,
-		LIQUIDFUN_GATE4_GRAVITY,
 		LIQUIDFUN_GATE4_UNITS_PER_METER,
 		LIQUIDFUN_PACKAGE_VERSION,
 		LIQUIDFUN_SCENE_SEED,
@@ -35,11 +31,10 @@
 	const MAX_STEPS_PER_FRAME = 8;
 	const MAX_PHYSICS_FRAME_BUDGET_MS = 8;
 	const SIMULATION_SPEED_OPTIONS = [0.25, 0.5, 1, 2, 4, 8, 16, 32] as const;
-	const LIQUIDFUN_OSCILLATION_AMPLITUDE_SCALE = 4;
-	const MANUAL_GRAVITY_COMPONENT_LIMIT = 3_000;
-	const MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE =
-		MAX_HORIZONTAL_OSCILLATION_AMPLITUDE * LIQUIDFUN_OSCILLATION_AMPLITUDE_SCALE;
-	const DEFAULT_RENDER_FPS: MpmRenderFps = 60;
+	const MANUAL_GRAVITY_COMPONENT_LIMIT = 10_000;
+	const DEFAULT_LIQUIDFUN_OSCILLATION_AMPLITUDE = 1_000;
+	const MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE = 10_000;
+	const DEFAULT_RENDER_FPS: MpmRenderFps = 90;
 	const METRICS_INTERVAL_MS = 500;
 	const framePacer = new MpmFramePacer();
 
@@ -52,12 +47,10 @@
 	let paused = $state(false);
 	let pageVisible = $state(true);
 	let errorMessage = $state('');
-	let gravityX = $state(LIQUIDFUN_GATE4_GRAVITY.x);
-	let gravityY = $state(LIQUIDFUN_GATE4_GRAVITY.y);
-	let horizontalOscillationAmplitude = $state(
-		INITIAL_HORIZONTAL_OSCILLATION_AMPLITUDE
-	);
-	let simulationSpeed = $state(1);
+	let gravityX = $state(0);
+	let gravityY = $state(0);
+	let horizontalOscillationAmplitude = $state(DEFAULT_LIQUIDFUN_OSCILLATION_AMPLITUDE);
+	let simulationSpeed = $state(0.5);
 	let renderTargetFps: MpmRenderFps = $state(DEFAULT_RENDER_FPS);
 	let renderMode = $state<LiquidFunRenderMode>('surface');
 	let fps = $state(0);
@@ -205,7 +198,7 @@
 		horizontalOscillationAmplitude =
 			horizontalOscillationAmplitude > 0
 				? 0
-				: DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE;
+				: DEFAULT_LIQUIDFUN_OSCILLATION_AMPLITUDE;
 		setGravity();
 	}
 
@@ -449,8 +442,7 @@
 					/>
 				</label>
 				<p class="control-note">
-					The default manual gravity (0, 90) matches Gate 4. Horizontal oscillation, when enabled,
-					is added to X.
+					Manual gravity defaults to (0, 0). Horizontal oscillation, when enabled, is added to X.
 				</p>
 			</fieldset>
 
@@ -480,7 +472,7 @@
 				>
 					{horizontalOscillationAmplitude > 0
 						? 'Stop horizontal oscillation'
-						: 'Start horizontal oscillation (±240)'}
+						: 'Start horizontal oscillation (±1000)'}
 				</button>
 				<p class="control-note">
 					Added to manual X gravity; amplitude can reach ±{MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE}

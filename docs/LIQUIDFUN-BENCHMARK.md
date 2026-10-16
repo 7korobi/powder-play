@@ -81,17 +81,18 @@ physical response.
 ## Live LiquidFun lab and MPM references
 
 The live LiquidFun route executes the WASM engine described above and exposes
-pause/resume, single-step, reset, manual 2D gravity (each component ±3000 Gate 4
-units/s²), horizontal oscillation (default
-amplitude ±240 Gate 4 units/s² at 0.16 Hz, adjustable up to ±1440), requested
-simulation speed, render mode, render-target FPS, and live step/backlog metrics.
-The oscillation is added to X gravity and integrated as the average acceleration
-over each fixed step using simulation time; setting its amplitude to zero
-disables it. The FPS target limits Canvas drawing only; the accumulator and
-LiquidFun fixed simulation timestep are unchanged. A per-frame step count and
-physics-time budget prevent a high requested speed from producing an unbounded
-synchronous catch-up loop. If the browser cannot keep up, pending simulation
-time is shown and can be discarded while paused.
+pause/resume, single-step, reset, manual 2D gravity (each component ranges to
+±10000 Gate 4 units/s², initially (0, 0)), horizontal oscillation (default
+amplitude ±1000 Gate 4 units/s² at 0.16 Hz, adjustable up to ±10000), requested
+simulation speed (default 0.5×), render mode, render-target FPS (default 90),
+and live step/backlog metrics. The oscillation is added to X gravity and
+integrated as the average acceleration over each fixed step using simulation
+time; setting its amplitude to zero disables it. The FPS target limits Canvas
+drawing only; the accumulator and LiquidFun fixed simulation timestep are
+unchanged. A per-frame step count and physics-time budget prevent a high
+requested speed from producing an unbounded synchronous catch-up loop. If the
+browser cannot keep up, pending simulation time is shown and can be discarded
+while paused.
 
 The CPU and GPU MLS-MPM pages remain a separate same-equation numerical
 comparison. LiquidFun is a behavioral reference for contact, waves, settling,
