@@ -18,6 +18,7 @@ import {
 	LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS,
 	LIQUIDFUN_PEBBLE_MASS,
 	LIQUIDFUN_PARTICLE_RADIUS_METERS,
+	LIQUIDFUN_PRESSURE_STRENGTH,
 	LIQUIDFUN_SHARED_PARTICLE_DENSITY,
 	LIQUIDFUN_SHARED_PARTICLE_MASS,
 	LIQUIDFUN_PHYSICAL_DOMAIN_METERS,
@@ -85,11 +86,15 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 		expect(LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS).toBe(1);
 		expect(LIQUIDFUN_PARTICLE_SPACING_METERS).toBe(0.0015);
 		expect(LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS).toBe(30);
-		expect(LIQUIDFUN_SHARED_PARTICLE_MASS).toBe(0.05);
-		expect(LIQUIDFUN_SHARED_PARTICLE_DENSITY * 1.5 ** 2).toBeCloseTo(0.05);
+		expect(LIQUIDFUN_SHARED_PARTICLE_MASS).toBe(0.03);
+		expect(LIQUIDFUN_SHARED_PARTICLE_DENSITY * 1.5 ** 2).toBeCloseTo(0.03);
 		expect(LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS).toBe(0.003);
 		expect(LIQUIDFUN_PEBBLE_EDGE_LENGTH_BOX2D_UNITS).toBe(3);
 		expect(LIQUIDFUN_PEBBLE_MASS).toBe(0.045);
+	});
+
+	it('uses the requested pressure strength for the shared fluid particle system', () => {
+		expect(LIQUIDFUN_PRESSURE_STRENGTH).toBe(0.25);
 	});
 
 	it('preserves source counts and solid topology while expanding liquid flags', () => {

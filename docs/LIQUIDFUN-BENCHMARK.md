@@ -75,15 +75,17 @@ The source has 3,674 MPM nodes: 2,000 water, 1,500 oil, 150 pebble vertices,
 and 24 fracture nodes. The LiquidFun workload uses 2,000 water and 1,500 oil
 particles. Water uses the default `b2_waterParticle` flag; oil uses
 `b2_viscousParticle`. Both are created in the **same** LiquidFun particle
-system, with a shared radius of 1 mm and a shared particle mass of 0.05
+system, with a shared radius of 1 mm and a shared particle mass of 0.03
 simulation mass units. LiquidFun sets density at the particle-system level, so
-the oil particles also use mass 0.05; assigning oil mass 0.04 independently
-would require separate systems and remove water/oil particle-to-particle
-contacts. These are simulation mass units, not calibrated kilograms; because
-LiquidFun is two-dimensional, its density is per area rather than volumetric.
+the oil particles also use mass 0.03; assigning different water and oil masses
+independently would require separate systems and remove contacts between water
+and oil particles. With the unchanged 1.5 mm stride, this derives a shared
+system density of 0.013333 simulation mass units per square Box2D unit. These
+are simulation mass units, not calibrated kilograms; because LiquidFun is
+two-dimensional, its density is per area rather than volumetric.
 LiquidFun represents fluid with radius-bearing particles and neighbor pressure
 and contact solves; triangular fluid elements are not required. The application
-sets the shared particle-system `pressureStrength` to 0.5, ten times the
+sets the shared particle-system `pressureStrength` to 0.25, five times the
 installed `liquidfun-wasm@7.0.0` default of 0.05. This is a solver coefficient,
 not a physical pressure unit or a per-material setting. The increased value is
 a tuning experiment; check volume retention, oscillation, and stability under
@@ -131,8 +133,9 @@ The live LiquidFun route executes the WASM engine described above and exposes
 pause/resume, single-step, reset, manual 2D gravity (each component ranges to
 ±999 Gate 4 units/s², initially (0, 0)), horizontal oscillation (default
 amplitude ±999 Gate 4 units/s² at 0.16 Hz, adjustable up to ±999), requested
-simulation speed (default 0.5×), render mode, render-target FPS (default 90),
-and live step/backlog metrics. The gravity range corresponds to approximately
+simulation speed (default 0.5×; options 1/16×, 1/8×, 0.25×, 0.5×, 1×, 2×, 4×,
+8×, 16×, and 32×), render mode, render-target FPS (default 90), and live
+step/backlog metrics. The gravity range corresponds to approximately
 ±9.99 m/s² (about ±1.02G). The oscillation is added to X gravity and integrated
 as the average acceleration over each fixed step using simulation time; setting
 its amplitude to zero disables it. The FPS target limits Canvas drawing only;
@@ -154,7 +157,7 @@ The CPU and GPU MLS-MPM pages remain a separate same-equation numerical
 comparison. LiquidFun is a behavioral reference for contact, waves, settling,
 and stability, not an exact trajectory or constitutive-model oracle. Water
 and oil use different LiquidFun particle flags in one particle system, so they
-share its density, radius, and 0.05 particle mass. The 50 pebble triangles are
+share its density, radius, and 0.03 particle mass. The 50 pebble triangles are
 rigid Box2D bodies, not deformable MLS-MPM triangles; fracture nodes use
 dynamic bodies and breakable distance joints. These model differences should
 be retained when interpreting the visual and timing results.

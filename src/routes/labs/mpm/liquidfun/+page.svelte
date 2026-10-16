@@ -43,7 +43,18 @@
 
 	const MAX_STEPS_PER_FRAME = 8;
 	const MAX_PHYSICS_FRAME_BUDGET_MS = 8;
-	const SIMULATION_SPEED_OPTIONS = [0.25, 0.5, 1, 2, 4, 8, 16, 32] as const;
+	const SIMULATION_SPEED_OPTIONS = [
+		{ value: 1 / 16, label: '1/16' },
+		{ value: 1 / 8, label: '1/8' },
+		{ value: 0.25, label: '0.25' },
+		{ value: 0.5, label: '0.5' },
+		{ value: 1, label: '1' },
+		{ value: 2, label: '2' },
+		{ value: 4, label: '4' },
+		{ value: 8, label: '8' },
+		{ value: 16, label: '16' },
+		{ value: 32, label: '32' }
+	] as const;
 	const MANUAL_GRAVITY_COMPONENT_LIMIT = 999;
 	const DEFAULT_LIQUIDFUN_OSCILLATION_AMPLITUDE = 999;
 	const MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE = 999;
@@ -95,8 +106,15 @@
 					? 'ページ非表示中 · 物理計算を停止中'
 					: paused
 						? '一時停止中 · 未処理時間は保持されています'
-						: `実行中 · LiquidFun WASM · 要求 ${simulationSpeed}×`
+						: `実行中 · LiquidFun WASM · 要求 ${formatSimulationSpeed(simulationSpeed)}×`
 	);
+
+	function formatSimulationSpeed(speed: number): string {
+		return (
+			SIMULATION_SPEED_OPTIONS.find((option) => option.value === speed)?.label ??
+			String(speed)
+		);
+	}
 
 	function gravityForNextStep(): MpmVector2 {
 		return calculateLiquidFunStepGravity(
@@ -501,8 +519,8 @@
 				<label>
 					<span>Requested simulation speed</span>
 					<select bind:value={simulationSpeed}>
-						{#each SIMULATION_SPEED_OPTIONS as speed}
-							<option value={speed}>{speed}×</option>
+						{#each SIMULATION_SPEED_OPTIONS as option}
+							<option value={option.value}>{option.label}×</option>
 						{/each}
 					</select>
 				</label>
@@ -646,7 +664,8 @@
 			</li>
 			<li>
 				Water and oil use separate LiquidFun particle flags in one particle system, so both use the same
-				1.0 mm radius and 0.05 simulation mass units and retain mutual particle collisions. The triangular pebbles are
+				1.0 mm radius and 0.03 simulation mass units and retain mutual particle collisions. The triangular
+				pebbles are
 				rigid approximations, not deformable MLS-MPM triangles. Do not interpret their paths as a
 				matched-physics comparison.
 			</li>
