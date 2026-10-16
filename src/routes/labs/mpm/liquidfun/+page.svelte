@@ -7,6 +7,13 @@
 		type MpmRenderFps
 	} from '#lib/mpm/kernels/frame-pacer.js';
 	import {
+		DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE,
+		HORIZONTAL_OSCILLATION_FREQUENCY_HZ,
+		INITIAL_HORIZONTAL_OSCILLATION_AMPLITUDE,
+		MAX_HORIZONTAL_OSCILLATION_AMPLITUDE
+	} from '#lib/mpm/kernels/oscillation.js';
+	import { calculateLiquidFunStepGravity } from '#lib/mpm/liquidfun/oscillation.js';
+	import {
 		createLiquidFunSimulation,
 		type LiquidFunRenderMode,
 		type LiquidFunSimulation
@@ -28,6 +35,12 @@
 	const MAX_STEPS_PER_FRAME = 8;
 	const MAX_PHYSICS_FRAME_BUDGET_MS = 8;
 	const SIMULATION_SPEED_OPTIONS = [0.25, 0.5, 1, 2, 4, 8, 16, 32] as const;
+	const LIQUIDFUN_CONTROL_STRENGTH_SCALE = 4;
+	const BASE_MANUAL_GRAVITY_COMPONENT_LIMIT = 180;
+	const MANUAL_GRAVITY_COMPONENT_LIMIT =
+		BASE_MANUAL_GRAVITY_COMPONENT_LIMIT * LIQUIDFUN_CONTROL_STRENGTH_SCALE;
+	const MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE =
+		MAX_HORIZONTAL_OSCILLATION_AMPLITUDE * LIQUIDFUN_CONTROL_STRENGTH_SCALE;
 	const DEFAULT_RENDER_FPS: MpmRenderFps = 60;
 	const METRICS_INTERVAL_MS = 500;
 	const framePacer = new MpmFramePacer();
@@ -43,6 +56,9 @@
 	let errorMessage = $state('');
 	let gravityX = $state(LIQUIDFUN_GATE4_GRAVITY.x);
 	let gravityY = $state(LIQUIDFUN_GATE4_GRAVITY.y);
+	let horizontalOscillationAmplitude = $state(
+		INITIAL_HORIZONTAL_OSCILLATION_AMPLITUDE
+	);
 	let simulationSpeed = $state(1);
 	let renderTargetFps: MpmRenderFps = $state(DEFAULT_RENDER_FPS);
 	let renderMode = $state<LiquidFunRenderMode>('surface');
@@ -56,12 +72,12 @@
 	let animationFrame = 0;
 	let lastFrameTime = 0;
 	let lastMetricsTime = 0;
+	let simulatedTimeSeconds = 0;
 	let accumulatorSeconds = 0;
 	let renderedFramesForMetrics = 0;
 	let stepsForMetrics = 0;
 	let physicsMsForMetrics = 0;
 
-	const appliedGravity = $derived<MpmVector2>({ x: gravityX, y: gravityY });
 	const effectiveSimulationSpeed = $derived(
 		stepsPerSecond * LIQUIDFUN_DT_SECONDS
 	);
@@ -77,6 +93,14 @@
 						? '一時停止中 · 未処理時間は保持されています'
 						: `実行中 · LiquidFun WASM · 要求 ${simulationSpeed}×`
 	);
+
+	function gravityForNextStep(): MpmVector2 {
+		return calculateLiquidFunStepGravity(
+			{ x: gravityX, y: gravityY },
+			simulatedTimeSeconds,
+			horizontalOscillationAmplitude
+		);
+	}
 
 	function errorText(error: unknown): string {
 		return error instanceof Error && error.message.trim()
@@ -114,6 +138,7 @@
 		paused = false;
 		phase = 'loading';
 		errorMessage = '';
+		simulatedTimeSeconds = 0;
 		accumulatorSeconds = 0;
 		pendingSimulationMs = 0;
 		lastFrameTime = 0;
@@ -135,7 +160,7 @@
 			}
 
 			try {
-				createdSimulation.setGravityFromGate4(appliedGravity);
+				createdSimulation.setGravityFromGate4(gravityForNextStep());
 			} catch (error) {
 				try {
 					createdSimulation.dispose();
@@ -172,17 +197,28 @@
 
 	function setGravity(): void {
 		try {
-			simulation?.setGravityFromGate4(appliedGravity);
+			simulation?.setGravityFromGate4(gravityForNextStep());
 		} catch (error) {
 			failSimulation(error);
 		}
 	}
 
+	function toggleHorizontalOscillation(): void {
+		horizontalOscillationAmplitude =
+			horizontalOscillationAmplitude > 0
+				? 0
+				: DEFAULT_HORIZONTAL_OSCILLATION_AMPLITUDE;
+		setGravity();
+	}
+
 	function stepOnce(): void {
-		if (!simulation || phase !== 'ready' || !paused) return;
+		const currentSimulation = simulation;
+		if (!currentSimulation || phase !== 'ready' || !paused) return;
 		try {
+			currentSimulation.setGravityFromGate4(gravityForNextStep());
 			const startedAt = performance.now();
-			simulation.step();
+			currentSimulation.step();
+			simulatedTimeSeconds += LIQUIDFUN_DT_SECONDS;
 			physicsMsForMetrics += performance.now() - startedAt;
 			stepsForMetrics += 1;
 		} catch (error) {
@@ -214,7 +250,8 @@
 		const elapsedSeconds =
 			lastFrameTime === 0 ? 0 : Math.max(0, (now - lastFrameTime) / 1_000);
 		lastFrameTime = now;
-		if (simulation && phase === 'ready' && !paused && pageVisible) {
+		const currentSimulation = simulation;
+		if (currentSimulation && phase === 'ready' && !paused && pageVisible) {
 			try {
 				accumulatorSeconds += elapsedSeconds * simulationSpeed;
 				if (!Number.isFinite(accumulatorSeconds)) {
@@ -228,8 +265,10 @@
 					stepsThisFrame < MAX_STEPS_PER_FRAME &&
 					performance.now() - physicsStartedAt < MAX_PHYSICS_FRAME_BUDGET_MS
 				) {
+					currentSimulation.setGravityFromGate4(gravityForNextStep());
 					const stepStartedAt = performance.now();
-					simulation.step();
+					currentSimulation.step();
+					simulatedTimeSeconds += LIQUIDFUN_DT_SECONDS;
 					physicsMsForMetrics += performance.now() - stepStartedAt;
 					accumulatorSeconds = Math.max(
 						0,
@@ -382,14 +421,16 @@
 			</div>
 
 			<fieldset class="gravity-controls">
-				<legend>Manual 2D gravity · Gate 4 units/s²</legend>
+				<legend>
+					Manual 2D gravity · Gate 4 units/s² (±{MANUAL_GRAVITY_COMPONENT_LIMIT})
+				</legend>
 				<label class="range-control">
 					<span>X</span>
 					<output>{gravityX}</output>
 					<input
 						type="range"
-						min="-180"
-						max="180"
+						min={-MANUAL_GRAVITY_COMPONENT_LIMIT}
+						max={MANUAL_GRAVITY_COMPONENT_LIMIT}
 						step="5"
 						bind:value={gravityX}
 						oninput={setGravity}
@@ -401,8 +442,8 @@
 					<output>{gravityY}</output>
 					<input
 						type="range"
-						min="-180"
-						max="180"
+						min={-MANUAL_GRAVITY_COMPONENT_LIMIT}
+						max={MANUAL_GRAVITY_COMPONENT_LIMIT}
 						step="5"
 						bind:value={gravityY}
 						oninput={setGravity}
@@ -410,7 +451,42 @@
 					/>
 				</label>
 				<p class="control-note">
-					Gravity is applied immediately on both axes. The default (0, 90) matches the Gate 4 scene.
+					The default manual gravity (0, 90) matches Gate 4. Horizontal oscillation, when enabled,
+					is added to X.
+				</p>
+			</fieldset>
+
+			<fieldset class="oscillation-controls">
+				<legend>Horizontal oscillation · {HORIZONTAL_OSCILLATION_FREQUENCY_HZ} Hz</legend>
+				<label class="range-control">
+					<span>Acceleration amplitude</span>
+					<output>±{horizontalOscillationAmplitude}</output>
+					<input
+						type="range"
+						min="0"
+						max={MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE}
+						step="10"
+						bind:value={horizontalOscillationAmplitude}
+						oninput={setGravity}
+						disabled={phase !== 'ready'}
+						aria-label="Horizontal oscillation acceleration"
+						aria-valuetext={`±${horizontalOscillationAmplitude} Gate 4 units/s²`}
+					/>
+				</label>
+				<button
+					class="wide-button"
+					type="button"
+					onclick={toggleHorizontalOscillation}
+					disabled={phase !== 'ready'}
+					aria-pressed={horizontalOscillationAmplitude > 0}
+				>
+					{horizontalOscillationAmplitude > 0
+						? 'Stop horizontal oscillation'
+						: 'Start horizontal oscillation (±240)'}
+				</button>
+				<p class="control-note">
+					Added to manual X gravity; amplitude can reach ±{MAX_LIQUIDFUN_OSCILLATION_AMPLITUDE}
+					and is synchronized to simulation time. Set it to 0 to disable.
 				</p>
 			</fieldset>
 
@@ -769,7 +845,8 @@
 		font: inherit;
 	}
 
-	.gravity-controls {
+	.gravity-controls,
+	.oscillation-controls {
 		display: grid;
 		gap: 0.65rem;
 		min-width: 0;
@@ -780,7 +857,8 @@
 		background: #0d1823;
 	}
 
-	.gravity-controls legend {
+	.gravity-controls legend,
+	.oscillation-controls legend {
 		padding: 0 0.35rem;
 		font-weight: 650;
 	}
