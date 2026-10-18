@@ -8,6 +8,11 @@ import {
 	LIQUIDFUN_GATE4_DOMAIN,
 	LIQUIDFUN_GATE4_GRAVITY,
 	LIQUIDFUN_GATE4_UNITS_PER_METER,
+	LIQUIDFUN_ELASTIC_PARTICLE_COUNT,
+	LIQUIDFUN_ELASTIC_STRENGTH,
+	LIQUIDFUN_ELASTIC_TRIANGLE_COUNT,
+	LIQUIDFUN_RIGID_TRIANGLE_COUNT,
+	LIQUIDFUN_RIGID_TRIANGLE_VERTEX_COUNT,
 	LIQUIDFUN_OIL_PARTICLE_COUNT_MULTIPLIER,
 	LIQUIDFUN_OIL_PARTICLE_COUNT,
 	LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS,
@@ -17,6 +22,9 @@ import {
 	LIQUIDFUN_PEBBLE_EDGE_LENGTH_BOX2D_UNITS,
 	LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS,
 	LIQUIDFUN_PEBBLE_MASS,
+	LIQUIDFUN_PEBBLE_TRIANGLE_COUNT,
+	LIQUIDFUN_PEBBLE_TRIANGLE_VERTEX_COUNT,
+	LIQUIDFUN_PEBBLE_VERTEX_COUNT,
 	LIQUIDFUN_PARTICLE_RADIUS_METERS,
 	LIQUIDFUN_PRESSURE_STRENGTH,
 	LIQUIDFUN_SHARED_PARTICLE_DENSITY,
@@ -24,6 +32,17 @@ import {
 	LIQUIDFUN_PHYSICAL_DOMAIN_METERS,
 	LIQUIDFUN_SCENE_SEED,
 	LIQUIDFUN_SOLID_NODE_RADIUS_METERS,
+	LIQUIDFUN_SOFT_SQUARE_COUNT,
+	LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_BOX2D_UNITS,
+	LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_GATE4_UNITS,
+	LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_METERS,
+	LIQUIDFUN_SOFT_SQUARE_MASS,
+	LIQUIDFUN_SOFT_SQUARE_NODE_COUNT,
+	LIQUIDFUN_SOFT_SQUARE_NODE_MASS,
+	LIQUIDFUN_SOFT_SQUARE_SPRING_COUNT,
+	LIQUIDFUN_SOFT_SQUARE_SPRING_FREQUENCY_HZ,
+	LIQUIDFUN_SOFT_SQUARE_SPRINGS_PER_OBJECT,
+	LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT,
 	LIQUIDFUN_WATER_PARTICLE_COUNT_MULTIPLIER,
 	LIQUIDFUN_WATER_PARTICLE_ROWS,
 	LIQUIDFUN_OIL_PARTICLE_ROWS,
@@ -47,6 +66,7 @@ import {
 	GATE4_OIL_PARTICLE_COLUMNS,
 	GATE4_PEBBLE_COUNT,
 	GATE4_PEBBLE_PARTICLE_COUNT,
+	GATE4_PEBBLE_PARTICLES_PER_OBJECT,
 	GATE4_OIL_PARTICLE_COUNT,
 	GATE4_OIL_PARTICLE_ROWS,
 	GATE4_WATER_PARTICLE_COLUMNS,
@@ -91,13 +111,21 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 		expect(LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS).toBe(0.003);
 		expect(LIQUIDFUN_PEBBLE_EDGE_LENGTH_BOX2D_UNITS).toBe(3);
 		expect(LIQUIDFUN_PEBBLE_MASS).toBe(0.008);
+		expect(LIQUIDFUN_ELASTIC_STRENGTH).toBe(0.25);
+		expect(LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_METERS).toBe(0.003);
+		expect(LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_BOX2D_UNITS).toBe(3);
+		expect(LIQUIDFUN_SOFT_SQUARE_MASS).toBe(LIQUIDFUN_PEBBLE_MASS);
+		expect(LIQUIDFUN_SOFT_SQUARE_NODE_MASS * LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT).toBeCloseTo(
+			LIQUIDFUN_PEBBLE_MASS
+		);
+		expect(LIQUIDFUN_SOFT_SQUARE_SPRING_FREQUENCY_HZ).toBe(4);
 	});
 
 	it('uses the requested pressure strength for the shared fluid particle system', () => {
 		expect(LIQUIDFUN_PRESSURE_STRENGTH).toBe(1.0);
 	});
 
-	it('preserves source counts and solid topology while expanding liquid flags', () => {
+	it('preserves source counts while mapping alternating pebbles to triangles and squares', () => {
 		const workload = createLiquidFunGate4Workload();
 		const scene = createMpmGate4Scene(LIQUIDFUN_SCENE_SEED);
 		const waterParticles = scene.particles.filter(
@@ -139,14 +167,80 @@ describe('LiquidFun Gate 4 workload mapping', () => {
 		).toBe(true);
 		expect(workload.pebbleNodes).toHaveLength(GATE4_PEBBLE_PARTICLE_COUNT);
 		expect(workload.pebbleNodes).toEqual(pebbleNodes);
-		expect(workload.pebbleGroups).toHaveLength(GATE4_PEBBLE_COUNT);
-		expect(workload.pebbleGroups).toHaveLength(50);
+		expect(workload.pebbleGroups).toHaveLength(LIQUIDFUN_PEBBLE_TRIANGLE_COUNT);
+		expect(workload.pebbleGroups).toHaveLength(25);
+		expect(LIQUIDFUN_ELASTIC_TRIANGLE_COUNT).toBe(13);
+		expect(LIQUIDFUN_RIGID_TRIANGLE_COUNT).toBe(12);
+		expect(LIQUIDFUN_ELASTIC_PARTICLE_COUNT).toBe(39);
+		expect(LIQUIDFUN_RIGID_TRIANGLE_VERTEX_COUNT).toBe(36);
+		expect(
+			workload.pebbleGroups.map((group) => group.usesElasticParticleFlag)
+		).toEqual(
+			Array.from(
+				{ length: LIQUIDFUN_PEBBLE_TRIANGLE_COUNT },
+				(_, index) => index % 2 === 0
+			)
+		);
+		expect(
+			workload.pebbleGroups.filter((group) => group.usesElasticParticleFlag)
+		).toHaveLength(LIQUIDFUN_ELASTIC_TRIANGLE_COUNT);
+		expect(
+			workload.pebbleGroups.filter((group) => !group.usesElasticParticleFlag)
+		).toHaveLength(LIQUIDFUN_RIGID_TRIANGLE_COUNT);
 		for (const group of workload.pebbleGroups) {
 			const nodes = group.nodeIndices.map(
 				(nodeIndex) => workload.pebbleNodes[nodeIndex]
 			);
 			expect(nodes.every((node) => node?.objectId === group.objectId)).toBe(true);
 			expect(nodes.map((node) => node?.bondedTriangleVertex)).toEqual([0, 1, 2]);
+		}
+		expect(workload.softSquareGroups).toHaveLength(LIQUIDFUN_SOFT_SQUARE_COUNT);
+		expect(workload.softSquareGroups).toHaveLength(25);
+		expect(
+			new Set([
+				...workload.pebbleGroups.map(({ objectId }) => objectId),
+				...workload.softSquareGroups.map(({ objectId }) => objectId)
+			]).size
+		).toBe(GATE4_PEBBLE_COUNT);
+		expect(workload.softSquareGroups.every(({ bonds }) => bonds.length === 6)).toBe(true);
+		expect(LIQUIDFUN_SOFT_SQUARE_NODE_COUNT).toBe(100);
+		expect(LIQUIDFUN_SOFT_SQUARE_SPRING_COUNT).toBe(150);
+		expect(LIQUIDFUN_PEBBLE_TRIANGLE_VERTEX_COUNT).toBe(75);
+		expect(LIQUIDFUN_PEBBLE_VERTEX_COUNT).toBe(175);
+		expect(LIQUIDFUN_PEBBLE_VERTEX_COUNT / GATE4_PEBBLE_PARTICLE_COUNT).toBeCloseTo(
+			7 / 6
+		);
+		expect(
+			LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT / GATE4_PEBBLE_PARTICLES_PER_OBJECT
+		).toBeCloseTo(4 / 3);
+		for (const square of workload.softSquareGroups) {
+			expect(square.nodes).toHaveLength(LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT);
+			expect(
+				square.bonds.map(({ firstNodeIndex, secondNodeIndex }) => [
+					firstNodeIndex,
+					secondNodeIndex
+				])
+			).toEqual([
+				[0, 1],
+				[1, 2],
+				[2, 3],
+				[3, 0],
+				[0, 2],
+				[1, 3]
+			]);
+			for (let index = 0; index < square.nodes.length; index += 1) {
+				const first = square.nodes[index];
+				const second = square.nodes[(index + 1) % square.nodes.length];
+				expect(first).toBeDefined();
+				expect(second).toBeDefined();
+				if (!first || !second) continue;
+				expect(
+					Math.hypot(
+						second.position.x - first.position.x,
+						second.position.y - first.position.y
+					)
+				).toBeCloseTo(LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_GATE4_UNITS);
+			}
 		}
 		expect(workload.fractureNodes).toHaveLength(GATE4_FRACTURE_PARTICLE_COUNT);
 		expect(workload.fractureNodes).toHaveLength(24);

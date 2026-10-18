@@ -14,6 +14,7 @@ import {
 	GATE4_PARTICLE_COUNT,
 	GATE4_PEBBLE_COUNT,
 	GATE4_PEBBLE_EDGE_LENGTH,
+	GATE4_PEBBLE_PARTICLES_PER_OBJECT,
 	GATE4_PEBBLE_PARTICLE_COUNT,
 	GATE4_SOLID_PARTICLE_MASS,
 	GATE4_WATER_PARTICLE_COLUMNS,
@@ -38,8 +39,31 @@ export const LIQUIDFUN_BOX2D_GRAVITY_UNITS_PER_SECOND_SQUARED: MpmVector2 = {
 		(-LIQUIDFUN_GATE4_GRAVITY.y * LIQUIDFUN_BOX2D_UNITS_PER_METER) /
 		LIQUIDFUN_GATE4_ACCELERATION_UNITS_PER_METER_PER_SECOND_SQUARED
 };
+export const LIQUIDFUN_PEBBLE_TRIANGLE_COUNT = GATE4_PEBBLE_COUNT / 2;
+export const LIQUIDFUN_SOFT_SQUARE_COUNT =
+	GATE4_PEBBLE_COUNT - LIQUIDFUN_PEBBLE_TRIANGLE_COUNT;
+export const LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT = 4;
+export const LIQUIDFUN_PEBBLE_TRIANGLE_VERTEX_COUNT =
+	LIQUIDFUN_PEBBLE_TRIANGLE_COUNT * GATE4_PEBBLE_PARTICLES_PER_OBJECT;
+export const LIQUIDFUN_ELASTIC_TRIANGLE_COUNT = Math.ceil(
+	LIQUIDFUN_PEBBLE_TRIANGLE_COUNT / 2
+);
+export const LIQUIDFUN_RIGID_TRIANGLE_COUNT =
+	LIQUIDFUN_PEBBLE_TRIANGLE_COUNT - LIQUIDFUN_ELASTIC_TRIANGLE_COUNT;
+export const LIQUIDFUN_ELASTIC_PARTICLE_COUNT =
+	LIQUIDFUN_ELASTIC_TRIANGLE_COUNT * GATE4_PEBBLE_PARTICLES_PER_OBJECT;
+export const LIQUIDFUN_RIGID_TRIANGLE_VERTEX_COUNT =
+	LIQUIDFUN_RIGID_TRIANGLE_COUNT * GATE4_PEBBLE_PARTICLES_PER_OBJECT;
+export const LIQUIDFUN_SOFT_SQUARE_NODE_COUNT =
+	LIQUIDFUN_SOFT_SQUARE_COUNT * LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT;
+export const LIQUIDFUN_SOFT_SQUARE_SPRINGS_PER_OBJECT = 6;
+export const LIQUIDFUN_SOFT_SQUARE_SPRING_COUNT =
+	LIQUIDFUN_SOFT_SQUARE_COUNT * LIQUIDFUN_SOFT_SQUARE_SPRINGS_PER_OBJECT;
+export const LIQUIDFUN_PEBBLE_VERTEX_COUNT =
+	LIQUIDFUN_PEBBLE_TRIANGLE_VERTEX_COUNT + LIQUIDFUN_SOFT_SQUARE_NODE_COUNT;
 export const LIQUIDFUN_SHARED_PARTICLE_MASS = 0.01;
 export const LIQUIDFUN_PRESSURE_STRENGTH = 1.0;
+export const LIQUIDFUN_ELASTIC_STRENGTH = 0.25;
 export const LIQUIDFUN_PARTICLE_RADIUS_METERS = 1e-3;
 export const LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS =
 	LIQUIDFUN_PARTICLE_RADIUS_METERS * LIQUIDFUN_BOX2D_UNITS_PER_METER;
@@ -75,6 +99,34 @@ export const LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS = 3e-3;
 export const LIQUIDFUN_PEBBLE_EDGE_LENGTH_BOX2D_UNITS =
 	LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS * LIQUIDFUN_BOX2D_UNITS_PER_METER;
 export const LIQUIDFUN_PEBBLE_MASS = 0.008;
+export const LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_METERS =
+	LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS;
+export const LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_BOX2D_UNITS =
+	LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_METERS * LIQUIDFUN_BOX2D_UNITS_PER_METER;
+export const LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_GATE4_UNITS =
+	LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_METERS * LIQUIDFUN_GATE4_UNITS_PER_METER;
+export const LIQUIDFUN_SOFT_SQUARE_MASS = LIQUIDFUN_PEBBLE_MASS;
+export const LIQUIDFUN_SOFT_SQUARE_NODE_MASS =
+	LIQUIDFUN_SOFT_SQUARE_MASS / LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT;
+export const LIQUIDFUN_SOFT_SQUARE_NODE_RADIUS_BOX2D_UNITS =
+	LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_BOX2D_UNITS / 4;
+export const LIQUIDFUN_SOFT_SQUARE_NODE_DENSITY =
+	LIQUIDFUN_SOFT_SQUARE_NODE_MASS /
+	(Math.PI * LIQUIDFUN_SOFT_SQUARE_NODE_RADIUS_BOX2D_UNITS ** 2);
+export const LIQUIDFUN_SOFT_SQUARE_SPRING_FREQUENCY_HZ = 4;
+export const LIQUIDFUN_SOFT_SQUARE_SPRING_DAMPING_RATIO = 0.7;
+const LIQUIDFUN_SOFT_SQUARE_SPRING_ANGULAR_FREQUENCY =
+	2 * Math.PI * LIQUIDFUN_SOFT_SQUARE_SPRING_FREQUENCY_HZ;
+const LIQUIDFUN_SOFT_SQUARE_REDUCED_NODE_MASS =
+	LIQUIDFUN_SOFT_SQUARE_NODE_MASS / 2;
+export const LIQUIDFUN_SOFT_SQUARE_SPRING_STIFFNESS =
+	LIQUIDFUN_SOFT_SQUARE_REDUCED_NODE_MASS *
+	LIQUIDFUN_SOFT_SQUARE_SPRING_ANGULAR_FREQUENCY ** 2;
+export const LIQUIDFUN_SOFT_SQUARE_SPRING_DAMPING =
+	2 *
+	LIQUIDFUN_SOFT_SQUARE_SPRING_DAMPING_RATIO *
+	LIQUIDFUN_SOFT_SQUARE_REDUCED_NODE_MASS *
+	LIQUIDFUN_SOFT_SQUARE_SPRING_ANGULAR_FREQUENCY;
 export const LIQUIDFUN_FRACTURE_BOND_FREQUENCY_HZ = 8;
 export const LIQUIDFUN_BOND_DAMPING_RATIO = 1;
 const LIQUIDFUN_FRACTURE_BOND_ANGULAR_FREQUENCY =
@@ -153,6 +205,23 @@ export interface LiquidFunVector {
 export interface LiquidFunTriangleGroupSeed {
 	readonly objectId: number;
 	readonly nodeIndices: readonly [number, number, number];
+	readonly usesElasticParticleFlag: boolean;
+}
+
+export interface LiquidFunSoftSquareNodeSeed {
+	readonly position: MpmVector2;
+	readonly velocity: MpmVector2;
+}
+
+export interface LiquidFunSoftSquareSeed {
+	readonly objectId: number;
+	readonly nodes: readonly [
+		LiquidFunSoftSquareNodeSeed,
+		LiquidFunSoftSquareNodeSeed,
+		LiquidFunSoftSquareNodeSeed,
+		LiquidFunSoftSquareNodeSeed
+	];
+	readonly bonds: readonly LiquidFunBondSeed[];
 }
 
 export interface LiquidFunBondSeed {
@@ -173,6 +242,7 @@ export interface LiquidFunGate4Workload {
 	readonly oilParticles: readonly MpmParticle[];
 	readonly pebbleNodes: readonly MpmParticle[];
 	readonly pebbleGroups: readonly LiquidFunTriangleGroupSeed[];
+	readonly softSquareGroups: readonly LiquidFunSoftSquareSeed[];
 	readonly fractureNodes: readonly MpmParticle[];
 	readonly fractureBonds: readonly LiquidFunFractureBondSeed[];
 }
@@ -287,6 +357,107 @@ export function mapBox2DVelocityToGate4(velocity: LiquidFunVector): MpmVector2 {
 	};
 }
 
+const SOFT_SQUARE_CORNER_OFFSETS = [
+	{ x: -0.5, y: -0.5 },
+	{ x: 0.5, y: -0.5 },
+	{ x: 0.5, y: 0.5 },
+	{ x: -0.5, y: 0.5 }
+] as const;
+const SOFT_SQUARE_BOND_ENDPOINTS = [
+	[0, 1],
+	[1, 2],
+	[2, 3],
+	[3, 0],
+	[0, 2],
+	[1, 3]
+] as const;
+
+function createSoftSquareSeed(
+	objectId: number,
+	triangleNodes: readonly [MpmParticle, MpmParticle, MpmParticle]
+): LiquidFunSoftSquareSeed {
+	const center = triangleNodes.reduce(
+		(total, node) => ({
+			x: total.x + node.position.x / triangleNodes.length,
+			y: total.y + node.position.y / triangleNodes.length
+		}),
+		{ x: 0, y: 0 }
+	);
+	const linearVelocity = triangleNodes.reduce(
+		(total, node) => ({
+			x: total.x + node.velocity.x / triangleNodes.length,
+			y: total.y + node.velocity.y / triangleNodes.length
+		}),
+		{ x: 0, y: 0 }
+	);
+	let angularVelocityNumerator = 0;
+	let angularVelocityDenominator = 0;
+	for (const node of triangleNodes) {
+		const relativePosition = {
+			x: node.position.x - center.x,
+			y: node.position.y - center.y
+		};
+		const relativeVelocity = {
+			x: node.velocity.x - linearVelocity.x,
+			y: node.velocity.y - linearVelocity.y
+		};
+		angularVelocityNumerator +=
+			relativePosition.x * relativeVelocity.y -
+			relativePosition.y * relativeVelocity.x;
+		angularVelocityDenominator +=
+			relativePosition.x ** 2 + relativePosition.y ** 2;
+	}
+	if (
+		!Number.isFinite(angularVelocityNumerator) ||
+		!Number.isFinite(angularVelocityDenominator) ||
+		angularVelocityDenominator <= Number.EPSILON
+	) {
+		throw new RangeError('A Gate 4 soft square must have finite source motion.');
+	}
+	const angularVelocity =
+		angularVelocityNumerator / angularVelocityDenominator;
+	const edgeLength = LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_GATE4_UNITS;
+	const createNode = (
+		offset: (typeof SOFT_SQUARE_CORNER_OFFSETS)[number]
+	): LiquidFunSoftSquareNodeSeed => ({
+		position: {
+			x: center.x + offset.x * edgeLength,
+			y: center.y + offset.y * edgeLength
+		},
+		velocity: {
+			x: linearVelocity.x - angularVelocity * offset.y * edgeLength,
+			y: linearVelocity.y + angularVelocity * offset.x * edgeLength
+		}
+	});
+	const nodes: LiquidFunSoftSquareSeed['nodes'] = [
+		createNode(SOFT_SQUARE_CORNER_OFFSETS[0]),
+		createNode(SOFT_SQUARE_CORNER_OFFSETS[1]),
+		createNode(SOFT_SQUARE_CORNER_OFFSETS[2]),
+		createNode(SOFT_SQUARE_CORNER_OFFSETS[3])
+	];
+	const bonds = SOFT_SQUARE_BOND_ENDPOINTS.map(
+		([firstNodeIndex, secondNodeIndex]) => {
+			const firstNode = nodes[firstNodeIndex];
+			const secondNode = nodes[secondNodeIndex];
+			if (!firstNode || !secondNode) {
+				throw new RangeError('A Gate 4 soft square bond must identify two nodes.');
+			}
+			const firstPosition = mapGate4PositionToBox2D(firstNode.position);
+			const secondPosition = mapGate4PositionToBox2D(secondNode.position);
+			return {
+				firstNodeIndex,
+				secondNodeIndex,
+				restLengthBox2DUnits: Math.hypot(
+					secondPosition.x - firstPosition.x,
+					secondPosition.y - firstPosition.y
+				)
+			};
+		}
+	);
+
+	return { objectId, nodes, bonds };
+}
+
 export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 	const scene = createMpmGate4Scene(LIQUIDFUN_SCENE_SEED);
 	const sourceWaterParticles: MpmParticle[] = [];
@@ -317,9 +488,12 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 
 	const pebbleNodes: MpmParticle[] = [];
 	const pebbleGroups: LiquidFunTriangleGroupSeed[] = [];
-	for (const [objectId, nodes] of [...pebbleNodesByObject.entries()].sort(
-		([first], [second]) => first - second
-	)) {
+	const softSquareGroups: LiquidFunSoftSquareSeed[] = [];
+	for (const [objectIndex, [objectId, nodes]] of [
+		...pebbleNodesByObject.entries()
+	]
+		.sort(([first], [second]) => first - second)
+		.entries()) {
 		const orderedNodes = [...nodes].sort(
 			(first, second) =>
 				(first.bondedTriangleVertex ?? -1) - (second.bondedTriangleVertex ?? -1)
@@ -333,17 +507,29 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 		) {
 			throw new Error(`Gate 4 pebble ${objectId} must contain vertices 0, 1, and 2.`);
 		}
+		const [firstNode, secondNode, thirdNode] = orderedNodes;
+		if (!firstNode || !secondNode || !thirdNode) {
+			throw new Error(`Gate 4 pebble ${objectId} must contain three vertices.`);
+		}
 
 		const firstNodeIndex = pebbleNodes.length;
 		pebbleNodes.push(...orderedNodes);
-		pebbleGroups.push({
+		const triangleGroup = {
 			objectId,
 			nodeIndices: [
 				firstNodeIndex,
 				firstNodeIndex + 1,
 				firstNodeIndex + 2
-			]
-		});
+			],
+			usesElasticParticleFlag: pebbleGroups.length % 2 === 0
+		} as const;
+		if (objectIndex % 2 === 0) {
+			pebbleGroups.push(triangleGroup);
+		} else {
+			softSquareGroups.push(
+				createSoftSquareSeed(objectId, [firstNode, secondNode, thirdNode])
+			);
+		}
 	}
 
 	const fractureBonds: LiquidFunFractureBondSeed[] = scene.fractureBonds.map(
@@ -367,14 +553,40 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 		sourceOilParticles.length +
 		pebbleNodes.length +
 		fractureNodes.length;
+	const elasticTriangleCount = pebbleGroups.filter(
+		(group) => group.usesElasticParticleFlag
+	).length;
 
 	if (
 		scene.particles.length !== GATE4_PARTICLE_COUNT ||
 		sourceWaterParticles.length !== GATE4_WATER_PARTICLE_COUNT ||
 		sourceOilParticles.length !== GATE4_OIL_PARTICLE_COUNT ||
-		pebbleGroups.length !== GATE4_PEBBLE_COUNT ||
+		pebbleGroups.length !== LIQUIDFUN_PEBBLE_TRIANGLE_COUNT ||
+		elasticTriangleCount !== LIQUIDFUN_ELASTIC_TRIANGLE_COUNT ||
+		softSquareGroups.length !== LIQUIDFUN_SOFT_SQUARE_COUNT ||
 		pebbleNodes.length !== GATE4_PEBBLE_PARTICLE_COUNT ||
 		fractureNodes.length !== GATE4_FRACTURE_PARTICLE_COUNT ||
+		softSquareGroups.some(
+			(group) =>
+				group.nodes.length !== LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT ||
+				group.bonds.length !== LIQUIDFUN_SOFT_SQUARE_SPRINGS_PER_OBJECT ||
+				group.nodes.some(
+					(node) =>
+						!Number.isFinite(node.position.x) ||
+						!Number.isFinite(node.position.y) ||
+						!Number.isFinite(node.velocity.x) ||
+						!Number.isFinite(node.velocity.y)
+				) ||
+				group.bonds.some(
+					(bond) =>
+						bond.firstNodeIndex < 0 ||
+						bond.firstNodeIndex >= LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT ||
+						bond.secondNodeIndex < 0 ||
+						bond.secondNodeIndex >= LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT ||
+						!Number.isFinite(bond.restLengthBox2DUnits) ||
+						bond.restLengthBox2DUnits <= 0
+				)
+		) ||
 		fractureBonds.length !== GATE4_FRACTURE_BOND_COUNT ||
 		mappedMpmNodeCount !== scene.particles.length ||
 		fractureBonds.some(
@@ -411,6 +623,7 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 		),
 		pebbleNodes,
 		pebbleGroups,
+		softSquareGroups,
 		fractureNodes,
 		fractureBonds
 	};

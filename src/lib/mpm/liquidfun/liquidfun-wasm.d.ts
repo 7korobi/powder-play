@@ -62,18 +62,38 @@ declare module 'liquidfun-wasm' {
 		delete?(): void;
 	}
 
+	export interface B2ParticleGroupDef {
+		flags: number;
+		position: B2Vec2;
+		angle: number;
+		linearVelocity: B2Vec2;
+		angularVelocity: number;
+		particleCount: number;
+		positionData: B2Vec2;
+		delete?(): void;
+	}
+
+	export interface B2ParticleGroup {
+		GetParticleCount(): number;
+		GetBufferIndex(): number;
+		GetAllParticleFlags(): number;
+	}
+
 	export interface B2ParticleSystemDef {
 		density: number;
 		gravityScale: number;
 		radius: number;
 		pressureStrength: number;
+		elasticStrength: number;
 		delete?(): void;
 	}
 
 	export interface B2ParticleSystem {
 		CreateParticle(definition: B2ParticleDef): number;
+		CreateParticleGroup(definition: B2ParticleGroupDef): B2ParticleGroup;
 		GetParticleCount(): number;
 		GetParticleFlags(index: number): number;
+		GetTriadCount(): number;
 		GetPositionBuffer(): B2Vec2;
 		delete?(): void;
 	}
@@ -102,6 +122,7 @@ declare module 'liquidfun-wasm' {
 		b2CircleShape: new () => B2CircleShape;
 		b2DistanceJointDef: new () => B2DistanceJointDef;
 		b2ParticleDef: new () => B2ParticleDef;
+		b2ParticleGroupDef: new () => B2ParticleGroupDef;
 		b2ParticleSystemDef: new () => B2ParticleSystemDef;
 		HEAPF32: Float32Array;
 		getPointer(value: B2Vec2): number;
@@ -110,6 +131,7 @@ declare module 'liquidfun-wasm' {
 		): readonly [vertices: B2Vec2, destroy: () => void];
 		b2_waterParticle: number;
 		b2_viscousParticle: number;
+		b2_elasticParticle: number;
 	}
 
 	export type LiquidFunFactory = () => Promise<LiquidFunModule>;

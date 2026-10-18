@@ -3,9 +3,10 @@ import type {
 	B2BodyDef,
 	B2CircleShape,
 	B2DistanceJointDef,
-	B2Fixture,
 	B2Joint,
 	B2ParticleDef,
+	B2ParticleGroup,
+	B2ParticleGroupDef,
 	B2ParticleSystem,
 	B2ParticleSystemDef,
 	B2PolygonShape,
@@ -14,6 +15,7 @@ import type {
 	LiquidFunModule
 } from 'liquidfun-wasm';
 import type { MpmParticle, MpmVector2 } from '../reference/solver.js';
+import { GATE4_PEBBLE_PARTICLES_PER_OBJECT } from '../scenes/gate4.js';
 import { readLiquidFunParticlePosition } from './particle-buffer.js';
 import {
 	createLiquidFunGate4Workload,
@@ -25,16 +27,30 @@ import {
 	LIQUIDFUN_GATE4_GRAVITY,
 	LIQUIDFUN_GATE4_ACCELERATION_UNITS_PER_METER_PER_SECOND_SQUARED,
 	LIQUIDFUN_GATE4_UNITS_PER_METER,
+	LIQUIDFUN_ELASTIC_PARTICLE_COUNT,
+	LIQUIDFUN_ELASTIC_STRENGTH,
+	LIQUIDFUN_ELASTIC_TRIANGLE_COUNT,
 	LIQUIDFUN_FRACTURE_BOND_DAMPING,
 	LIQUIDFUN_FRACTURE_BOND_STIFFNESS,
 	LIQUIDFUN_PARTICLE_RADIUS_METERS,
 	LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS,
 	LIQUIDFUN_PEBBLE_MASS,
+	LIQUIDFUN_PEBBLE_TRIANGLE_COUNT,
+	LIQUIDFUN_RIGID_TRIANGLE_COUNT,
 	scaleLiquidFunPebbleLocalVertices,
 	LIQUIDFUN_POSITION_ITERATIONS,
 	LIQUIDFUN_SHARED_PARTICLE_DENSITY,
+	LIQUIDFUN_SOFT_SQUARE_COUNT,
+	LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_METERS,
+	LIQUIDFUN_SOFT_SQUARE_MASS,
 	LIQUIDFUN_SOLID_NODE_DENSITY,
 	LIQUIDFUN_SOLID_NODE_RADIUS_BOX2D_UNITS,
+	LIQUIDFUN_SOFT_SQUARE_NODE_DENSITY,
+	LIQUIDFUN_SOFT_SQUARE_NODE_RADIUS_BOX2D_UNITS,
+	LIQUIDFUN_SOFT_SQUARE_SPRING_DAMPING,
+	LIQUIDFUN_SOFT_SQUARE_SPRING_DAMPING_RATIO,
+	LIQUIDFUN_SOFT_SQUARE_SPRING_FREQUENCY_HZ,
+	LIQUIDFUN_SOFT_SQUARE_SPRING_STIFFNESS,
 	LIQUIDFUN_SHARED_PARTICLE_MASS,
 	LIQUIDFUN_PHYSICAL_DOMAIN_METERS,
 	LIQUIDFUN_PRESSURE_STRENGTH,
@@ -45,6 +61,7 @@ import {
 	mapGate4VelocityToBox2D,
 	type LiquidFunBondSeed,
 	type LiquidFunFractureBondSeed,
+	type LiquidFunSoftSquareNodeSeed,
 	type LiquidFunVector
 } from './workload.js';
 import { createLiquidFunWallDefinitions } from './wall-geometry.js';
@@ -61,6 +78,13 @@ export interface LiquidFunSimulation {
 	readonly mappedMpmNodeCount: number;
 	readonly pebbleNodeCount: number;
 	readonly triangleBodyCount: number;
+	readonly elasticTriangleCount: number;
+	readonly elasticParticleCount: number;
+	readonly elasticTriadCount: number;
+	readonly softSquareCount: number;
+	readonly softSquareNodeCount: number;
+	readonly softSquareJointCount: number;
+	readonly pebbleVertexCount: number;
 	readonly fractureNodeCount: number;
 	readonly fractureBondCount: number;
 	readonly activeFractureBondCount: number;
@@ -83,6 +107,16 @@ interface PebbleTriangleBody {
 	readonly localVertices: readonly LiquidFunVector[];
 }
 
+interface PebbleTriangleMotion {
+	readonly center: LiquidFunVector;
+	readonly linearVelocity: LiquidFunVector;
+	readonly angularVelocity: number;
+	readonly localVertices: readonly LiquidFunVector[];
+	readonly areaBox2DUnitsSquared: number;
+}
+
+type SoftSquareBody = readonly [B2Body, B2Body, B2Body, B2Body];
+
 interface FractureBondJoint extends LiquidFunFractureBondSeed {
 	joint: B2Joint | null;
 }
@@ -92,8 +126,17 @@ interface VectorWithAxisGetters {
 	get_y(): number;
 }
 
-function release(value: { delete?: () => void } | null | undefined): void {
-	value?.delete?.();
+function release(
+	value:
+		| { delete?: () => void; __destroy__?: () => void }
+		| null
+		| undefined
+): void {
+	if (typeof value?.delete === 'function') {
+		value.delete();
+	} else {
+		value?.__destroy__?.();
+	}
 }
 
 function releaseUnknown(value: unknown): void {
@@ -104,6 +147,13 @@ function releaseUnknown(value: unknown): void {
 		typeof value.delete === 'function'
 	) {
 		value.delete();
+	} else if (
+		typeof value === 'object' &&
+		value !== null &&
+		'__destroy__' in value &&
+		typeof value.__destroy__ === 'function'
+	) {
+		value.__destroy__();
 	}
 }
 
@@ -183,28 +233,25 @@ function addBoxFixture(
 	halfWidth: number,
 	halfHeight: number
 ): void {
-	const shape: B2PolygonShape = new module.b2PolygonShape();
-	let fixture: B2Fixture | undefined;
+	const shape = new module.b2PolygonShape();
 	try {
 		shape.SetAsBox(halfWidth, halfHeight);
-		fixture = body.CreateFixture(shape, 0);
+		if (!body.CreateFixture(shape, 0)) {
+			throw new Error('LiquidFun did not create a static wall fixture.');
+		}
 	} finally {
-		release(fixture);
 		release(shape);
 	}
 }
 
 function addSolidNodeFixture(module: LiquidFunModule, body: B2Body): void {
 	const shape: B2CircleShape = new module.b2CircleShape();
-	let fixture: B2Fixture | undefined;
 	try {
 		shape.m_radius = LIQUIDFUN_SOLID_NODE_RADIUS_BOX2D_UNITS;
-		fixture = body.CreateFixture(shape, LIQUIDFUN_SOLID_NODE_DENSITY);
-		if (!fixture) {
+		if (!body.CreateFixture(shape, LIQUIDFUN_SOLID_NODE_DENSITY)) {
 			throw new Error('LiquidFun did not create a Gate 4 solid-node fixture.');
 		}
 	} finally {
-		release(fixture);
 		release(shape);
 	}
 }
@@ -221,20 +268,37 @@ function createSolidNodeBody(
 		mapGate4PositionToBox2D(particle.position),
 		mapGate4VelocityToBox2D(particle.velocity)
 	);
+	addSolidNodeFixture(module, body);
+	return body;
+}
+
+function createSoftSquareNodeBody(
+	module: LiquidFunModule,
+	world: B2World,
+	node: LiquidFunSoftSquareNodeSeed
+): B2Body {
+	const body = createBody(
+		module,
+		world,
+		B2_DYNAMIC_BODY,
+		mapGate4PositionToBox2D(node.position),
+		mapGate4VelocityToBox2D(node.velocity)
+	);
+	const shape = new module.b2CircleShape();
 	try {
-		addSolidNodeFixture(module, body);
+		shape.m_radius = LIQUIDFUN_SOFT_SQUARE_NODE_RADIUS_BOX2D_UNITS;
+		if (!body.CreateFixture(shape, LIQUIDFUN_SOFT_SQUARE_NODE_DENSITY)) {
+			throw new Error('LiquidFun did not create a soft-square node fixture.');
+		}
 		return body;
-	} catch (error) {
-		release(body);
-		throw error;
+	} finally {
+		release(shape);
 	}
 }
 
-function createPebbleTriangleBody(
-	module: LiquidFunModule,
-	world: B2World,
+function calculatePebbleTriangleMotion(
 	nodes: readonly [MpmParticle, MpmParticle, MpmParticle]
-): PebbleTriangleBody {
+): PebbleTriangleMotion {
 	const positions = nodes.map((node) => mapGate4PositionToBox2D(node.position));
 	const velocities = nodes.map((node) => mapGate4VelocityToBox2D(node.velocity));
 	const positionSum = positions.reduce(average, { x: 0, y: 0 });
@@ -276,6 +340,9 @@ function createPebbleTriangleBody(
 		throw new RangeError('A Gate 4 pebble triangle must have nonzero area.');
 	}
 	const angularVelocity = angularVelocityNumerator / angularVelocityDenominator;
+	if (!Number.isFinite(angularVelocity)) {
+		throw new RangeError('A Gate 4 pebble triangle must have finite angular velocity.');
+	}
 
 	let twiceArea = 0;
 	for (let index = 0; index < localVertices.length; index += 1) {
@@ -294,6 +361,27 @@ function createPebbleTriangleBody(
 		throw new RangeError('A Gate 4 pebble triangle must have finite, nonzero area.');
 	}
 
+	return {
+		center,
+		linearVelocity,
+		angularVelocity,
+		localVertices,
+		areaBox2DUnitsSquared
+	};
+}
+
+function createPebbleTriangleBody(
+	module: LiquidFunModule,
+	world: B2World,
+	nodes: readonly [MpmParticle, MpmParticle, MpmParticle]
+): PebbleTriangleBody {
+	const {
+		center,
+		linearVelocity,
+		angularVelocity,
+		localVertices,
+		areaBox2DUnitsSquared
+	} = calculatePebbleTriangleMotion(nodes);
 	const body = createBody(
 		module,
 		world,
@@ -304,25 +392,61 @@ function createPebbleTriangleBody(
 	);
 	let shape: B2PolygonShape | undefined;
 	let destroyVertices: (() => void) | undefined;
-	let fixture: B2Fixture | undefined;
 	try {
 		shape = new module.b2PolygonShape();
 		const [vertices, destroy] = module.pointsToVec2Array(localVertices);
 		destroyVertices = destroy;
 		shape.Set(vertices, localVertices.length);
 		const triangleMass = LIQUIDFUN_PEBBLE_MASS;
-		fixture = body.CreateFixture(shape, triangleMass / areaBox2DUnitsSquared);
-		if (!fixture) {
+		if (!body.CreateFixture(shape, triangleMass / areaBox2DUnitsSquared)) {
 			throw new Error('LiquidFun did not create a Gate 4 pebble polygon fixture.');
 		}
 		return { body, localVertices };
-	} catch (error) {
-		release(body);
-		throw error;
 	} finally {
-		release(fixture);
 		release(shape);
 		destroyVertices?.();
+	}
+}
+
+function createElasticParticleTriangleGroup(
+	module: LiquidFunModule,
+	particleSystem: B2ParticleSystem,
+	nodes: readonly [MpmParticle, MpmParticle, MpmParticle]
+): B2ParticleGroup {
+	const motion = calculatePebbleTriangleMotion(nodes);
+	let particlePositions: B2Vec2 | undefined;
+	let destroyParticlePositions: (() => void) | undefined;
+	let position: B2Vec2 | undefined;
+	let linearVelocity: B2Vec2 | undefined;
+	let definition: B2ParticleGroupDef | undefined;
+	let group: B2ParticleGroup | undefined;
+	try {
+		[particlePositions, destroyParticlePositions] = module.pointsToVec2Array(
+			motion.localVertices
+		);
+		position = createVector(module, motion.center);
+		linearVelocity = createVector(module, motion.linearVelocity);
+		definition = new module.b2ParticleGroupDef();
+		definition.flags = module.b2_elasticParticle;
+		definition.position = position;
+		definition.angle = 0;
+		definition.linearVelocity = linearVelocity;
+		definition.angularVelocity = motion.angularVelocity;
+		definition.particleCount = motion.localVertices.length;
+		definition.positionData = particlePositions;
+		group = particleSystem.CreateParticleGroup(definition);
+		if (
+			group.GetParticleCount() !== GATE4_PEBBLE_PARTICLES_PER_OBJECT ||
+			(group.GetAllParticleFlags() & module.b2_elasticParticle) === 0
+		) {
+			throw new Error('LiquidFun did not create the expected elastic pebble particles.');
+		}
+		return group;
+	} finally {
+		release(definition);
+		release(linearVelocity);
+		release(position);
+		destroyParticlePositions?.();
 	}
 }
 
@@ -347,6 +471,7 @@ function createBondJoint(
 		throw new RangeError('A Gate 4 bond must identify existing solid nodes.');
 	}
 
+	// GetPosition returns references owned by the bodies, not disposable vectors.
 	const firstAnchor = firstBody.GetPosition();
 	const secondAnchor = secondBody.GetPosition();
 	const definition: B2DistanceJointDef = new module.b2DistanceJointDef();
@@ -362,27 +487,18 @@ function createBondJoint(
 		}
 		return joint;
 	} finally {
-		release(firstAnchor);
-		release(secondAnchor);
 		release(definition);
 	}
 }
 
 function bodyDistance(firstBody: B2Body, secondBody: B2Body): number {
-	const firstPosition = firstBody.GetPosition();
-	const secondPosition = secondBody.GetPosition();
-	try {
-		const first = readVector(firstPosition);
-		const second = readVector(secondPosition);
-		const distance = Math.hypot(second.x - first.x, second.y - first.y);
-		if (!Number.isFinite(distance)) {
-			throw new RangeError('A Gate 4 fracture bond length became non-finite.');
-		}
-		return distance;
-	} finally {
-		release(firstPosition);
-		release(secondPosition);
+	const first = readVector(firstBody.GetPosition());
+	const second = readVector(secondBody.GetPosition());
+	const distance = Math.hypot(second.x - first.x, second.y - first.y);
+	if (!Number.isFinite(distance)) {
+		throw new RangeError('A Gate 4 fracture bond length became non-finite.');
 	}
+	return distance;
 }
 
 function breakStretchedFractureBonds(
@@ -407,7 +523,6 @@ function breakStretchedFractureBonds(
 		if (tensileStrain >= bond.failureStrain) {
 			world.DestroyJoint(joint);
 			bond.joint = null;
-			release(joint);
 			continue;
 		}
 		activeBondCount += 1;
@@ -428,11 +543,7 @@ function createStaticWalls(module: LiquidFunModule, world: B2World): number {
 			wall.position,
 			{ x: 0, y: 0 }
 		);
-		try {
-			addBoxFixture(module, body, wall.halfWidth, wall.halfHeight);
-		} finally {
-			release(body);
-		}
+		addBoxFixture(module, body, wall.halfWidth, wall.halfHeight);
 	}
 	return walls.length;
 }
@@ -516,21 +627,88 @@ function drawParticles(
 		);
 		context.beginPath();
 		context.arc(point.x, point.y, radius, 0, Math.PI * 2);
+		const flags = particleSystem.GetParticleFlags(index);
 		context.fillStyle =
-			(particleSystem.GetParticleFlags(index) & module.b2_viscousParticle) !== 0
+			(flags & module.b2_viscousParticle) !== 0
 				? '#f2bf38'
-				: '#2e8cf2';
+				: (flags & module.b2_elasticParticle) !== 0
+					? '#c28cff'
+					: '#2e8cf2';
 		context.fill();
 	}
 }
 
-function readBodyPosition(body: B2Body): LiquidFunVector {
-	const position = body.GetPosition();
-	try {
-		return readVector(position);
-	} finally {
-		release(position);
+function drawElasticParticleTriangles(
+	module: LiquidFunModule,
+	context: CanvasRenderingContext2D,
+	particleSystem: B2ParticleSystem,
+	groups: readonly B2ParticleGroup[],
+	width: number,
+	height: number,
+	pixelsPerBox2DUnit: number,
+	offsetX: number,
+	offsetY: number
+): void {
+	if (groups.length === 0) return;
+	const positionBuffer = particleSystem.GetPositionBuffer();
+	const positionBufferPointer = module.getPointer(positionBuffer);
+	const positionBufferHeap = module.HEAPF32;
+	context.fillStyle = 'rgba(194, 140, 255, 0.24)';
+	context.strokeStyle = '#e2c7ff';
+	context.lineWidth = 1.25;
+	for (const group of groups) {
+		const particleCount = group.GetParticleCount();
+		if (particleCount !== 3) {
+			throw new RangeError('An elastic pebble triangle must contain three particles.');
+		}
+		const bufferIndex = group.GetBufferIndex();
+		const positions = Array.from({ length: particleCount }, (_, index) =>
+			readLiquidFunParticlePosition(
+				positionBufferHeap,
+				positionBufferPointer,
+				bufferIndex + index
+			)
+		);
+		const center = positions.reduce(
+			(total, point) => ({
+				x: total.x + point.x / positions.length,
+				y: total.y + point.y / positions.length
+			}),
+			{ x: 0, y: 0 }
+		);
+		positions.sort(
+			(first, second) =>
+				Math.atan2(first.y - center.y, first.x - center.x) -
+				Math.atan2(second.y - center.y, second.x - center.x)
+		);
+		const points = positions.map((position) =>
+			pointOnCanvas(
+				position,
+				width,
+				height,
+				pixelsPerBox2DUnit,
+				offsetX,
+				offsetY
+			)
+		);
+		const first = points[0];
+		if (!first) {
+			throw new RangeError('An elastic pebble triangle has no drawable particles.');
+		}
+		context.beginPath();
+		context.moveTo(first.x, first.y);
+		for (const point of points.slice(1)) {
+			context.lineTo(point.x, point.y);
+		}
+		context.closePath();
+		context.fill();
+		context.stroke();
 	}
+}
+
+function readBodyPosition(body: B2Body): LiquidFunVector {
+	// GetPosition returns a borrowed view owned by Box2D.
+	return readVector(body.GetPosition());
 }
 
 function drawPebbleTriangles(
@@ -573,6 +751,47 @@ function drawPebbleTriangles(
 		context.moveTo(first.x, first.y);
 		context.lineTo(second.x, second.y);
 		context.lineTo(third.x, third.y);
+		context.closePath();
+		context.fill();
+		context.stroke();
+	}
+}
+
+function drawSoftSquares(
+	context: CanvasRenderingContext2D,
+	squares: readonly SoftSquareBody[],
+	width: number,
+	height: number,
+	pixelsPerBox2DUnit: number,
+	offsetX: number,
+	offsetY: number
+): void {
+	context.fillStyle = '#70cfc0';
+	context.strokeStyle = '#d7fff8';
+	context.lineWidth = 1.25;
+	for (const square of squares) {
+		const points = square.map((body) =>
+			pointOnCanvas(
+				readBodyPosition(body),
+				width,
+				height,
+				pixelsPerBox2DUnit,
+				offsetX,
+				offsetY
+			)
+		);
+		const first = points[0];
+		const second = points[1];
+		const third = points[2];
+		const fourth = points[3];
+		if (!first || !second || !third || !fourth) {
+			throw new RangeError('A soft square must identify four drawable vertices.');
+		}
+		context.beginPath();
+		context.moveTo(first.x, first.y);
+		context.lineTo(second.x, second.y);
+		context.lineTo(third.x, third.y);
+		context.lineTo(fourth.x, fourth.y);
 		context.closePath();
 		context.fill();
 		context.stroke();
@@ -642,6 +861,10 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 
 	let particleSystem: B2ParticleSystem | undefined;
 	const pebbleTriangleBodies: PebbleTriangleBody[] = [];
+	const elasticParticleGroups: B2ParticleGroup[] = [];
+	const softSquareBodies: SoftSquareBody[] = [];
+	const softSquareNodeBodies: B2Body[] = [];
+	const softSquareSpringJoints: B2Joint[] = [];
 	const fractureNodeBodies: B2Body[] = [];
 	const fractureBondJoints: FractureBondJoint[] = [];
 	let disposed = false;
@@ -650,6 +873,7 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 			new module.b2ParticleSystemDef();
 		particleSystemDefinition.density = LIQUIDFUN_SHARED_PARTICLE_DENSITY;
 		particleSystemDefinition.pressureStrength = LIQUIDFUN_PRESSURE_STRENGTH;
+		particleSystemDefinition.elasticStrength = LIQUIDFUN_ELASTIC_STRENGTH;
 		particleSystemDefinition.gravityScale = 1;
 		particleSystemDefinition.radius = LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS;
 		try {
@@ -693,9 +917,55 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 			if (!first || !second || !third) {
 				throw new RangeError('A Gate 4 pebble must identify three existing nodes.');
 			}
-			pebbleTriangleBodies.push(
-				createPebbleTriangleBody(module, world, [first, second, third])
-			);
+			const triangleNodes: [MpmParticle, MpmParticle, MpmParticle] = [
+				first,
+				second,
+				third
+			];
+			if (group.usesElasticParticleFlag) {
+				const previousTriadCount = particleSystem.GetTriadCount();
+				const elasticGroup = createElasticParticleTriangleGroup(
+					module,
+					particleSystem,
+					triangleNodes
+				);
+				elasticParticleGroups.push(elasticGroup);
+				if (particleSystem.GetTriadCount() !== previousTriadCount + 1) {
+					throw new Error(
+						'LiquidFun did not create one elastic triad for the pebble triangle.'
+					);
+				}
+			} else {
+				pebbleTriangleBodies.push(
+					createPebbleTriangleBody(module, world, triangleNodes)
+				);
+			}
+		}
+		for (const square of workload.softSquareGroups) {
+			const nodeBodies: B2Body[] = [];
+			for (const node of square.nodes) {
+				const body = createSoftSquareNodeBody(module, world, node);
+				nodeBodies.push(body);
+				softSquareNodeBodies.push(body);
+			}
+			const [first, second, third, fourth] = nodeBodies;
+			if (!first || !second || !third || !fourth) {
+				throw new RangeError('A soft square must identify four existing nodes.');
+			}
+			const squareBodies: SoftSquareBody = [first, second, third, fourth];
+			softSquareBodies.push(squareBodies);
+			for (const bond of square.bonds) {
+				softSquareSpringJoints.push(
+					createBondJoint(
+						module,
+						world,
+						squareBodies,
+						bond,
+						LIQUIDFUN_SOFT_SQUARE_SPRING_STIFFNESS,
+						LIQUIDFUN_SOFT_SQUARE_SPRING_DAMPING
+					)
+				);
+			}
 		}
 		for (const particle of workload.fractureNodes) {
 			fractureNodeBodies.push(createSolidNodeBody(module, world, particle));
@@ -715,6 +985,22 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 		}
 		let activeFractureBondCount = fractureBondJoints.length;
 
+		const elasticParticleCount = elasticParticleGroups.reduce(
+			(count, group) => count + group.GetParticleCount(),
+			0
+		);
+		const elasticTriadCount = particleSystem.GetTriadCount();
+		const particleCount = particleSystem.GetParticleCount();
+		if (
+			pebbleTriangleBodies.length !== LIQUIDFUN_RIGID_TRIANGLE_COUNT ||
+			elasticParticleGroups.length !== LIQUIDFUN_ELASTIC_TRIANGLE_COUNT ||
+			elasticParticleCount !== LIQUIDFUN_ELASTIC_PARTICLE_COUNT ||
+			elasticTriadCount !== LIQUIDFUN_ELASTIC_TRIANGLE_COUNT ||
+			particleCount !== fluidParticleCount + elasticParticleCount
+		) {
+			throw new Error('LiquidFun pebble triangle counts do not match the configured workload.');
+		}
+
 		const particleIterations = world.CalculateReasonableParticleIterations(
 			LIQUIDFUN_DT_SECONDS
 		);
@@ -724,12 +1010,26 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 		const activeParticleSystem = particleSystem;
 
 		return {
-			particleCount: fluidParticleCount,
+			particleCount,
 			waterParticleCount: workload.waterParticles.length,
 			oilParticleCount: workload.oilParticles.length,
 			mappedMpmNodeCount: workload.mappedMpmNodeCount,
 			pebbleNodeCount: workload.pebbleNodes.length,
 			triangleBodyCount: pebbleTriangleBodies.length,
+			elasticTriangleCount: elasticParticleGroups.length,
+			elasticParticleCount,
+			elasticTriadCount,
+			softSquareCount: softSquareBodies.length,
+			softSquareNodeCount: softSquareNodeBodies.length,
+			softSquareJointCount: softSquareSpringJoints.length,
+			pebbleVertexCount:
+				pebbleTriangleBodies.reduce(
+					(vertexCount, triangle) =>
+						vertexCount + triangle.localVertices.length,
+					0
+				) +
+				elasticParticleCount +
+				softSquareNodeBodies.length,
 			fractureNodeCount: fractureNodeBodies.length,
 			fractureBondCount: fractureBondJoints.length,
 			get activeFractureBondCount(): number {
@@ -794,11 +1094,22 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 					context.rect(offsetX, offsetY, domainWidth, domainHeight);
 					context.clip();
 
+					drawElasticParticleTriangles(
+						module,
+						context,
+						activeParticleSystem,
+						elasticParticleGroups,
+						width,
+						height,
+						pixelsPerBox2DUnit,
+						offsetX,
+						offsetY
+					);
 					drawParticles(
 						module,
 						context,
 						activeParticleSystem,
-						workload.waterParticles.length + workload.oilParticles.length,
+						particleCount,
 						renderMode,
 						width,
 						height,
@@ -809,6 +1120,15 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 					drawPebbleTriangles(
 						context,
 						pebbleTriangleBodies,
+						width,
+						height,
+						pixelsPerBox2DUnit,
+						offsetX,
+						offsetY
+					);
+					drawSoftSquares(
+						context,
+						softSquareBodies,
 						width,
 						height,
 						pixelsPerBox2DUnit,
@@ -837,23 +1157,19 @@ export async function createLiquidFunSimulation(): Promise<LiquidFunSimulation> 
 				if (disposed) return;
 				disposed = true;
 				for (const bond of fractureBondJoints) {
-					release(bond.joint);
 					bond.joint = null;
 				}
 				fractureBondJoints.length = 0;
-				for (const triangle of pebbleTriangleBodies) release(triangle.body);
+				softSquareSpringJoints.length = 0;
 				pebbleTriangleBodies.length = 0;
-				for (const body of fractureNodeBodies) release(body);
+				elasticParticleGroups.length = 0;
+				softSquareNodeBodies.length = 0;
+				softSquareBodies.length = 0;
 				fractureNodeBodies.length = 0;
-				release(activeParticleSystem);
 				release(world);
 			}
 		};
 	} catch (error) {
-		for (const bond of fractureBondJoints) release(bond.joint);
-		for (const triangle of pebbleTriangleBodies) release(triangle.body);
-		for (const body of fractureNodeBodies) release(body);
-		release(particleSystem);
 		release(world);
 		throw error;
 	}
@@ -872,8 +1188,18 @@ export const LIQUIDFUN_REALTIME_CONFIG = {
 	particleRadiusMeters: LIQUIDFUN_PARTICLE_RADIUS_METERS,
 	particleRadiusBox2dUnits: LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS,
 	sharedParticleMass: LIQUIDFUN_SHARED_PARTICLE_MASS,
+	pebbleTriangleCount: LIQUIDFUN_PEBBLE_TRIANGLE_COUNT,
+	rigidTriangleCount: LIQUIDFUN_RIGID_TRIANGLE_COUNT,
+	elasticTriangleCount: LIQUIDFUN_ELASTIC_TRIANGLE_COUNT,
+	elasticParticleCount: LIQUIDFUN_ELASTIC_PARTICLE_COUNT,
+	elasticStrength: LIQUIDFUN_ELASTIC_STRENGTH,
 	pebbleEdgeLengthMeters: LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS,
 	pebbleMass: LIQUIDFUN_PEBBLE_MASS,
+	softSquareCount: LIQUIDFUN_SOFT_SQUARE_COUNT,
+	softSquareEdgeLengthMeters: LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_METERS,
+	softSquareMass: LIQUIDFUN_SOFT_SQUARE_MASS,
+	softSquareSpringFrequencyHz: LIQUIDFUN_SOFT_SQUARE_SPRING_FREQUENCY_HZ,
+	softSquareSpringDampingRatio: LIQUIDFUN_SOFT_SQUARE_SPRING_DAMPING_RATIO,
 	velocityIterations: LIQUIDFUN_VELOCITY_ITERATIONS,
 	positionIterations: LIQUIDFUN_POSITION_ITERATIONS
 } as const;

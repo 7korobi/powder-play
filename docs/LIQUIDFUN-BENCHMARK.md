@@ -104,28 +104,56 @@ domain. The source Gate 4 scene, including all 3,674 mapped nodes, its
 2,000/1,500 fluid-node counts, and its 2,200 × 1,500 domain used by the CPU
 and GPU MLS-MPM pages, is unchanged.
 
-Each set of three pebble vertices initializes one dynamic Box2D polygon body,
-for 50 full-triangle collision shapes. Each is an equilateral triangle with
-3 mm sides and mass 0.008 simulation mass units. The initial polygon keeps
-the source triangle's center and scales its local vertices to the target edge
-length. Its center velocity is the vertex mean, and angular velocity is fitted
-to the scaled vertices and source velocities. Fixture density is derived from
-the target body mass and polygon area. The fixture used for collision covers
-the same three vertices that are drawn; the vertex array is passed through
-LiquidFun's contiguous `pointsToVec2Array` adapter before Box2D constructs the
-polygon, avoiding a mismatched pointer array or a box-shaped collision proxy.
+The LiquidFun workload maps alternating source pebble objects to 25 triangle
+shapes and 25 soft squares; the source MPM scene remains unchanged. The triangle
+shapes alternate between 12 rigid Box2D polygons and 13 LiquidFun
+`b2_elasticParticle` groups, with three particles per elastic triangle. Each
+rigid triangle is one dynamic Box2D polygon body with 3 mm sides and mass 0.008
+simulation mass units. It keeps the source triangle's center, fits its linear
+and angular velocity from the source vertices, and scales the local vertices
+to the target edge length. Fixture density is derived from the target body
+mass and polygon area. The collision fixture covers the same three vertices
+that are drawn; the vertex array is passed through LiquidFun's contiguous
+`pointsToVec2Array` adapter before Box2D constructs the polygon.
+
+Each elastic triangle is created as its own particle group so its three initial
+vertices form one elastic triad without connecting to neighboring triangles.
+The group uses the shared fluid particle system's 1 mm radius and 0.01
+simulation mass per particle, giving it a total mass of 0.03; this differs from
+the 0.008 mass of a rigid triangle. `elasticStrength` is explicitly set to
+LiquidFun's default value of 0.25. These are therefore intentionally different
+representations, not a flag-only comparison at equal mass.
+
+Each soft square has a 3 mm side and the same total mass, 0.008 simulation
+mass units, split equally among four dynamic circle-node bodies (0.002 per
+node). The nodes are connected by six distance-joint springs: the four sides
+and both diagonals. Spring stiffness and damping are derived from a 4 Hz
+frequency and 0.7 damping ratio. The circles have 0.75 mm radii, so the
+quadrilateral can deform while keeping a closed, collidable node frame under
+the current 1 mm fluid radius. Canvas2D fills the current four-node outline;
+that fill is visual only and is not an additional polygon collision fixture.
+
+The mixed pebble arrangement therefore has 36 rigid-triangle vertices, 39
+elastic-particle vertices, and 100 soft-square nodes, 175 in total. A square
+has 4/3 as many vertices as one triangle, while the aggregate count is 7/6 of
+the original 150 triangle vertices.
 The 24 fracture nodes remain individual dynamic circle bodies connected by
 the same 53 Gate 4 bonds. Those bonds break when tensile strain reaches the
 Gate 4 12% threshold.
 
-This is a rigid-body approximation of the MPM pebble material, not a
-deformable match: it does not reproduce MPM deformation gradients or
-Neo-Hookean constitutive behavior, and Box2D contact/constraint solving differs
-from MLS-MPM. One LiquidFun particle system shares density across water and
-oil, so it cannot preserve the MPM phase densities 0.02 and 0.016
-independently. Expect different trajectories and breakage timing; the
-comparison holds the seeded source scene and fixed timestep, not the exact
-physical response.
+Rigid triangles are rigid approximations of the MPM pebble material;
+elastic-particle triangles use LiquidFun's triad shape-restoration solver; and
+soft squares are four-node, six-spring Box2D approximations. None reproduces
+MPM deformation gradients or Neo-Hookean constitutive behavior, and
+Box2D/LiquidFun contact and constraint solving differs from MLS-MPM. The 24
+fracture nodes remain dynamic circle bodies connected by 53 Gate 4 bonds;
+those bonds break when tensile strain reaches the Gate 4 12% threshold. One
+LiquidFun particle system shares density, radius, and particle mass across
+water, oil, and elastic triangles, so it cannot preserve the MPM phase
+densities 0.02 and 0.016 independently or match rigid-pebble mass for elastic
+triangles. Expect different trajectories and breakage timing; the comparison
+holds the seeded source scene and fixed timestep, not the exact physical
+response.
 
 ## Live LiquidFun lab and MPM references
 
@@ -157,10 +185,11 @@ The CPU and GPU MLS-MPM pages remain a separate same-equation numerical
 comparison. LiquidFun is a behavioral reference for contact, waves, settling,
 and stability, not an exact trajectory or constitutive-model oracle. Water
 and oil use different LiquidFun particle flags in one particle system, so they
-share its density, radius, and 0.01 particle mass. The 50 pebble triangles are
-rigid Box2D bodies, not deformable MLS-MPM triangles; fracture nodes use
-dynamic bodies and breakable distance joints. These model differences should
-be retained when interpreting the visual and timing results.
+share its density, radius, and 0.01 particle mass. The pebble mixture combines
+rigid Box2D triangles with spring-connected soft squares; neither reproduces
+the deformable MLS-MPM triangle constitutive model. Fracture nodes use dynamic
+bodies and breakable distance joints. These model differences should be
+retained when interpreting the visual and timing results.
 
 ## Repeatable simulation-only benchmark
 
@@ -190,9 +219,10 @@ eight synchronous calls. The JSON includes median, p95, min, max, and sample
 count for batch CPU milliseconds, plus derived per-step time and steps/second.
 The p95 uses the same lower-index quantile convention as
 `scripts/benchmark-mpm.mjs`. Scope includes JavaScript-to-WASM call overhead,
-LiquidFun/Box2D `world.Step()` work, and fracture-bond strain checks. Scene
-construction, Canvas2D, UI work, GPU timestamps, and GPU queue completion/wait
-are excluded. No GPU or `navigator.gpu` is used by this benchmark.
+LiquidFun/Box2D `world.Step()` work, soft-square spring solving, and
+fracture-bond strain checks. Scene construction, Canvas2D, UI work, GPU
+timestamps, and GPU queue completion/wait are excluded. No GPU or
+`navigator.gpu` is used by this benchmark.
 
 The result also records package/engine version, browser user agent,
 `hardwareConcurrency`, source hashes, scene seed/counts, grid/domain, scale,
