@@ -3,19 +3,14 @@ import {
 	createMpmGate4Scene,
 	GATE4_FRACTURE_BOND_COUNT,
 	GATE4_FRACTURE_FAILURE_STRAIN,
-	GATE4_FRACTURE_PARTICLE_COUNT,
 	GATE4_FRACTURE_OBJECT_ID,
+	GATE4_FRACTURE_PARTICLE_COUNT,
 	GATE4_GRID,
-	GATE4_LIQUID_START_X,
 	GATE4_OIL_PARTICLE_COLUMNS,
 	GATE4_OIL_PARTICLE_COUNT,
 	GATE4_OIL_PARTICLE_ROWS,
 	GATE4_PARTICLE_AREA,
 	GATE4_PARTICLE_COUNT,
-	GATE4_PEBBLE_COUNT,
-	GATE4_PEBBLE_EDGE_LENGTH,
-	GATE4_PEBBLE_PARTICLES_PER_OBJECT,
-	GATE4_PEBBLE_PARTICLE_COUNT,
 	GATE4_SOLID_PARTICLE_MASS,
 	GATE4_WATER_PARTICLE_COLUMNS,
 	GATE4_WATER_PARTICLE_COUNT,
@@ -39,31 +34,25 @@ export const LIQUIDFUN_BOX2D_GRAVITY_UNITS_PER_SECOND_SQUARED: MpmVector2 = {
 		(-LIQUIDFUN_GATE4_GRAVITY.y * LIQUIDFUN_BOX2D_UNITS_PER_METER) /
 		LIQUIDFUN_GATE4_ACCELERATION_UNITS_PER_METER_PER_SECOND_SQUARED
 };
-export const LIQUIDFUN_PEBBLE_TRIANGLE_COUNT = GATE4_PEBBLE_COUNT / 2;
-export const LIQUIDFUN_SOFT_SQUARE_COUNT =
-	GATE4_PEBBLE_COUNT - LIQUIDFUN_PEBBLE_TRIANGLE_COUNT;
-export const LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT = 4;
-export const LIQUIDFUN_PEBBLE_TRIANGLE_VERTEX_COUNT =
-	LIQUIDFUN_PEBBLE_TRIANGLE_COUNT * GATE4_PEBBLE_PARTICLES_PER_OBJECT;
-export const LIQUIDFUN_ELASTIC_TRIANGLE_COUNT = Math.ceil(
-	LIQUIDFUN_PEBBLE_TRIANGLE_COUNT / 2
-);
-export const LIQUIDFUN_RIGID_TRIANGLE_COUNT =
-	LIQUIDFUN_PEBBLE_TRIANGLE_COUNT - LIQUIDFUN_ELASTIC_TRIANGLE_COUNT;
-export const LIQUIDFUN_ELASTIC_PARTICLE_COUNT =
-	LIQUIDFUN_ELASTIC_TRIANGLE_COUNT * GATE4_PEBBLE_PARTICLES_PER_OBJECT;
-export const LIQUIDFUN_RIGID_TRIANGLE_VERTEX_COUNT =
-	LIQUIDFUN_RIGID_TRIANGLE_COUNT * GATE4_PEBBLE_PARTICLES_PER_OBJECT;
-export const LIQUIDFUN_SOFT_SQUARE_NODE_COUNT =
-	LIQUIDFUN_SOFT_SQUARE_COUNT * LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT;
-export const LIQUIDFUN_SOFT_SQUARE_SPRINGS_PER_OBJECT = 6;
-export const LIQUIDFUN_SOFT_SQUARE_SPRING_COUNT =
-	LIQUIDFUN_SOFT_SQUARE_COUNT * LIQUIDFUN_SOFT_SQUARE_SPRINGS_PER_OBJECT;
-export const LIQUIDFUN_PEBBLE_VERTEX_COUNT =
-	LIQUIDFUN_PEBBLE_TRIANGLE_VERTEX_COUNT + LIQUIDFUN_SOFT_SQUARE_NODE_COUNT;
+export const LIQUIDFUN_VISIBLE_DOMAIN_WIDTH_METERS = 0.14;
+export const LIQUIDFUN_GATE4_DOMAIN = {
+	width:
+		LIQUIDFUN_VISIBLE_DOMAIN_WIDTH_METERS * LIQUIDFUN_GATE4_UNITS_PER_METER,
+	height: GATE4_GRID.cellsY * GATE4_GRID.cellSize
+} as const;
+export const LIQUIDFUN_PHYSICAL_DOMAIN_METERS = {
+	width: LIQUIDFUN_GATE4_DOMAIN.width / LIQUIDFUN_GATE4_UNITS_PER_METER,
+	height: LIQUIDFUN_GATE4_DOMAIN.height / LIQUIDFUN_GATE4_UNITS_PER_METER
+} as const;
+export const LIQUIDFUN_BOX2D_DOMAIN_UNITS = {
+	width: LIQUIDFUN_GATE4_DOMAIN.width * LIQUIDFUN_BOX2D_UNITS_PER_GATE4_UNIT,
+	height: LIQUIDFUN_GATE4_DOMAIN.height * LIQUIDFUN_BOX2D_UNITS_PER_GATE4_UNIT
+} as const;
+
 export const LIQUIDFUN_SHARED_PARTICLE_MASS = 0.01;
 export const LIQUIDFUN_PRESSURE_STRENGTH = 1.0;
 export const LIQUIDFUN_ELASTIC_STRENGTH = 0.25;
+export const LIQUIDFUN_SPRING_STRENGTH = 0.25;
 export const LIQUIDFUN_PARTICLE_RADIUS_METERS = 1e-3;
 export const LIQUIDFUN_PARTICLE_RADIUS_BOX2D_UNITS =
 	LIQUIDFUN_PARTICLE_RADIUS_METERS * LIQUIDFUN_BOX2D_UNITS_PER_METER;
@@ -73,17 +62,72 @@ export const LIQUIDFUN_PARTICLE_SPACING_METERS =
 	LIQUIDFUN_PARTICLE_STRIDE_BOX2D_UNITS / LIQUIDFUN_BOX2D_UNITS_PER_METER;
 export const LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS =
 	LIQUIDFUN_PARTICLE_SPACING_METERS * LIQUIDFUN_GATE4_UNITS_PER_METER;
-// LiquidFun estimates particle mass as density times the squared 0.75-diameter stride.
 export const LIQUIDFUN_SHARED_PARTICLE_DENSITY =
 	LIQUIDFUN_SHARED_PARTICLE_MASS / LIQUIDFUN_PARTICLE_STRIDE_BOX2D_UNITS ** 2;
-export const LIQUIDFUN_WATER_PARTICLE_COUNT_MULTIPLIER = 1;
-export const LIQUIDFUN_OIL_PARTICLE_COUNT_MULTIPLIER = 1;
-export const LIQUIDFUN_WATER_PARTICLE_COUNT =
-	GATE4_WATER_PARTICLE_COUNT * LIQUIDFUN_WATER_PARTICLE_COUNT_MULTIPLIER;
-export const LIQUIDFUN_OIL_PARTICLE_COUNT =
-	GATE4_OIL_PARTICLE_COUNT * LIQUIDFUN_OIL_PARTICLE_COUNT_MULTIPLIER;
-export const LIQUIDFUN_WATER_PARTICLE_ROWS = 23;
-export const LIQUIDFUN_OIL_PARTICLE_ROWS = 20;
+
+export const LIQUIDFUN_FLUID_TYPE_PARTICLE_COUNT = 800;
+export const LIQUIDFUN_WATER_PARTICLE_COUNT = LIQUIDFUN_FLUID_TYPE_PARTICLE_COUNT;
+export const LIQUIDFUN_OIL_PARTICLE_COUNT = LIQUIDFUN_FLUID_TYPE_PARTICLE_COUNT;
+export const LIQUIDFUN_INK_PARTICLE_COUNT = LIQUIDFUN_FLUID_TYPE_PARTICLE_COUNT;
+export const LIQUIDFUN_SOIL_PARTICLE_COUNT = LIQUIDFUN_FLUID_TYPE_PARTICLE_COUNT;
+export const LIQUIDFUN_FLUID_PARTICLE_COUNT =
+	LIQUIDFUN_WATER_PARTICLE_COUNT +
+	LIQUIDFUN_OIL_PARTICLE_COUNT +
+	LIQUIDFUN_INK_PARTICLE_COUNT +
+	LIQUIDFUN_SOIL_PARTICLE_COUNT;
+export const LIQUIDFUN_FLUID_PARTICLE_ROWS = 43;
+export const LIQUIDFUN_FLUID_COLUMN_START_X_METERS = 0.0015;
+export const LIQUIDFUN_FLUID_COLUMN_SPACING_METERS = 0.029;
+export const LIQUIDFUN_FLUID_START_Y_METERS = 0.01;
+
+export const LIQUIDFUN_ELASTIC_BALL_COUNT = 10;
+export const LIQUIDFUN_ELASTIC_BALL_PARTICLES_PER_GROUP = 12;
+export const LIQUIDFUN_ELASTIC_BALL_PARTICLE_COUNT =
+	LIQUIDFUN_ELASTIC_BALL_COUNT * LIQUIDFUN_ELASTIC_BALL_PARTICLES_PER_GROUP;
+// The wider middle gap leaves room for the retained fracture lattice.
+export const LIQUIDFUN_ELASTIC_BALL_CENTER_X_METERS = [
+	0.005, 0.017, 0.029, 0.041, 0.053, 0.066, 0.078, 0.09, 0.102, 0.114
+] as const;
+export const LIQUIDFUN_ELASTIC_BALL_CENTER_Y_METERS = 0.00425;
+const LIQUIDFUN_ELASTIC_BALL_GRID_COORDINATES = [
+	{ column: 1, row: 0 },
+	{ column: 2, row: 0 },
+	{ column: 0, row: 1 },
+	{ column: 1, row: 1 },
+	{ column: 2, row: 1 },
+	{ column: 3, row: 1 },
+	{ column: 0, row: 2 },
+	{ column: 1, row: 2 },
+	{ column: 2, row: 2 },
+	{ column: 3, row: 2 },
+	{ column: 1, row: 3 },
+	{ column: 2, row: 3 }
+] as const;
+
+export const LIQUIDFUN_SPRING_VINE_COUNT = 10;
+export const LIQUIDFUN_SPRING_VINE_LENGTH_METERS = 0.07;
+export const LIQUIDFUN_SPRING_VINE_PARTICLES_PER_GROUP =
+	Math.ceil(
+		LIQUIDFUN_SPRING_VINE_LENGTH_METERS / LIQUIDFUN_PARTICLE_SPACING_METERS
+	) + 1;
+export const LIQUIDFUN_SPRING_VINE_PARTICLE_COUNT =
+	LIQUIDFUN_SPRING_VINE_COUNT *
+	LIQUIDFUN_SPRING_VINE_PARTICLES_PER_GROUP;
+export const LIQUIDFUN_SPRING_VINE_LINK_COUNT =
+	LIQUIDFUN_SPRING_VINE_COUNT *
+	(LIQUIDFUN_SPRING_VINE_PARTICLES_PER_GROUP - 1);
+export const LIQUIDFUN_SPRING_VINE_SPAN_METERS =
+	(LIQUIDFUN_SPRING_VINE_PARTICLES_PER_GROUP - 1) *
+	LIQUIDFUN_PARTICLE_SPACING_METERS;
+export const LIQUIDFUN_SPRING_VINE_CENTER_X_START_METERS = 0.1185;
+export const LIQUIDFUN_SPRING_VINE_CENTER_X_SPACING_METERS = 0.0022;
+export const LIQUIDFUN_SPRING_VINE_CENTER_Y_METERS =
+	LIQUIDFUN_PHYSICAL_DOMAIN_METERS.height / 2;
+export const LIQUIDFUN_TOTAL_PARTICLE_COUNT =
+	LIQUIDFUN_FLUID_PARTICLE_COUNT +
+	LIQUIDFUN_ELASTIC_BALL_PARTICLE_COUNT +
+	LIQUIDFUN_SPRING_VINE_PARTICLE_COUNT;
+
 export const LIQUIDFUN_SOLID_NODE_AREA_SQUARE_METERS =
 	GATE4_PARTICLE_AREA / LIQUIDFUN_GATE4_UNITS_PER_METER ** 2;
 export const LIQUIDFUN_SOLID_NODE_AREA_BOX2D_UNITS_SQUARED =
@@ -95,38 +139,10 @@ export const LIQUIDFUN_SOLID_NODE_RADIUS_BOX2D_UNITS =
 	LIQUIDFUN_SOLID_NODE_RADIUS_METERS * LIQUIDFUN_BOX2D_UNITS_PER_METER;
 export const LIQUIDFUN_SOLID_NODE_DENSITY =
 	GATE4_SOLID_PARTICLE_MASS / LIQUIDFUN_SOLID_NODE_AREA_BOX2D_UNITS_SQUARED;
-export const LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS = 3e-3;
-export const LIQUIDFUN_PEBBLE_EDGE_LENGTH_BOX2D_UNITS =
-	LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS * LIQUIDFUN_BOX2D_UNITS_PER_METER;
-export const LIQUIDFUN_PEBBLE_MASS = 0.008;
-export const LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_METERS =
-	LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS;
-export const LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_BOX2D_UNITS =
-	LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_METERS * LIQUIDFUN_BOX2D_UNITS_PER_METER;
-export const LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_GATE4_UNITS =
-	LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_METERS * LIQUIDFUN_GATE4_UNITS_PER_METER;
-export const LIQUIDFUN_SOFT_SQUARE_MASS = LIQUIDFUN_PEBBLE_MASS;
-export const LIQUIDFUN_SOFT_SQUARE_NODE_MASS =
-	LIQUIDFUN_SOFT_SQUARE_MASS / LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT;
-export const LIQUIDFUN_SOFT_SQUARE_NODE_RADIUS_BOX2D_UNITS =
-	LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_BOX2D_UNITS / 4;
-export const LIQUIDFUN_SOFT_SQUARE_NODE_DENSITY =
-	LIQUIDFUN_SOFT_SQUARE_NODE_MASS /
-	(Math.PI * LIQUIDFUN_SOFT_SQUARE_NODE_RADIUS_BOX2D_UNITS ** 2);
-export const LIQUIDFUN_SOFT_SQUARE_SPRING_FREQUENCY_HZ = 4;
-export const LIQUIDFUN_SOFT_SQUARE_SPRING_DAMPING_RATIO = 0.7;
-const LIQUIDFUN_SOFT_SQUARE_SPRING_ANGULAR_FREQUENCY =
-	2 * Math.PI * LIQUIDFUN_SOFT_SQUARE_SPRING_FREQUENCY_HZ;
-const LIQUIDFUN_SOFT_SQUARE_REDUCED_NODE_MASS =
-	LIQUIDFUN_SOFT_SQUARE_NODE_MASS / 2;
-export const LIQUIDFUN_SOFT_SQUARE_SPRING_STIFFNESS =
-	LIQUIDFUN_SOFT_SQUARE_REDUCED_NODE_MASS *
-	LIQUIDFUN_SOFT_SQUARE_SPRING_ANGULAR_FREQUENCY ** 2;
-export const LIQUIDFUN_SOFT_SQUARE_SPRING_DAMPING =
-	2 *
-	LIQUIDFUN_SOFT_SQUARE_SPRING_DAMPING_RATIO *
-	LIQUIDFUN_SOFT_SQUARE_REDUCED_NODE_MASS *
-	LIQUIDFUN_SOFT_SQUARE_SPRING_ANGULAR_FREQUENCY;
+export const LIQUIDFUN_FRACTURE_CENTER_METERS = {
+	x: 0.0595,
+	y: LIQUIDFUN_ELASTIC_BALL_CENTER_Y_METERS
+} as const;
 export const LIQUIDFUN_FRACTURE_BOND_FREQUENCY_HZ = 8;
 export const LIQUIDFUN_BOND_DAMPING_RATIO = 1;
 const LIQUIDFUN_FRACTURE_BOND_ANGULAR_FREQUENCY =
@@ -142,86 +158,27 @@ export const LIQUIDFUN_FRACTURE_BOND_DAMPING =
 	LIQUIDFUN_FRACTURE_BOND_ANGULAR_FREQUENCY;
 export const LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN =
 	GATE4_FRACTURE_FAILURE_STRAIN;
+
 export const LIQUIDFUN_VELOCITY_ITERATIONS = 8;
 export const LIQUIDFUN_POSITION_ITERATIONS = 3;
-export const LIQUIDFUN_PEBBLE_SIZE_SCALE =
-	(LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS * LIQUIDFUN_GATE4_UNITS_PER_METER) /
-	GATE4_PEBBLE_EDGE_LENGTH;
 export const LIQUIDFUN_STATIONARY_WARMUP_MS = 600;
 export const LIQUIDFUN_GRAVITY_WARMUP_STEPS = 64;
 export const LIQUIDFUN_SAMPLE_BATCHES = 12;
 export const LIQUIDFUN_STEPS_PER_BATCH = 8;
-
-const LIQUIDFUN_WATER_GRID = {
-	columns: Math.ceil(LIQUIDFUN_WATER_PARTICLE_COUNT / LIQUIDFUN_WATER_PARTICLE_ROWS),
-	rows: LIQUIDFUN_WATER_PARTICLE_ROWS
-} as const;
-const LIQUIDFUN_OIL_GRID = {
-	rows: LIQUIDFUN_OIL_PARTICLE_ROWS,
-	columns: Math.ceil(LIQUIDFUN_OIL_PARTICLE_COUNT / LIQUIDFUN_OIL_PARTICLE_ROWS)
-} as const;
-const LIQUIDFUN_OIL_START_Y =
-	2 * LIQUIDFUN_PARTICLE_RADIUS_METERS * LIQUIDFUN_GATE4_UNITS_PER_METER;
-const LIQUIDFUN_WATER_START_Y =
-	LIQUIDFUN_OIL_START_Y +
-	LIQUIDFUN_OIL_GRID.rows * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS;
-const LIQUIDFUN_FLUID_RIGHT_EDGE =
-	GATE4_LIQUID_START_X +
-	(Math.max(LIQUIDFUN_WATER_GRID.columns, LIQUIDFUN_OIL_GRID.columns) - 1) *
-		LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS;
-const LIQUIDFUN_DOMAIN_RIGHT_MARGIN = LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS;
-const LIQUIDFUN_MINIMUM_DOMAIN_WIDTH_MILLIMETERS = 140;
-const LIQUIDFUN_BASE_DOMAIN_WIDTH = Math.max(
-	GATE4_GRID.cellsX * GATE4_GRID.cellSize,
-	(LIQUIDFUN_MINIMUM_DOMAIN_WIDTH_MILLIMETERS * LIQUIDFUN_GATE4_UNITS_PER_METER) /
-		1_000
-);
-
-export const LIQUIDFUN_GATE4_DOMAIN = {
-	width:
-		Math.ceil(
-			Math.max(
-				LIQUIDFUN_BASE_DOMAIN_WIDTH,
-				LIQUIDFUN_FLUID_RIGHT_EDGE + LIQUIDFUN_DOMAIN_RIGHT_MARGIN
-			) / GATE4_GRID.cellSize
-		) * GATE4_GRID.cellSize,
-	height: GATE4_GRID.cellsY * GATE4_GRID.cellSize
-} as const;
-
-export const LIQUIDFUN_PHYSICAL_DOMAIN_METERS = {
-	width: LIQUIDFUN_GATE4_DOMAIN.width / LIQUIDFUN_GATE4_UNITS_PER_METER,
-	height: LIQUIDFUN_GATE4_DOMAIN.height / LIQUIDFUN_GATE4_UNITS_PER_METER
-} as const;
-export const LIQUIDFUN_BOX2D_DOMAIN_UNITS = {
-	width: LIQUIDFUN_GATE4_DOMAIN.width * LIQUIDFUN_BOX2D_UNITS_PER_GATE4_UNIT,
-	height: LIQUIDFUN_GATE4_DOMAIN.height * LIQUIDFUN_BOX2D_UNITS_PER_GATE4_UNIT
-} as const;
 
 export interface LiquidFunVector {
 	readonly x: number;
 	readonly y: number;
 }
 
-export interface LiquidFunTriangleGroupSeed {
-	readonly objectId: number;
-	readonly nodeIndices: readonly [number, number, number];
-	readonly usesElasticParticleFlag: boolean;
-}
-
-export interface LiquidFunSoftSquareNodeSeed {
+export interface LiquidFunFluidParticleSeed {
 	readonly position: MpmVector2;
 	readonly velocity: MpmVector2;
 }
 
-export interface LiquidFunSoftSquareSeed {
-	readonly objectId: number;
-	readonly nodes: readonly [
-		LiquidFunSoftSquareNodeSeed,
-		LiquidFunSoftSquareNodeSeed,
-		LiquidFunSoftSquareNodeSeed,
-		LiquidFunSoftSquareNodeSeed
-	];
-	readonly bonds: readonly LiquidFunBondSeed[];
+export interface LiquidFunParticleGroupSeed {
+	readonly groupIndex: number;
+	readonly positions: readonly MpmVector2[];
 }
 
 export interface LiquidFunBondSeed {
@@ -237,26 +194,18 @@ export interface LiquidFunFractureBondSeed extends LiquidFunBondSeed {
 export interface LiquidFunGate4Workload {
 	readonly seed: number;
 	readonly sourceMpmNodeCount: number;
-	readonly mappedMpmNodeCount: number;
-	readonly waterParticles: readonly MpmParticle[];
-	readonly oilParticles: readonly MpmParticle[];
-	readonly pebbleNodes: readonly MpmParticle[];
-	readonly pebbleGroups: readonly LiquidFunTriangleGroupSeed[];
-	readonly softSquareGroups: readonly LiquidFunSoftSquareSeed[];
+	readonly waterParticles: readonly LiquidFunFluidParticleSeed[];
+	readonly oilParticles: readonly LiquidFunFluidParticleSeed[];
+	readonly inkParticles: readonly LiquidFunFluidParticleSeed[];
+	readonly soilParticles: readonly LiquidFunFluidParticleSeed[];
+	readonly elasticBallGroups: readonly LiquidFunParticleGroupSeed[];
+	readonly springVines: readonly LiquidFunParticleGroupSeed[];
 	readonly fractureNodes: readonly MpmParticle[];
 	readonly fractureBonds: readonly LiquidFunFractureBondSeed[];
 }
 
-export function scaleLiquidFunPebbleLocalVertices(
-	vertices: readonly LiquidFunVector[]
-): readonly LiquidFunVector[] {
-	if (vertices.length !== 3) {
-		throw new RangeError('A LiquidFun pebble must have exactly three triangle vertices.');
-	}
-	return vertices.map((vertex) => ({
-		x: vertex.x * LIQUIDFUN_PEBBLE_SIZE_SCALE,
-		y: vertex.y * LIQUIDFUN_PEBBLE_SIZE_SCALE
-	}));
+function metersToGate4Units(meters: number): number {
+	return meters * LIQUIDFUN_GATE4_UNITS_PER_METER;
 }
 
 function expandLiquidParticles(
@@ -265,8 +214,9 @@ function expandLiquidParticles(
 	sourceRows: number,
 	targetParticleCount: number,
 	targetRows: number,
+	targetStartX: number,
 	targetStartY: number
-): readonly MpmParticle[] {
+): readonly LiquidFunFluidParticleSeed[] {
 	if (sourceParticles.length !== sourceColumns * sourceRows) {
 		throw new Error('LiquidFun source particle count does not match its grid dimensions.');
 	}
@@ -275,16 +225,17 @@ function expandLiquidParticles(
 		targetParticleCount < targetRows ||
 		!Number.isSafeInteger(targetRows) ||
 		targetRows < 2 ||
+		!Number.isFinite(targetStartX) ||
 		!Number.isFinite(targetStartY)
 	) {
 		throw new RangeError('LiquidFun fluid grids must have finite origins and at least two rows.');
 	}
-	const firstSourceParticle = sourceParticles[0];
-	if (firstSourceParticle === undefined) {
+	if (sourceParticles[0] === undefined) {
 		throw new Error('LiquidFun source particle grid is incomplete.');
 	}
+
 	const targetColumns = Math.ceil(targetParticleCount / targetRows);
-	const expandedParticles: MpmParticle[] = [];
+	const expandedParticles: LiquidFunFluidParticleSeed[] = [];
 	for (let row = 0; row < targetRows; row += 1) {
 		const rowStartIndex = Math.floor((row * targetParticleCount) / targetRows);
 		const rowEndIndex = Math.floor(((row + 1) * targetParticleCount) / targetRows);
@@ -299,14 +250,14 @@ function expandLiquidParticles(
 				throw new Error('LiquidFun expansion could not find a source particle.');
 			}
 			expandedParticles.push({
-				...sourceParticle,
 				position: {
 					x:
-						firstSourceParticle.position.x +
+						targetStartX +
 						columnOffset +
 						column * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS,
 					y: targetStartY + row * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS
-				}
+				},
+				velocity: sourceParticle.velocity
 			});
 		}
 	}
@@ -357,114 +308,96 @@ export function mapBox2DVelocityToGate4(velocity: LiquidFunVector): MpmVector2 {
 	};
 }
 
-const SOFT_SQUARE_CORNER_OFFSETS = [
-	{ x: -0.5, y: -0.5 },
-	{ x: 0.5, y: -0.5 },
-	{ x: 0.5, y: 0.5 },
-	{ x: -0.5, y: 0.5 }
-] as const;
-const SOFT_SQUARE_BOND_ENDPOINTS = [
-	[0, 1],
-	[1, 2],
-	[2, 3],
-	[3, 0],
-	[0, 2],
-	[1, 3]
-] as const;
-
-function createSoftSquareSeed(
-	objectId: number,
-	triangleNodes: readonly [MpmParticle, MpmParticle, MpmParticle]
-): LiquidFunSoftSquareSeed {
-	const center = triangleNodes.reduce(
-		(total, node) => ({
-			x: total.x + node.position.x / triangleNodes.length,
-			y: total.y + node.position.y / triangleNodes.length
-		}),
-		{ x: 0, y: 0 }
-	);
-	const linearVelocity = triangleNodes.reduce(
-		(total, node) => ({
-			x: total.x + node.velocity.x / triangleNodes.length,
-			y: total.y + node.velocity.y / triangleNodes.length
-		}),
-		{ x: 0, y: 0 }
-	);
-	let angularVelocityNumerator = 0;
-	let angularVelocityDenominator = 0;
-	for (const node of triangleNodes) {
-		const relativePosition = {
-			x: node.position.x - center.x,
-			y: node.position.y - center.y
-		};
-		const relativeVelocity = {
-			x: node.velocity.x - linearVelocity.x,
-			y: node.velocity.y - linearVelocity.y
-		};
-		angularVelocityNumerator +=
-			relativePosition.x * relativeVelocity.y -
-			relativePosition.y * relativeVelocity.x;
-		angularVelocityDenominator +=
-			relativePosition.x ** 2 + relativePosition.y ** 2;
-	}
+function createElasticBallGroups(): readonly LiquidFunParticleGroupSeed[] {
 	if (
-		!Number.isFinite(angularVelocityNumerator) ||
-		!Number.isFinite(angularVelocityDenominator) ||
-		angularVelocityDenominator <= Number.EPSILON
+		LIQUIDFUN_ELASTIC_BALL_CENTER_X_METERS.length !==
+		LIQUIDFUN_ELASTIC_BALL_COUNT
 	) {
-		throw new RangeError('A Gate 4 soft square must have finite source motion.');
+		throw new Error('LiquidFun elastic ball positions do not match the configured count.');
 	}
-	const angularVelocity =
-		angularVelocityNumerator / angularVelocityDenominator;
-	const edgeLength = LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_GATE4_UNITS;
-	const createNode = (
-		offset: (typeof SOFT_SQUARE_CORNER_OFFSETS)[number]
-	): LiquidFunSoftSquareNodeSeed => ({
-		position: {
-			x: center.x + offset.x * edgeLength,
-			y: center.y + offset.y * edgeLength
-		},
-		velocity: {
-			x: linearVelocity.x - angularVelocity * offset.y * edgeLength,
-			y: linearVelocity.y + angularVelocity * offset.x * edgeLength
-		}
-	});
-	const nodes: LiquidFunSoftSquareSeed['nodes'] = [
-		createNode(SOFT_SQUARE_CORNER_OFFSETS[0]),
-		createNode(SOFT_SQUARE_CORNER_OFFSETS[1]),
-		createNode(SOFT_SQUARE_CORNER_OFFSETS[2]),
-		createNode(SOFT_SQUARE_CORNER_OFFSETS[3])
-	];
-	const bonds = SOFT_SQUARE_BOND_ENDPOINTS.map(
-		([firstNodeIndex, secondNodeIndex]) => {
-			const firstNode = nodes[firstNodeIndex];
-			const secondNode = nodes[secondNodeIndex];
-			if (!firstNode || !secondNode) {
-				throw new RangeError('A Gate 4 soft square bond must identify two nodes.');
-			}
-			const firstPosition = mapGate4PositionToBox2D(firstNode.position);
-			const secondPosition = mapGate4PositionToBox2D(secondNode.position);
-			return {
-				firstNodeIndex,
-				secondNodeIndex,
-				restLengthBox2DUnits: Math.hypot(
-					secondPosition.x - firstPosition.x,
-					secondPosition.y - firstPosition.y
-				)
-			};
-		}
-	);
 
-	return { objectId, nodes, bonds };
+	return LIQUIDFUN_ELASTIC_BALL_CENTER_X_METERS.map((centerX, groupIndex) => {
+		const centerXGate4 = metersToGate4Units(centerX);
+		const centerYGate4 = metersToGate4Units(
+			LIQUIDFUN_ELASTIC_BALL_CENTER_Y_METERS
+		);
+		return {
+			groupIndex,
+			positions: LIQUIDFUN_ELASTIC_BALL_GRID_COORDINATES.map(
+				({ column, row }) => ({
+					x:
+						centerXGate4 +
+						(column - 1.5) * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS,
+					y:
+						centerYGate4 +
+						(row - 1.5) * LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS
+				})
+			)
+		};
+	});
+}
+
+function createSpringVines(): readonly LiquidFunParticleGroupSeed[] {
+	return Array.from({ length: LIQUIDFUN_SPRING_VINE_COUNT }, (_, groupIndex) => {
+		const x = metersToGate4Units(
+			LIQUIDFUN_SPRING_VINE_CENTER_X_START_METERS +
+				groupIndex * LIQUIDFUN_SPRING_VINE_CENTER_X_SPACING_METERS
+		);
+		const centerY = metersToGate4Units(
+			LIQUIDFUN_SPRING_VINE_CENTER_Y_METERS
+		);
+		return {
+			groupIndex,
+			positions: Array.from(
+				{ length: LIQUIDFUN_SPRING_VINE_PARTICLES_PER_GROUP },
+				(_, particleIndex) => ({
+					x,
+					y:
+						centerY +
+						(particleIndex -
+							(LIQUIDFUN_SPRING_VINE_PARTICLES_PER_GROUP - 1) / 2) *
+							LIQUIDFUN_PARTICLE_SPACING_GATE4_UNITS
+				})
+			)
+		};
+	});
+}
+
+function moveFractureNodesToLayout(
+	nodes: readonly MpmParticle[]
+): readonly MpmParticle[] {
+	if (nodes.length === 0) {
+		throw new Error('The Gate 4 fracture node source is empty.');
+	}
+	const sourceCenter = nodes.reduce(
+		(center, node) => ({
+			x: center.x + node.position.x / nodes.length,
+			y: center.y + node.position.y / nodes.length
+		}),
+		{ x: 0, y: 0 }
+	);
+	const targetCenter = {
+		x: metersToGate4Units(LIQUIDFUN_FRACTURE_CENTER_METERS.x),
+		y: metersToGate4Units(LIQUIDFUN_FRACTURE_CENTER_METERS.y)
+	};
+	const offset = {
+		x: targetCenter.x - sourceCenter.x,
+		y: targetCenter.y - sourceCenter.y
+	};
+	return nodes.map((node) => ({
+		...node,
+		position: {
+			x: node.position.x + offset.x,
+			y: node.position.y + offset.y
+		}
+	}));
 }
 
 export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 	const scene = createMpmGate4Scene(LIQUIDFUN_SCENE_SEED);
 	const sourceWaterParticles: MpmParticle[] = [];
 	const sourceOilParticles: MpmParticle[] = [];
-	const pebbleNodesByObject = new Map<number, MpmParticle[]>();
-	const fractureNodes: MpmParticle[] = [];
-	const fractureNodeIndices = new Map<number, number>();
+	const fractureNodesBySourceIndex = new Map<number, MpmParticle>();
 
 	for (let sourceIndex = 0; sourceIndex < scene.particles.length; sourceIndex += 1) {
 		const particle = scene.particles[sourceIndex];
@@ -473,69 +406,27 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 			sourceWaterParticles.push(particle);
 		} else if (material === 'oil') {
 			sourceOilParticles.push(particle);
-		} else if (particle.bondedTriangleVertex !== undefined) {
-			if (particle.objectId === undefined) {
-				throw new Error('Every Gate 4 pebble node must have an object id.');
-			}
-			const nodes = pebbleNodesByObject.get(particle.objectId) ?? [];
-			nodes.push(particle);
-			pebbleNodesByObject.set(particle.objectId, nodes);
 		} else if (particle.objectId === GATE4_FRACTURE_OBJECT_ID) {
-			fractureNodeIndices.set(sourceIndex, fractureNodes.length);
-			fractureNodes.push(particle);
+			fractureNodesBySourceIndex.set(sourceIndex, particle);
 		}
 	}
 
-	const pebbleNodes: MpmParticle[] = [];
-	const pebbleGroups: LiquidFunTriangleGroupSeed[] = [];
-	const softSquareGroups: LiquidFunSoftSquareSeed[] = [];
-	for (const [objectIndex, [objectId, nodes]] of [
-		...pebbleNodesByObject.entries()
-	]
-		.sort(([first], [second]) => first - second)
-		.entries()) {
-		const orderedNodes = [...nodes].sort(
-			(first, second) =>
-				(first.bondedTriangleVertex ?? -1) - (second.bondedTriangleVertex ?? -1)
-		);
-		if (
-			orderedNodes.length !== 3 ||
-			orderedNodes.some(
-				(node, vertex) =>
-					node.objectId !== objectId || node.bondedTriangleVertex !== vertex
-			)
-		) {
-			throw new Error(`Gate 4 pebble ${objectId} must contain vertices 0, 1, and 2.`);
-		}
-		const [firstNode, secondNode, thirdNode] = orderedNodes;
-		if (!firstNode || !secondNode || !thirdNode) {
-			throw new Error(`Gate 4 pebble ${objectId} must contain three vertices.`);
-		}
-
-		const firstNodeIndex = pebbleNodes.length;
-		pebbleNodes.push(...orderedNodes);
-		const triangleGroup = {
-			objectId,
-			nodeIndices: [
-				firstNodeIndex,
-				firstNodeIndex + 1,
-				firstNodeIndex + 2
-			],
-			usesElasticParticleFlag: pebbleGroups.length % 2 === 0
-		} as const;
-		if (objectIndex % 2 === 0) {
-			pebbleGroups.push(triangleGroup);
-		} else {
-			softSquareGroups.push(
-				createSoftSquareSeed(objectId, [firstNode, secondNode, thirdNode])
-			);
-		}
-	}
-
+	const sourceFractureNodes = [...fractureNodesBySourceIndex.values()];
+	const fractureNodes = moveFractureNodesToLayout(sourceFractureNodes);
+	const fractureNodeIndexBySourceIndex = new Map(
+		[...fractureNodesBySourceIndex.keys()].map((sourceIndex, nodeIndex) => [
+			sourceIndex,
+			nodeIndex
+		])
+	);
 	const fractureBonds: LiquidFunFractureBondSeed[] = scene.fractureBonds.map(
 		(bond: MpmSolidBond) => {
-			const firstNodeIndex = fractureNodeIndices.get(bond.firstParticle);
-			const secondNodeIndex = fractureNodeIndices.get(bond.secondParticle);
+			const firstNodeIndex = fractureNodeIndexBySourceIndex.get(
+				bond.firstParticle
+			);
+			const secondNodeIndex = fractureNodeIndexBySourceIndex.get(
+				bond.secondParticle
+			);
 			if (firstNodeIndex === undefined || secondNodeIndex === undefined) {
 				throw new Error('Every Gate 4 fracture bond must map to fracture nodes.');
 			}
@@ -548,82 +439,121 @@ export function createLiquidFunGate4Workload(): LiquidFunGate4Workload {
 			};
 		}
 	);
-	const mappedMpmNodeCount =
-		sourceWaterParticles.length +
-		sourceOilParticles.length +
-		pebbleNodes.length +
-		fractureNodes.length;
-	const elasticTriangleCount = pebbleGroups.filter(
-		(group) => group.usesElasticParticleFlag
-	).length;
 
+	const targetStartY = metersToGate4Units(LIQUIDFUN_FLUID_START_Y_METERS);
+	const fluidStartX = (column: number) =>
+		metersToGate4Units(
+			LIQUIDFUN_FLUID_COLUMN_START_X_METERS +
+				column * LIQUIDFUN_FLUID_COLUMN_SPACING_METERS
+		);
+	const fluidParticles = (
+		sourceParticles: readonly MpmParticle[],
+		sourceColumns: number,
+		sourceRows: number,
+		targetStartX: number
+	) =>
+		expandLiquidParticles(
+			sourceParticles,
+			sourceColumns,
+			sourceRows,
+			LIQUIDFUN_FLUID_TYPE_PARTICLE_COUNT,
+			LIQUIDFUN_FLUID_PARTICLE_ROWS,
+			targetStartX,
+			targetStartY
+		);
+	const [waterParticles, oilParticles, inkParticles, soilParticles] = [
+		fluidParticles(
+			sourceWaterParticles,
+			GATE4_WATER_PARTICLE_COLUMNS,
+			GATE4_WATER_PARTICLE_ROWS,
+			fluidStartX(0)
+		),
+		fluidParticles(
+			sourceOilParticles,
+			GATE4_OIL_PARTICLE_COLUMNS,
+			GATE4_OIL_PARTICLE_ROWS,
+			fluidStartX(1)
+		),
+		fluidParticles(
+			sourceWaterParticles,
+			GATE4_WATER_PARTICLE_COLUMNS,
+			GATE4_WATER_PARTICLE_ROWS,
+			fluidStartX(2)
+		),
+		fluidParticles(
+			sourceOilParticles,
+			GATE4_OIL_PARTICLE_COLUMNS,
+			GATE4_OIL_PARTICLE_ROWS,
+			fluidStartX(3)
+		)
+	];
+	if (!waterParticles || !oilParticles || !inkParticles || !soilParticles) {
+		throw new Error('LiquidFun fluid source grids could not be created.');
+	}
+
+	const elasticBallGroups = createElasticBallGroups();
+	const springVines = createSpringVines();
+	const finitePosition = (position: MpmVector2) =>
+		Number.isFinite(position.x) && Number.isFinite(position.y);
 	if (
 		scene.particles.length !== GATE4_PARTICLE_COUNT ||
 		sourceWaterParticles.length !== GATE4_WATER_PARTICLE_COUNT ||
 		sourceOilParticles.length !== GATE4_OIL_PARTICLE_COUNT ||
-		pebbleGroups.length !== LIQUIDFUN_PEBBLE_TRIANGLE_COUNT ||
-		elasticTriangleCount !== LIQUIDFUN_ELASTIC_TRIANGLE_COUNT ||
-		softSquareGroups.length !== LIQUIDFUN_SOFT_SQUARE_COUNT ||
-		pebbleNodes.length !== GATE4_PEBBLE_PARTICLE_COUNT ||
 		fractureNodes.length !== GATE4_FRACTURE_PARTICLE_COUNT ||
-		softSquareGroups.some(
-			(group) =>
-				group.nodes.length !== LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT ||
-				group.bonds.length !== LIQUIDFUN_SOFT_SQUARE_SPRINGS_PER_OBJECT ||
-				group.nodes.some(
-					(node) =>
-						!Number.isFinite(node.position.x) ||
-						!Number.isFinite(node.position.y) ||
-						!Number.isFinite(node.velocity.x) ||
-						!Number.isFinite(node.velocity.y)
-				) ||
-				group.bonds.some(
-					(bond) =>
-						bond.firstNodeIndex < 0 ||
-						bond.firstNodeIndex >= LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT ||
-						bond.secondNodeIndex < 0 ||
-						bond.secondNodeIndex >= LIQUIDFUN_SOFT_SQUARE_VERTEX_COUNT ||
-						!Number.isFinite(bond.restLengthBox2DUnits) ||
-						bond.restLengthBox2DUnits <= 0
+		fractureBonds.length !== GATE4_FRACTURE_BOND_COUNT ||
+		[
+			waterParticles,
+			oilParticles,
+			inkParticles,
+			soilParticles
+		].some(
+			(particles) =>
+				particles.length !== LIQUIDFUN_FLUID_TYPE_PARTICLE_COUNT ||
+				particles.some(
+					(particle) =>
+						!finitePosition(particle.position) ||
+						!finitePosition(particle.velocity)
 				)
 		) ||
-		fractureBonds.length !== GATE4_FRACTURE_BOND_COUNT ||
-		mappedMpmNodeCount !== scene.particles.length ||
+		elasticBallGroups.length !== LIQUIDFUN_ELASTIC_BALL_COUNT ||
+		elasticBallGroups.some(
+			(group) =>
+				group.positions.length !== LIQUIDFUN_ELASTIC_BALL_PARTICLES_PER_GROUP ||
+				group.positions.some((position) => !finitePosition(position))
+		) ||
+		springVines.length !== LIQUIDFUN_SPRING_VINE_COUNT ||
+		springVines.some(
+			(group) =>
+				group.positions.length !== LIQUIDFUN_SPRING_VINE_PARTICLES_PER_GROUP ||
+				group.positions.some((position) => !finitePosition(position))
+		) ||
+		fractureNodes.some(
+			(node) =>
+				!finitePosition(node.position) || !finitePosition(node.velocity)
+		) ||
 		fractureBonds.some(
 			(bond) =>
 				bond.failureStrain !== GATE4_FRACTURE_FAILURE_STRAIN ||
 				bond.firstNodeIndex < 0 ||
 				bond.firstNodeIndex >= fractureNodes.length ||
 				bond.secondNodeIndex < 0 ||
-				bond.secondNodeIndex >= fractureNodes.length
+				bond.secondNodeIndex >= fractureNodes.length ||
+				!Number.isFinite(bond.restLengthBox2DUnits) ||
+				bond.restLengthBox2DUnits <= 0
 		)
 	) {
-		throw new Error('The LiquidFun mapping no longer matches the Gate 4 scene nodes and bonds.');
+		throw new Error('The LiquidFun workload does not match its configured particle layout.');
 	}
 
 	return {
 		seed: LIQUIDFUN_SCENE_SEED,
 		sourceMpmNodeCount: scene.particles.length,
-		mappedMpmNodeCount,
-		waterParticles: expandLiquidParticles(
-			sourceWaterParticles,
-			GATE4_WATER_PARTICLE_COLUMNS,
-			GATE4_WATER_PARTICLE_ROWS,
-			LIQUIDFUN_WATER_PARTICLE_COUNT,
-			LIQUIDFUN_WATER_GRID.rows,
-			LIQUIDFUN_WATER_START_Y
-		),
-		oilParticles: expandLiquidParticles(
-			sourceOilParticles,
-			GATE4_OIL_PARTICLE_COLUMNS,
-			GATE4_OIL_PARTICLE_ROWS,
-			LIQUIDFUN_OIL_PARTICLE_COUNT,
-			LIQUIDFUN_OIL_GRID.rows,
-			LIQUIDFUN_OIL_START_Y
-		),
-		pebbleNodes,
-		pebbleGroups,
-		softSquareGroups,
+		waterParticles,
+		oilParticles,
+		inkParticles,
+		soilParticles,
+		elasticBallGroups,
+		springVines,
 		fractureNodes,
 		fractureBonds
 	};

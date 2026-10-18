@@ -20,37 +20,35 @@
 		LIQUIDFUN_BOX2D_DOMAIN_UNITS,
 		LIQUIDFUN_BOX2D_UNITS_PER_METER,
 		LIQUIDFUN_DT_SECONDS,
-		LIQUIDFUN_ELASTIC_PARTICLE_COUNT,
+		LIQUIDFUN_ELASTIC_BALL_COUNT,
+		LIQUIDFUN_ELASTIC_BALL_PARTICLE_COUNT,
+		LIQUIDFUN_ELASTIC_BALL_PARTICLES_PER_GROUP,
 		LIQUIDFUN_ELASTIC_STRENGTH,
-		LIQUIDFUN_ELASTIC_TRIANGLE_COUNT,
+		LIQUIDFUN_FLUID_PARTICLE_COUNT,
 		LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN,
 		LIQUIDFUN_GATE4_DOMAIN,
 		LIQUIDFUN_GATE4_ACCELERATION_UNITS_PER_METER_PER_SECOND_SQUARED,
 		LIQUIDFUN_GATE4_UNITS_PER_METER,
+		LIQUIDFUN_INK_PARTICLE_COUNT,
 		LIQUIDFUN_OIL_PARTICLE_COUNT,
-		LIQUIDFUN_OIL_PARTICLE_COUNT_MULTIPLIER,
 		LIQUIDFUN_PACKAGE_VERSION,
 		LIQUIDFUN_PARTICLE_RADIUS_METERS,
 		LIQUIDFUN_PARTICLE_SPACING_METERS,
-		LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS,
-		LIQUIDFUN_PEBBLE_MASS,
-		LIQUIDFUN_PEBBLE_VERTEX_COUNT,
 		LIQUIDFUN_PHYSICAL_DOMAIN_METERS,
 		LIQUIDFUN_PRESSURE_STRENGTH,
-		LIQUIDFUN_RIGID_TRIANGLE_COUNT,
-		LIQUIDFUN_RIGID_TRIANGLE_VERTEX_COUNT,
 		LIQUIDFUN_SCENE_SEED,
 		LIQUIDFUN_SHARED_PARTICLE_MASS,
-		LIQUIDFUN_SOFT_SQUARE_COUNT,
-		LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_METERS,
-		LIQUIDFUN_SOFT_SQUARE_MASS,
-		LIQUIDFUN_SOFT_SQUARE_NODE_COUNT,
-		LIQUIDFUN_SOFT_SQUARE_NODE_MASS,
-		LIQUIDFUN_SOFT_SQUARE_SPRING_COUNT,
-		LIQUIDFUN_SOFT_SQUARE_SPRING_FREQUENCY_HZ,
+		LIQUIDFUN_SOIL_PARTICLE_COUNT,
+		LIQUIDFUN_SPRING_STRENGTH,
+		LIQUIDFUN_SPRING_VINE_COUNT,
+		LIQUIDFUN_SPRING_VINE_LENGTH_METERS,
+		LIQUIDFUN_SPRING_VINE_LINK_COUNT,
+		LIQUIDFUN_SPRING_VINE_PARTICLE_COUNT,
+		LIQUIDFUN_SPRING_VINE_PARTICLES_PER_GROUP,
+		LIQUIDFUN_SPRING_VINE_SPAN_METERS,
+		LIQUIDFUN_TOTAL_PARTICLE_COUNT,
 		LIQUIDFUN_VELOCITY_ITERATIONS,
 		LIQUIDFUN_POSITION_ITERATIONS,
-		LIQUIDFUN_WATER_PARTICLE_COUNT_MULTIPLIER,
 		LIQUIDFUN_WATER_PARTICLE_COUNT
 	} from '#lib/mpm/liquidfun/workload.js';
 
@@ -414,7 +412,7 @@
 			</div>
 
 			<div class="canvas-frame">
-				<canvas bind:this={canvas} aria-label="LiquidFun WASM water, oil and solid particle simulation">
+				<canvas bind:this={canvas} aria-label="LiquidFun WASM four-material, elastic-ball and spring-vine simulation">
 					Canvas2D に対応したブラウザーでご利用ください。
 				</canvas>
 			</div>
@@ -599,35 +597,29 @@
 					<dd>{simulation?.particleCount.toLocaleString() ?? '—'}</dd>
 				</div>
 				<div>
-					<dt>Water / oil / elastic flags</dt>
+					<dt>Water / oil / ink / soil particles</dt>
 					<dd>
 						{simulation?.waterParticleCount.toLocaleString() ?? '—'} /
 						{simulation?.oilParticleCount.toLocaleString() ?? '—'} /
-						{simulation?.elasticParticleCount.toLocaleString() ?? '—'}
+						{simulation?.inkParticleCount.toLocaleString() ?? '—'} /
+						{simulation?.soilParticleCount.toLocaleString() ?? '—'}
 					</dd>
 				</div>
 				<div>
-					<dt>Rigid / elastic triangles / soft squares</dt>
+					<dt>Elastic balls / particles / triads</dt>
 					<dd>
-						{simulation?.triangleBodyCount ?? '—'} /
-						{simulation?.elasticTriangleCount ?? '—'} /
-						{simulation?.softSquareCount ?? '—'}
+						{simulation?.elasticBallCount ?? '—'} /
+						{simulation?.elasticParticleCount ?? '—'} /
+						{simulation?.elasticTriadCount ?? '—'}
 					</dd>
 				</div>
 				<div>
-					<dt>Elastic-particle triads</dt>
-					<dd>{simulation?.elasticTriadCount ?? '—'}</dd>
-				</div>
-				<div>
-					<dt>Soft-square nodes / springs</dt>
+					<dt>Spring vines / particles / pairs</dt>
 					<dd>
-						{simulation?.softSquareNodeCount ?? '—'} /
-						{simulation?.softSquareJointCount ?? '—'}
+						{simulation?.springVineCount ?? '—'} /
+						{simulation?.springVineParticleCount ?? '—'} /
+						{simulation?.springPairCount ?? '—'}
 					</dd>
-				</div>
-				<div>
-					<dt>Solid vertices (pebbles)</dt>
-					<dd>{simulation?.pebbleVertexCount ?? '—'}</dd>
 				</div>
 				<div>
 					<dt>Fracture nodes / active bonds</dt>
@@ -643,34 +635,31 @@
 				<ul>
 					<li>
 						Seed <code>0x{LIQUIDFUN_SCENE_SEED.toString(16)}</code> ·
-						{simulation?.sourceMpmNodeCount.toLocaleString() ?? '3,674'} source nodes ·
-						{simulation?.mappedMpmNodeCount.toLocaleString() ?? '3,674'} mapped
+						{simulation?.sourceMpmNodeCount.toLocaleString() ?? '3,674'} Gate 4 source nodes;
+						the LiquidFun workload is not a one-to-one MPM mapping
 					</li>
 					<li>
-						{LIQUIDFUN_WATER_PARTICLE_COUNT.toLocaleString()} water /
-						{' '}{LIQUIDFUN_OIL_PARTICLE_COUNT.toLocaleString()} oil particles ·
-						water {LIQUIDFUN_WATER_PARTICLE_COUNT_MULTIPLIER}× / oil
-						{LIQUIDFUN_OIL_PARTICLE_COUNT_MULTIPLIER}× source count ·
-						{(LIQUIDFUN_PARTICLE_SPACING_METERS * 1_000).toFixed(1)} mm spacing
+						{LIQUIDFUN_WATER_PARTICLE_COUNT.toLocaleString()} water (blue, default) ·
+						{LIQUIDFUN_OIL_PARTICLE_COUNT.toLocaleString()} oil (yellow, viscous) ·
+						{LIQUIDFUN_INK_PARTICLE_COUNT.toLocaleString()} ink (black, powder) ·
+						{LIQUIDFUN_SOIL_PARTICLE_COUNT.toLocaleString()} soil (brown, powder + viscous) ·
+						{(LIQUIDFUN_PARTICLE_SPACING_METERS * 1_000).toFixed(1)} mm stride
 					</li>
 					<li>
-						{LIQUIDFUN_RIGID_TRIANGLE_COUNT} rigid triangles +
-						{LIQUIDFUN_ELASTIC_TRIANGLE_COUNT} elastic-particle triangles +
-						{LIQUIDFUN_SOFT_SQUARE_COUNT} soft squares ·
-						{LIQUIDFUN_RIGID_TRIANGLE_VERTEX_COUNT} rigid vertices +
-						{LIQUIDFUN_ELASTIC_PARTICLE_COUNT} elastic particles +
-						{LIQUIDFUN_SOFT_SQUARE_NODE_COUNT} square nodes =
-						{LIQUIDFUN_PEBBLE_VERTEX_COUNT} total · {LIQUIDFUN_SOFT_SQUARE_SPRING_COUNT} soft-square springs
+						{LIQUIDFUN_TOTAL_PARTICLE_COUNT.toLocaleString()} total LiquidFun particles =
+						{LIQUIDFUN_FLUID_PARTICLE_COUNT.toLocaleString()} fluid +
+						{LIQUIDFUN_ELASTIC_BALL_PARTICLE_COUNT} elastic-ball +
+						{LIQUIDFUN_SPRING_VINE_PARTICLE_COUNT} spring-vine particles
 					</li>
 					<li>
-						{LIQUIDFUN_GATE4_DOMAIN.width} × {LIQUIDFUN_GATE4_DOMAIN.height} Gate 4 units ·
+						{LIQUIDFUN_GATE4_DOMAIN.width.toFixed(0)} × {LIQUIDFUN_GATE4_DOMAIN.height.toFixed(0)} Gate 4 units ·
 						{(LIQUIDFUN_PHYSICAL_DOMAIN_METERS.width * 1_000).toFixed(0)} ×
 						{(LIQUIDFUN_PHYSICAL_DOMAIN_METERS.height * 1_000).toFixed(0)} mm visible domain
 					</li>
 					<li>
 						{(LIQUIDFUN_WALL_THICKNESS_METERS * 1_000).toLocaleString()} mm of static wall depth beyond each visible
-						domain edge · {LIQUIDFUN_BOX2D_DOMAIN_UNITS.width} ×
-						{LIQUIDFUN_BOX2D_DOMAIN_UNITS.height} Box2D engine units
+						domain edge · {LIQUIDFUN_BOX2D_DOMAIN_UNITS.width.toFixed(0)} ×
+						{LIQUIDFUN_BOX2D_DOMAIN_UNITS.height.toFixed(0)} Box2D engine units
 					</li>
 					<li>
 						dt = 1/{Math.round(1 / LIQUIDFUN_DT_SECONDS)} s · position scale {LIQUIDFUN_GATE4_UNITS_PER_METER}
@@ -681,28 +670,26 @@
 						iterations · particle iterations {simulation?.particleIterations ?? '…'}
 					</li>
 					<li>
-						Fluid radius {(LIQUIDFUN_PARTICLE_RADIUS_METERS * 1_000).toFixed(1)} mm · shared water/oil
-						particle mass {LIQUIDFUN_SHARED_PARTICLE_MASS} simulation units · pebble edge
-						{(LIQUIDFUN_PEBBLE_EDGE_LENGTH_METERS * 1_000).toFixed(1)} mm / mass
-						{LIQUIDFUN_PEBBLE_MASS} simulation units · fracture threshold
+						Shared particle radius {(LIQUIDFUN_PARTICLE_RADIUS_METERS * 1_000).toFixed(1)} mm and
+						mass {LIQUIDFUN_SHARED_PARTICLE_MASS} simulation units · fracture threshold
 						{(LIQUIDFUN_FRACTURE_BOND_FAILURE_STRAIN * 100).toFixed(0)}%
 					</li>
 					<li>
-						Soft-square side {(LIQUIDFUN_SOFT_SQUARE_EDGE_LENGTH_METERS * 1_000).toFixed(1)} mm · mass
-						{LIQUIDFUN_SOFT_SQUARE_MASS} total ({LIQUIDFUN_SOFT_SQUARE_NODE_MASS} per node) · spring frequency
-						{LIQUIDFUN_SOFT_SQUARE_SPRING_FREQUENCY_HZ} Hz
+						{LIQUIDFUN_ELASTIC_BALL_COUNT} independent elastic balls ×
+						{LIQUIDFUN_ELASTIC_BALL_PARTICLES_PER_GROUP} particles · elastic strength
+						{LIQUIDFUN_ELASTIC_STRENGTH.toFixed(2)}
 					</li>
 					<li>
-						Elastic triangles use <code>b2_elasticParticle</code> at strength
-						{LIQUIDFUN_ELASTIC_STRENGTH.toFixed(2)} · each has 3 shared-system particles
-						({(LIQUIDFUN_PARTICLE_RADIUS_METERS * 1_000).toFixed(1)} mm radius,
-						{LIQUIDFUN_SHARED_PARTICLE_MASS} mass each; total
-						{(3 * LIQUIDFUN_SHARED_PARTICLE_MASS).toFixed(3)} vs rigid triangle mass
-						{LIQUIDFUN_PEBBLE_MASS}
+						{LIQUIDFUN_SPRING_VINE_COUNT} spring vines ×
+						{LIQUIDFUN_SPRING_VINE_PARTICLES_PER_GROUP} particles ·
+						{(LIQUIDFUN_SPRING_VINE_LENGTH_METERS * 1_000).toFixed(0)} mm target /
+						{(LIQUIDFUN_SPRING_VINE_SPAN_METERS * 1_000).toFixed(1)} mm particle span ·
+						{LIQUIDFUN_SPRING_VINE_LINK_COUNT} expected links · spring strength
+						{LIQUIDFUN_SPRING_STRENGTH.toFixed(2)}
 					</li>
 					<li>
-						Pressure strength {LIQUIDFUN_PRESSURE_STRENGTH.toFixed(2)} · one shared particle-system coefficient for
-						water and oil
+						Pressure strength {LIQUIDFUN_PRESSURE_STRENGTH.toFixed(2)} · one shared
+						particle-system coefficient; all materials still collide and share radius and mass
 					</li>
 				</ul>
 			</div>
@@ -713,20 +700,17 @@
 		<h2 id="comparison-heading">How to use this reference</h2>
 		<ul>
 			<li>
-				This page steps the installed <code>liquidfun-wasm</code> engine. Liquid particles are solved by
-				LiquidFun; pebble triangles alternate between Box2D polygon bodies and LiquidFun elastic-particle
-				groups, while soft squares and the fracture network use dynamic circle bodies and distance joints.
-				Canvas2D is only the renderer.
+				This page steps the installed <code>liquidfun-wasm</code> engine. All 3,800 visible material
+				particles share one LiquidFun particle system; the elastic balls and spring vines use LiquidFun
+				particle groups. Only the retained fracture network uses dynamic circle bodies and distance
+				joints. Canvas2D is only the renderer.
 			</li>
 			<li>
-				Water and oil use separate LiquidFun particle flags in one particle system, so both use the same
-				1.0 mm radius and 0.01 simulation mass units and retain mutual particle collisions. The pebble
-				workload has 12 rigid triangles, 13 elastic-particle triangles, and 25 soft squares. Each elastic
-				triangle uses three shared-system particles (0.03 total mass), so it is heavier than a 0.008-mass
-				rigid triangle; the comparison changes both representation and mass. Each square has four circle
-				nodes connected by six springs; its filled Canvas polygon is visual only, not a solid collision
-				fixture. These representations differ from deformable MLS-MPM triangles, so their paths are not
-				a matched-physics comparison.
+				Water, oil, ink and soil use flags in the same particle system, so all four share the 1.0 mm
+				radius and 0.01 simulation mass and retain cross-material particle collisions. Color identifies
+				the requested material; it does not create a separate physical phase. Ten elastic groups and ten
+				spring groups are likewise still in that shared system. LiquidFun is a behavioral comparison for
+				MLS-MPM, not a matched-physics or trajectory-equivalence test.
 			</li>
 			<li>
 				Use the CPU MLS-MPM page at <a href="/labs/mpm/reference">/labs/mpm/reference</a> as the

@@ -85,6 +85,7 @@ declare module 'liquidfun-wasm' {
 		radius: number;
 		pressureStrength: number;
 		elasticStrength: number;
+		springStrength: number;
 		delete?(): void;
 	}
 
@@ -93,6 +94,7 @@ declare module 'liquidfun-wasm' {
 		CreateParticleGroup(definition: B2ParticleGroupDef): B2ParticleGroup;
 		GetParticleCount(): number;
 		GetParticleFlags(index: number): number;
+		GetPairCount(): number;
 		GetTriadCount(): number;
 		GetPositionBuffer(): B2Vec2;
 		delete?(): void;
@@ -132,6 +134,8 @@ declare module 'liquidfun-wasm' {
 		b2_waterParticle: number;
 		b2_viscousParticle: number;
 		b2_elasticParticle: number;
+		b2_springParticle: number;
+		b2_powderParticle: number;
 	}
 
 	export type LiquidFunFactory = () => Promise<LiquidFunModule>;

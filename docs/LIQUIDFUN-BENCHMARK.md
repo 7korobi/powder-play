@@ -43,8 +43,8 @@ and the wall. The visible LiquidFun domain is 140 × 75 mm.
 
 Physical Gate 4 positions use 20,000 units/m. Box2D runs in internal units at
 1,000 units/m (one internal unit represents 1 mm), so one Gate 4 unit maps to
-0.05 Box2D units. This keeps the 1 mm fluid radius and 3 mm pebble geometry
-large relative to Box2D's fixed length tolerance. Internal Box2D coordinates
+0.05 Box2D units. This keeps the 1 mm particle radius and 1.5 mm spring-link
+spacing large relative to Box2D's fixed length tolerance. Internal Box2D coordinates
 and physical meters are deliberately distinct. The LiquidFun scene regrids its
 fluid particles to fit the specified 140 × 75 mm visible domain; the CPU/GPU
 MPM source scene is unchanged.
@@ -71,89 +71,75 @@ Gate 4 coordinates are y-down; Box2D engine coordinates are y-up:
 - Every step uses `dt = 1/240 s`; the benchmark does not change the seed,
   timestep, or source scene counts.
 
-The source has 3,674 MPM nodes: 2,000 water, 1,500 oil, 150 pebble vertices,
-and 24 fracture nodes. The LiquidFun workload uses 2,000 water and 1,500 oil
-particles. Water uses the default `b2_waterParticle` flag; oil uses
-`b2_viscousParticle`. Both are created in the **same** LiquidFun particle
-system, with a shared radius of 1 mm and a shared particle mass of 0.01
-simulation mass units. LiquidFun sets density at the particle-system level, so
-the oil particles also use mass 0.01; assigning different water and oil masses
-independently would require separate systems and remove contacts between water
-and oil particles. With the unchanged 1.5 mm stride, this derives a shared
-system density of 0.004444 simulation mass units per square Box2D unit. These
-are simulation mass units, not calibrated kilograms; because LiquidFun is
-two-dimensional, its density is per area rather than volumetric.
+The source MPM scene has 3,674 nodes: 2,000 water, 1,500 oil, 150 pebble
+vertices, and 24 fracture nodes. The LiquidFun workbench uses the seed for
+fluid velocity samples and the fracture network, but its material workload is
+not a one-to-one mapping of those source nodes. It creates 800 particles for
+each of water, oil, ink, and soil (3,200 fluid particles), ten elastic balls
+with 12 particles each (120), and ten spring vines with 48 particles each
+(480), for 3,800 LiquidFun particles total. The 24 fracture nodes are separate
+Box2D bodies and are not included in that particle count.
+
+Water uses the default `b2_waterParticle` flag; oil uses
+`b2_viscousParticle`; ink uses `b2_powderParticle`; and soil combines
+`b2_powderParticle` with `b2_viscousParticle`. These are flags in the **same**
+LiquidFun particle system, not four isolated fluids: every type shares a 1 mm
+radius, 0.01 simulation mass units per particle, and particle contacts with
+the other types. Color distinguishes the requested material in the renderer;
+it does not isolate solver interactions. LiquidFun sets density at the
+particle-system level. At the 1.5 mm stride, the shared density is 0.004444
+simulation mass units per square Box2D unit. These are simulation mass units,
+not calibrated kilograms; LiquidFun is two-dimensional, so its density is per
+area rather than volumetric.
+
 LiquidFun represents fluid with radius-bearing particles and neighbor pressure
-and contact solves; triangular fluid elements are not required. The application
-sets the shared particle-system `pressureStrength` to 1.00, twenty times the
-installed `liquidfun-wasm@7.0.0` default of 0.05. This is a solver coefficient,
-not a physical pressure unit or a per-material setting. The increased value is
-a tuning experiment; check volume retention, oscillation, and stability under
-the target forcing rather than treating it as a calibrated material parameter.
+and contact solves; triangular fluid elements are not required. The
+application sets the shared particle-system `pressureStrength` to 1.00,
+twenty times the installed `liquidfun-wasm@7.0.0` default of 0.05. This is a
+solver coefficient, not a physical pressure unit or a per-material setting.
+The increased value is a tuning experiment; check volume retention,
+oscillation, and stability under the target forcing rather than treating it as
+a calibrated material parameter.
 
-For the LiquidFun workload only, the source fluids are regridded at a 30-unit
-stride, which maps to 1.5 mm (75% of the 2 mm particle diameter): water uses
-87 columns × 23 rows for 2,000 particles, and oil uses 75 columns × 20 rows
-for 1,500 particles. The different row counts let both bands fit within the
-140 × 75 mm visible domain while keeping the particle spacing proportional to
-the radius. Oil particle centers start 2 mm below the top wall; water follows
-oil by one stride and remains clear of the fracture nodes. Source velocities
-are sampled across the source rows and repeated horizontally. The maximum
-fluid center x is 2,680 Gate 4 units (134 mm), within the 2,800-unit (140 mm)
-domain. The source Gate 4 scene, including all 3,674 mapped nodes, its
-2,000/1,500 fluid-node counts, and its 2,200 × 1,500 domain used by the CPU
-and GPU MLS-MPM pages, is unchanged.
+The four fluid grids each contain 800 particles across 43 rows, using a 30
+Gate 4 unit stride (1.5 mm, 75% of the 2 mm particle diameter). Their x
+origins are 1.5, 30.5, 59.5, and 88.5 mm; all start at y = 10 mm. The maximum
+row width is 19 particles (27 mm between first and last centers), and the last
+row is at y = 73 mm, so particle centers plus their 1 mm radii remain within
+the 140 × 75 mm visible domain. Water and ink reuse sampled water velocities;
+oil and soil reuse sampled oil velocities. Source rows are sampled and
+horizontal velocities repeated. The source Gate 4 scene and its 2,200 × 1,500
+domain used by the CPU and GPU MLS-MPM pages remain unchanged.
 
-The LiquidFun workload maps alternating source pebble objects to 25 triangle
-shapes and 25 soft squares; the source MPM scene remains unchanged. The triangle
-shapes alternate between 12 rigid Box2D polygons and 13 LiquidFun
-`b2_elasticParticle` groups, with three particles per elastic triangle. Each
-rigid triangle is one dynamic Box2D polygon body with 3 mm sides and mass 0.008
-simulation mass units. It keeps the source triangle's center, fits its linear
-and angular velocity from the source vertices, and scales the local vertices
-to the target edge length. Fixture density is derived from the target body
-mass and polygon area. The collision fixture covers the same three vertices
-that are drawn; the vertex array is passed through LiquidFun's contiguous
-`pointsToVec2Array` adapter before Box2D constructs the polygon.
+The ten elastic balls are independent LiquidFun particle groups with
+`b2_elasticParticle`; each contains 12 particles arranged on a 1.5 mm grid
+with the four corners omitted. `elasticStrength` is explicitly set to
+LiquidFun's default value of 0.25. The balls share the particle system's
+1 mm radius and 0.01 particle mass, so each has a nominal particle mass of
+0.12 simulation mass units. Their group boundaries are not rigid fixtures,
+and their mass is not calibrated to a physical ball.
 
-Each elastic triangle is created as its own particle group so its three initial
-vertices form one elastic triad without connecting to neighboring triangles.
-The group uses the shared fluid particle system's 1 mm radius and 0.01
-simulation mass per particle, giving it a total mass of 0.03; this differs from
-the 0.008 mass of a rigid triangle. `elasticStrength` is explicitly set to
-LiquidFun's default value of 0.25. These are therefore intentionally different
-representations, not a flag-only comparison at equal mass.
+The ten spring vines are also independent particle groups, each using
+`b2_springParticle` for 48 particles in a vertical chain. Adjacent particles
+are 1.5 mm apart, giving 47 intervals and a 70.5 mm center-to-center span,
+close to the requested 70 mm. Their x centers are 2.2 mm apart, just beyond
+the 2 mm particle diameter. `springStrength` is set to LiquidFun's default
+0.25. At initialization, each vine is expected to form 47 spring links
+(470 across the ten groups); startup checks this count, and the live page
+continues to report the engine's actual `GetPairCount()`.
 
-Each soft square has a 3 mm side and the same total mass, 0.008 simulation
-mass units, split equally among four dynamic circle-node bodies (0.002 per
-node). The nodes are connected by six distance-joint springs: the four sides
-and both diagonals. Spring stiffness and damping are derived from a 4 Hz
-frequency and 0.7 damping ratio. The circles have 0.75 mm radii, so the
-quadrilateral can deform while keeping a closed, collidable node frame under
-the current 1 mm fluid radius. Canvas2D fills the current four-node outline;
-that fill is visual only and is not an additional polygon collision fixture.
+The retained fracture network has 24 dynamic circle bodies connected by the
+same 53 Gate 4 bonds. Those bonds break when tensile strain reaches the Gate 4
+12% threshold. Elastic balls and spring vines use LiquidFun's particle
+constraints, not Box2D rigid bodies or hand-authored distance joints.
 
-The mixed pebble arrangement therefore has 36 rigid-triangle vertices, 39
-elastic-particle vertices, and 100 soft-square nodes, 175 in total. A square
-has 4/3 as many vertices as one triangle, while the aggregate count is 7/6 of
-the original 150 triangle vertices.
-The 24 fracture nodes remain individual dynamic circle bodies connected by
-the same 53 Gate 4 bonds. Those bonds break when tensile strain reaches the
-Gate 4 12% threshold.
-
-Rigid triangles are rigid approximations of the MPM pebble material;
-elastic-particle triangles use LiquidFun's triad shape-restoration solver; and
-soft squares are four-node, six-spring Box2D approximations. None reproduces
-MPM deformation gradients or Neo-Hookean constitutive behavior, and
-Box2D/LiquidFun contact and constraint solving differs from MLS-MPM. The 24
-fracture nodes remain dynamic circle bodies connected by 53 Gate 4 bonds;
-those bonds break when tensile strain reaches the Gate 4 12% threshold. One
-LiquidFun particle system shares density, radius, and particle mass across
-water, oil, and elastic triangles, so it cannot preserve the MPM phase
-densities 0.02 and 0.016 independently or match rigid-pebble mass for elastic
-triangles. Expect different trajectories and breakage timing; the comparison
-holds the seeded source scene and fixed timestep, not the exact physical
-response.
+These flag-based materials are a behavioral comparison, not a matched-physics
+replacement for MPM. LiquidFun flags do not provide independent mass or radius
+per material, and all four fluid types continue to contact one another. Its
+elastic-triad and spring-pair solvers do not reproduce MPM deformation
+gradients or Neo-Hookean constitutive behavior. Expect different trajectories,
+mixing, and breakage timing; the comparison holds a fixed source seed and
+timestep, not exact physical response.
 
 ## Live LiquidFun lab and MPM references
 
@@ -183,13 +169,13 @@ gravity; isolate it from manual-gravity tests by setting its amplitude to zero.
 
 The CPU and GPU MLS-MPM pages remain a separate same-equation numerical
 comparison. LiquidFun is a behavioral reference for contact, waves, settling,
-and stability, not an exact trajectory or constitutive-model oracle. Water
-and oil use different LiquidFun particle flags in one particle system, so they
-share its density, radius, and 0.01 particle mass. The pebble mixture combines
-rigid Box2D triangles with spring-connected soft squares; neither reproduces
-the deformable MLS-MPM triangle constitutive model. Fracture nodes use dynamic
-bodies and breakable distance joints. These model differences should be
-retained when interpreting the visual and timing results.
+and stability, not an exact trajectory or constitutive-model oracle. Water,
+oil, ink, and soil use different flag combinations in one particle system,
+so they share its density, radius, 0.01 particle mass, and cross-material
+contacts. Elastic balls and spring vines use LiquidFun's particle constraints;
+they do not reproduce the deformable MLS-MPM triangle constitutive model.
+Fracture nodes use dynamic bodies and breakable distance joints. Retain these
+model differences when interpreting visual and timing results.
 
 ## Repeatable simulation-only benchmark
 
@@ -219,14 +205,15 @@ eight synchronous calls. The JSON includes median, p95, min, max, and sample
 count for batch CPU milliseconds, plus derived per-step time and steps/second.
 The p95 uses the same lower-index quantile convention as
 `scripts/benchmark-mpm.mjs`. Scope includes JavaScript-to-WASM call overhead,
-LiquidFun/Box2D `world.Step()` work, soft-square spring solving, and
-fracture-bond strain checks. Scene construction, Canvas2D, UI work, GPU
+LiquidFun `world.Step()` work, mixed-material particle contacts, elastic-triad
+and spring-pair solving, and fracture-bond strain checks. Scene construction,
+Canvas2D, UI work, GPU
 timestamps, and GPU queue completion/wait are excluded. No GPU or
 `navigator.gpu` is used by this benchmark.
 
 The result also records package/engine version, browser user agent,
-`hardwareConcurrency`, source hashes, scene seed/counts, grid/domain, scale,
-gravity, fixed `dt`, iteration counts, warmup parameters, and sample
+`hardwareConcurrency`, source hashes, seed and material counts, grid/domain,
+scale, gravity, fixed `dt`, iteration counts, warmup parameters, and sample
 configuration. The package loader automatically selects its SIMD or non-SIMD
 WASM build when supported; results can therefore differ by browser and
 hardware. Use the recorded environment and configuration when interpreting
