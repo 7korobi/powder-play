@@ -1,5 +1,10 @@
 export type MpmConstitutiveModel = 'neo-hookean' | 'snow' | 'water' | 'oil' | 'powder';
 
+export interface MpmTaitEquationOfState {
+	readonly model: 'tait';
+	readonly exponent: number;
+}
+
 export const MPM_CONSTITUTIVE_MODEL_CODES: Readonly<
 	Record<MpmConstitutiveModel, number>
 > = {
@@ -9,6 +14,28 @@ export const MPM_CONSTITUTIVE_MODEL_CODES: Readonly<
 	oil: 3,
 	powder: 4
 };
+
+export function normalizeMpmTaitEquationOfState(
+	value: unknown,
+	name: string
+): MpmTaitEquationOfState | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		throw new TypeError(`${name} must be an object.`);
+	}
+	const record = value as Record<string, unknown>;
+	if (record.model !== 'tait') {
+		throw new RangeError(`${name}.model must be 'tait'.`);
+	}
+	if (
+		typeof record.exponent !== 'number' ||
+		!Number.isFinite(record.exponent) ||
+		record.exponent <= 0
+	) {
+		throw new RangeError(`${name}.exponent must be positive and finite.`);
+	}
+	return { model: 'tait', exponent: record.exponent };
+}
 
 export const MPM_LIQUID_CONTACT_SEPARATION_FRACTION = 0.25;
 export const MPM_LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER = 1;

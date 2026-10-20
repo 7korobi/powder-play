@@ -91,6 +91,7 @@ struct SimulationParams {
 	bonding: vec4<f32>,
 	cflBounds: vec4<f32>,
 	fracture: vec4<u32>,
+	wall: vec4<f32>,
 }
 
 struct InteractionParams {
@@ -273,7 +274,26 @@ fn particleWaveSpeedBound(particle: Particle) -> f32 {
 		) {
 			return 3.402823466e38;
 		}
-		return sqrt(particle.lambda / particle.density);
+		var waveSpeedSquared = particle.lambda / particle.density;
+		if (particle.frictionCoefficient > 0.0) {
+			let determinant = determinant2x2(particle.f);
+			if (
+				!finiteFloat(particle.frictionCoefficient) ||
+				particle.frictionCoefficient <= 0.0 ||
+				!finiteFloat(determinant) ||
+				determinant <= 0.0
+			) {
+				return 3.402823466e38;
+			}
+			waveSpeedSquared =
+				particle.frictionCoefficient *
+				waveSpeedSquared *
+				pow(1.0 / determinant, particle.frictionCoefficient - 1.0);
+		}
+		if (!finiteFloat(waveSpeedSquared) || waveSpeedSquared < 0.0) {
+			return 3.402823466e38;
+		}
+		return sqrt(waveSpeedSquared);
 	}
 	if (particle.materialModel != MODEL_NEO_HOOKEAN) {
 		return 3.402823466e38;
@@ -862,14 +882,24 @@ fn prepareParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 				!finiteFloat(particle.density) ||
 				particle.density <= 0.0 ||
 				!finiteFloat(particle.lambda) ||
-				particle.lambda <= 0.0
+				particle.lambda <= 0.0 ||
+				!finiteFloat(particle.frictionCoefficient) ||
+				particle.frictionCoefficient < 0.0
 			) {
 				atomicMin(&stateError[1], particleIndex);
 				atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_INVALID_MATERIAL);
 				return;
 			}
-			let pressure = particle.lambda * min(determinant - 1.0, 0.0);
-			stressTimesFt = vec4<f32>(pressure, 0.0, 0.0, pressure);
+			if (particle.frictionCoefficient > 0.0) {
+				let pressure =
+					particle.lambda *
+					(pow(1.0 / determinant, particle.frictionCoefficient) - 1.0);
+				let stress = -determinant * pressure;
+				stressTimesFt = vec4<f32>(stress, 0.0, 0.0, stress);
+			} else {
+				let pressure = particle.lambda * min(determinant - 1.0, 0.0);
+				stressTimesFt = vec4<f32>(pressure, 0.0, 0.0, pressure);
+			}
 		} else if (particle.materialModel == MODEL_POWDER) {
 			if (
 				!finiteFloat(particle.lambda) ||
@@ -1282,6 +1312,21 @@ fn applyWallCushion(velocity: f32, coordinate: i32, extent: i32) -> f32 {
 	return velocity * clamp(wallDistance / cushionCells, 0.0, 1.0);
 }
 
+fn applyWallTangentialFriction(
+	velocity: f32,
+	coordinate: i32,
+	extent: i32,
+	friction: f32,
+) -> f32 {
+	if (friction <= 0.0) {
+		return velocity;
+	}
+	let wallDistance = max(0.0, min(f32(coordinate), f32(extent - coordinate)));
+	let cushionCells = min(WALL_CUSHION_CELLS, f32(extent) / 4.0);
+	let wallInfluence = 1.0 - clamp(wallDistance / cushionCells, 0.0, 1.0);
+	return velocity * (1.0 - friction * wallInfluence);
+}
+
 fn integrateDeformation(
 	deformation: vec4<f32>,
 	velocityGradient: vec4<f32>,
@@ -1528,6 +1573,42 @@ fn updateGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		oilVelocity.y,
 		nodeCoordinate.y,
 		i32(params.grid.y),
+	);
+	solidVelocity.x = applyWallTangentialFriction(
+		solidVelocity.x,
+		nodeCoordinate.y,
+		i32(params.grid.y),
+		params.wall.x,
+	);
+	solidVelocity.y = applyWallTangentialFriction(
+		solidVelocity.y,
+		nodeCoordinate.x,
+		i32(params.grid.x),
+		params.wall.x,
+	);
+	waterVelocity.x = applyWallTangentialFriction(
+		waterVelocity.x,
+		nodeCoordinate.y,
+		i32(params.grid.y),
+		params.wall.x,
+	);
+	waterVelocity.y = applyWallTangentialFriction(
+		waterVelocity.y,
+		nodeCoordinate.x,
+		i32(params.grid.x),
+		params.wall.x,
+	);
+	oilVelocity.x = applyWallTangentialFriction(
+		oilVelocity.x,
+		nodeCoordinate.y,
+		i32(params.grid.y),
+		params.wall.x,
+	);
+	oilVelocity.y = applyWallTangentialFriction(
+		oilVelocity.y,
+		nodeCoordinate.x,
+		i32(params.grid.x),
+		params.wall.x,
 	);
 	gridNodes[index].velocity = solidVelocity;
 	gridNodes[index].waterVelocity = waterVelocity;

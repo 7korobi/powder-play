@@ -77,7 +77,29 @@ function deriveParticleWaveSpeedBound(
 		if (!Number.isFinite(density) || density <= 0 || lambda <= 0) {
 			throw new RangeError('liquid CFL parameters require positive finite lambda and density.');
 		}
-		return Math.sqrt(lambda / density);
+		if (material.equationOfState?.model !== 'tait') {
+			return Math.sqrt(lambda / density);
+		}
+		const exponent = Math.fround(material.equationOfState.exponent);
+		const f00 = Math.fround(particle.F.m00);
+		const f01 = Math.fround(particle.F.m01);
+		const f10 = Math.fround(particle.F.m10);
+		const f11 = Math.fround(particle.F.m11);
+		const determinant = Math.fround(f00 * f11 - f01 * f10);
+		if (
+			!Number.isFinite(exponent) ||
+			exponent <= 0 ||
+			!Number.isFinite(determinant) ||
+			determinant <= 0
+		) {
+			throw new RangeError('Tait CFL bounds require a positive finite exponent and determinant.');
+		}
+		const waveSpeedSquared =
+			(exponent * lambda * Math.pow(1 / determinant, exponent - 1)) / density;
+		if (!Number.isFinite(waveSpeedSquared) || waveSpeedSquared < 0) {
+			throw new RangeError('Tait CFL wave-speed bound is outside the finite range.');
+		}
+		return Math.sqrt(waveSpeedSquared);
 	}
 	if (material.model !== undefined && material.model !== 'neo-hookean') return null;
 	if (lambda < 0 || mu < 0) {

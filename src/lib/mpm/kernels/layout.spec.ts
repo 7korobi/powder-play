@@ -350,6 +350,35 @@ describe('GPU MLS-MPM input and buffer layout', () => {
 		expect(state.packedParticles[58]).toBe(Math.fround(0.55));
 	});
 
+	it('packs the Tait exponent and wall-friction parameter without changing particle stride', () => {
+		const material = {
+			lambda: 1_116,
+			mu: 0 as const,
+			model: 'water' as const,
+			density: 19.964,
+			equationOfState: { model: 'tait' as const, exponent: 7.15 }
+		};
+		const particles = [makeParticle({ material })];
+		const state = validateMpmMlsGpuInput(
+			particles,
+			makeConfig({ material, wallFriction: 1 })
+		);
+		const layout = calculateMpmMlsGpuBufferLayout(state, LIMITS);
+		const parameters = packMpmMlsGpuStepParameters(
+			state,
+			layout,
+			0.001,
+			{ x: 0, y: -9.81 }
+		);
+
+		expect(state.packedParticles[18]).toBe(Math.fround(7.15));
+		expect(layout.particleStateBytes).toBe(80);
+		expect(parameters.byteLength).toBe(144);
+		expect(Array.from(new Float32Array(parameters, 128, 4))).toEqual([
+			1, 0, 0, 0
+		]);
+	});
+
 	it('packs bonded triangle vertices and exposes the active body count', () => {
 		const particles: readonly MpmParticle[] = [
 			makeParticle({

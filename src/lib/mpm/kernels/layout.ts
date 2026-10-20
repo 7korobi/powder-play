@@ -10,6 +10,7 @@ import { validateMpmSolidBondGraph } from '../reference/solid-bonds.js';
 import {
 	encodeMpmConstitutiveModel,
 	normalizeMpmConstitutiveModel,
+	normalizeMpmTaitEquationOfState,
 	SNOW_PLASTICITY
 } from '../materials.js';
 
@@ -88,6 +89,7 @@ export interface ValidatedMpmMlsGpuInput {
 	readonly bondReferenceDtF32: number | null;
 	readonly lambdaF32: number;
 	readonly muF32: number;
+	readonly wallFrictionF32: number;
 	readonly gradientScale: number;
 	readonly gradientScaleF32: number;
 }
@@ -96,7 +98,7 @@ export const PARTICLE_FLOATS = 20;
 export const PARTICLE_STRIDE_BYTES = PARTICLE_FLOATS * Float32Array.BYTES_PER_ELEMENT;
 export const PREPARED_AFFINE_STRIDE_BYTES = 4 * Float32Array.BYTES_PER_ELEMENT;
 export const OBJECT_ID_STRIDE_BYTES = Uint32Array.BYTES_PER_ELEMENT;
-export const SIMULATION_PARAMS_BYTES = 128;
+export const SIMULATION_PARAMS_BYTES = 144;
 export const RENDER_PARAMS_BYTES = 16;
 export const SURFACE_RENDER_PARAMS_BYTES = 32;
 export const COMPUTE_WORKGROUP_SIZE = 64;
@@ -142,6 +144,10 @@ export function validateMpmMlsGpuInput(
 		rawConfig.bondReferenceDt === undefined
 			? null
 			: finiteNumber(rawConfig.bondReferenceDt, 'bondReferenceDt');
+	const wallFriction =
+		rawConfig.wallFriction === undefined
+			? 0
+			: finiteNumber(rawConfig.wallFriction, 'wallFriction');
 	const lambda = material.lambda;
 	const mu = material.mu;
 
@@ -163,8 +169,17 @@ export function validateMpmMlsGpuInput(
 	if (bondReferenceDt !== null && bondReferenceDt <= 0) {
 		throw new RangeError('bondReferenceDt must be greater than zero');
 	}
+	if (wallFriction < 0 || wallFriction > 1) {
+		throw new RangeError('wallFriction must be between zero and one');
+	}
 	if (lambda < 0) throw new RangeError('material.lambda must be non-negative');
-	if (mu <= 0) throw new RangeError('material.mu must be greater than zero');
+	if (
+		mu <= 0 &&
+		material.model !== 'water' &&
+		material.model !== 'oil'
+	) {
+		throw new RangeError('material.mu must be greater than zero');
+	}
 
 	const domainWidth = cellsX * cellSize;
 	const domainHeight = cellsY * cellSize;
@@ -216,6 +231,7 @@ export function validateMpmMlsGpuInput(
 		'material.mu',
 		material.model !== 'water' && material.model !== 'oil'
 	);
+	const wallFrictionF32 = finiteFloat32(wallFriction, 'wallFriction');
 	const gradientScaleF32 = finiteFloat32(gradientScale, 'grid gradient scale', true);
 	const domainWidthF32 = finiteFloat32(
 		cellsX * cellSizeF32,
@@ -341,12 +357,15 @@ export function validateMpmMlsGpuInput(
 		const isLiquid =
 			particleMaterial.model === 'water' || particleMaterial.model === 'oil';
 		const density = isLiquid ? particleMaterial.density : 0;
-		const frictionCoefficient =
+		const materialParameter =
 			particleMaterial.model === 'powder'
 				? particleMaterial.frictionCoefficient
 				: particleMaterial.model === 'neo-hookean'
 					? damage
-					: 0;
+					: isLiquid &&
+							particleMaterial.equationOfState?.model === 'tait'
+						? particleMaterial.equationOfState.exponent
+						: 0;
 		const packedVolume = finiteFloat32(
 			particleVolume,
 			`particles[${index}].volume`,
@@ -387,10 +406,7 @@ export function validateMpmMlsGpuInput(
 			),
 			packedDensity,
 			packedVolume,
-			finiteFloat32(
-				frictionCoefficient,
-				`particles[${index}].material.frictionCoefficient`
-			),
+			finiteFloat32(materialParameter, `particles[${index}].material parameter`),
 			0
 		];
 
@@ -557,6 +573,7 @@ export function validateMpmMlsGpuInput(
 			...(bondReferenceDt === null ? {} : { bondReferenceDt }),
 			...(config.fractureBonds === undefined ? {} : { fractureBonds }),
 			material,
+			wallFriction,
 			capacity: particleCapacity
 		},
 		particleCount,
@@ -583,6 +600,7 @@ export function validateMpmMlsGpuInput(
 		bondReferenceDtF32,
 		lambdaF32,
 		muF32,
+		wallFrictionF32,
 		gradientScale,
 		gradientScaleF32
 	};
@@ -974,6 +992,7 @@ export function packMpmMlsGpuStepParameters(
 			? 1
 			: 0
 	]);
+	new Float32Array(result, 128, 4).set([state.wallFrictionF32, 0, 0, 0]);
 	return result;
 }
 
@@ -1007,6 +1026,10 @@ function validateMaterial(value: unknown, name: string): MpmMaterialParameters {
 	}
 	if (model === 'water' || model === 'oil') {
 		const density = finiteNumber(record.density, `${name}.density`);
+		const equationOfState = normalizeMpmTaitEquationOfState(
+			record.equationOfState,
+			`${name}.equationOfState`
+		);
 		if (lambda <= 0) throw new RangeError(`${name}.lambda must be greater than zero`);
 		if (mu !== 0) throw new RangeError(`${name}.mu must be zero for a liquid material`);
 		if (record.frictionCoefficient !== undefined) {
@@ -1016,7 +1039,20 @@ function validateMaterial(value: unknown, name: string): MpmMaterialParameters {
 		finiteFloat32(lambda, `${name}.lambda`, true);
 		finiteFloat32(mu, `${name}.mu`);
 		finiteFloat32(density, `${name}.density`, true);
-		return { lambda, mu: 0, model, density };
+		if (equationOfState !== undefined) {
+			finiteFloat32(
+				equationOfState.exponent,
+				`${name}.equationOfState.exponent`,
+				true
+			);
+		}
+		return {
+			lambda,
+			mu: 0,
+			model,
+			density,
+			...(equationOfState === undefined ? {} : { equationOfState })
+		};
 	}
 	if (model === 'powder') {
 		const frictionCoefficient = finiteNumber(
@@ -1028,15 +1064,21 @@ function validateMaterial(value: unknown, name: string): MpmMaterialParameters {
 		if (frictionCoefficient < 0) {
 			throw new RangeError(`${name}.frictionCoefficient must be non-negative`);
 		}
-		if (record.density !== undefined) {
-			throw new RangeError(`${name}.density is only valid for water or oil`);
+		if (record.density !== undefined || record.equationOfState !== undefined) {
+			throw new RangeError(
+				`${name}.density and ${name}.equationOfState are only valid for liquids`
+			);
 		}
 		finiteFloat32(lambda, `${name}.lambda`);
 		finiteFloat32(mu, `${name}.mu`, true);
 		finiteFloat32(frictionCoefficient, `${name}.frictionCoefficient`);
 		return { lambda, mu, model, frictionCoefficient };
 	}
-	if (record.density !== undefined || record.frictionCoefficient !== undefined) {
+	if (
+		record.density !== undefined ||
+		record.frictionCoefficient !== undefined ||
+		record.equationOfState !== undefined
+	) {
 		throw new RangeError(`${name} has parameters that do not match its constitutive model`);
 	}
 	if (lambda < 0) throw new RangeError(`${name}.lambda must be non-negative`);

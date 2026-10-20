@@ -251,6 +251,56 @@ describe('CPU MLS-MPM reference', () => {
 		}
 	});
 
+	it('damps tangential velocity at walls only when wall friction is configured', () => {
+		const particle = makeParticle({
+			position: { x: 0, y: 4 },
+			velocity: { x: 0, y: 10 }
+		});
+		const config = makeConfig({
+			dt: 0.1,
+			grid: { cellsX: 8, cellsY: 8, cellSize: 1 }
+		});
+		const frictionless = stepMpm([particle], config).particles[0];
+		const noSlip = stepMpm([particle], { ...config, wallFriction: 1 }).particles[0];
+
+		expect(frictionless.velocity.y).toBeGreaterThan(0);
+		expect(noSlip.velocity.y).toBeLessThan(frictionless.velocity.y);
+	});
+
+	it('uses the Tait pressure law in liquid stress while retaining the linear legacy profile', () => {
+		const taitMaterial: MpmMaterialParameters = {
+			lambda: 1_000,
+			mu: 0,
+			model: 'water',
+			density: 20,
+			equationOfState: { model: 'tait', exponent: 7.15 }
+		};
+		const linearMaterial: MpmMaterialParameters = {
+			lambda: taitMaterial.lambda,
+			mu: 0,
+			model: 'water',
+			density: taitMaterial.density
+		};
+		const particle = makeParticle({
+			position: { x: 4, y: 4 },
+			F: { m00: 0.975, m01: 0, m10: 0, m11: 0.975 },
+			volume: 0.04
+		});
+		const config = makeConfig({
+			dt: 0.00001,
+			grid: { cellsX: 8, cellsY: 8, cellSize: 1 },
+			particleMass: 0.8,
+			particleVolume: 0.04,
+			material: taitMaterial
+		});
+		const tait = stepMpm([particle], config).particles[0].F;
+		const linear = stepMpm([particle], { ...config, material: linearMaterial }).particles[0].F;
+		const taitJacobian = tait.m00 * tait.m11 - tait.m01 * tait.m10;
+		const linearJacobian = linear.m00 * linear.m11 - linear.m01 * linear.m10;
+
+		expect(taitJacobian).toBeGreaterThan(linearJacobian);
+	});
+
 	it('keeps all material models stable under sustained acceleration into domain walls', () => {
 		const materials: readonly MpmMaterialParameters[] = [
 			{ lambda: 8, mu: 0, model: 'water', density: 0.04 },

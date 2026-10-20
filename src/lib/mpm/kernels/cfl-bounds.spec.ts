@@ -56,6 +56,31 @@ describe('GPU MPM CFL bound derivation', () => {
 		expect(stretched?.waveSpeedBound).toBeGreaterThan(reference!.waveSpeedBound);
 	});
 
+	it('derives Tait sound speed from the exponent and current compression', () => {
+		const material = {
+			lambda: ((998.2 * 20 * 20) / 7.15) * 0.02,
+			mu: 0 as const,
+			model: 'water' as const,
+			density: 998.2 * 0.02,
+			equationOfState: { model: 'tait' as const, exponent: 7.15 }
+		};
+		const particle = {
+			position: { x: 1, y: 1 },
+			velocity: { x: 0, y: 0 },
+			C: { m00: 0, m01: 0, m10: 0, m11: 0 },
+			F: { m00: 1, m01: 0, m10: 0, m11: 1 },
+			material
+		};
+		const reference = deriveMpmMlsGpuCflBounds([particle], gate4Config);
+		const compressed = deriveMpmMlsGpuCflBounds(
+			[{ ...particle, F: { m00: 0.9, m01: 0, m10: 0, m11: 1 } }],
+			gate4Config
+		);
+
+		expect(reference?.waveSpeedBound).toBeCloseTo(20, 2);
+		expect(compressed?.waveSpeedBound).toBeGreaterThan(reference!.waveSpeedBound);
+	});
+
 	it('returns null rather than guessing a bound for unsupported constitutive models', () => {
 		const unsupported = {
 			...gate4Config,

@@ -565,6 +565,11 @@
 						<a href="/labs/mpm/kernels">Gate 2 GPU MLS-MPM 操作統合ラボ</a>
 						も利用できます。初回 CPU/GPU 比較後に粒子の選択・ドラッグ・複製を試せます。
 					</span>
+					<span>
+						SI単位系・Tait水の試作は
+						<a href="/labs/mpm/si">200 mm SI水槽ラボ</a>
+						で確認できます。計算用音速を下げた実験profileのため、実水の再現ではありません。
+					</span>
 				</div>
 			</div>
 

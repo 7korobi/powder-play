@@ -3137,13 +3137,22 @@ function unpackParticles(
 						: undefined;
 		const lambda = values[offset + 14];
 		const mu = values[offset + 15];
+		const materialParameter = values[offset + 18];
 		let material: MpmMaterialParameters;
 		if (model === 'water' || model === 'oil') {
 			material = {
 				model,
 				lambda,
 				mu: 0,
-				density: values[offset + 16]
+				density: values[offset + 16],
+				...(materialParameter > 0
+					? {
+							equationOfState: {
+								model: 'tait' as const,
+								exponent: materialParameter
+							}
+						}
+					: {})
 			};
 		} else if (model === 'powder') {
 			material = {

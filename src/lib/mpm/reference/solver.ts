@@ -1,5 +1,7 @@
 import {
 	normalizeMpmConstitutiveModel,
+	normalizeMpmTaitEquationOfState,
+	type MpmTaitEquationOfState,
 	MPM_LIQUID_CONTACT_APPROACH_SPEED_MULTIPLIER,
 	MPM_LIQUID_CONTACT_RELAXATION_SECONDS,
 	MPM_LIQUID_CONTACT_SEPARATION_FRACTION,
@@ -68,6 +70,7 @@ export type MpmMaterialParameters =
 			readonly mu: 0;
 			readonly model: 'water' | 'oil';
 			readonly density: number;
+			readonly equationOfState?: MpmTaitEquationOfState;
 	  }
 	| {
 			readonly lambda: number;
@@ -87,6 +90,7 @@ export interface MpmStepConfig {
 	readonly fractureBonds?: readonly MpmSolidBond[];
 	readonly material: MpmMaterialParameters;
 	readonly gravity: MpmVector2;
+	readonly wallFriction?: number;
 }
 
 export interface MpmStepDiagnostics {
@@ -115,6 +119,7 @@ interface ValidatedConfig {
 	readonly fractureBonds: readonly MpmSolidBond[] | undefined;
 	readonly material: MpmMaterialParameters;
 	readonly gravity: MpmVector2;
+	readonly wallFriction: number;
 	readonly domainWidth: number;
 	readonly domainHeight: number;
 	readonly gradientScale: number;
@@ -543,6 +548,18 @@ export function stepMpm(
 			node.yIndex,
 			validated.grid.cellsY
 		);
+		node.velocityX = applyWallTangentialFriction(
+			node.velocityX,
+			node.yIndex,
+			validated.grid.cellsY,
+			validated.wallFriction
+		);
+		node.velocityY = applyWallTangentialFriction(
+			node.velocityY,
+			node.xIndex,
+			validated.grid.cellsX,
+			validated.wallFriction
+		);
 		node.waterVelocityX = applyWallCushion(
 			node.waterVelocityX,
 			node.xIndex,
@@ -553,6 +570,18 @@ export function stepMpm(
 			node.yIndex,
 			validated.grid.cellsY
 		);
+		node.waterVelocityX = applyWallTangentialFriction(
+			node.waterVelocityX,
+			node.yIndex,
+			validated.grid.cellsY,
+			validated.wallFriction
+		);
+		node.waterVelocityY = applyWallTangentialFriction(
+			node.waterVelocityY,
+			node.xIndex,
+			validated.grid.cellsX,
+			validated.wallFriction
+		);
 		node.oilVelocityX = applyWallCushion(
 			node.oilVelocityX,
 			node.xIndex,
@@ -562,6 +591,18 @@ export function stepMpm(
 			node.oilVelocityY,
 			node.yIndex,
 			validated.grid.cellsY
+		);
+		node.oilVelocityX = applyWallTangentialFriction(
+			node.oilVelocityX,
+			node.yIndex,
+			validated.grid.cellsY,
+			validated.wallFriction
+		);
+		node.oilVelocityY = applyWallTangentialFriction(
+			node.oilVelocityY,
+			node.xIndex,
+			validated.grid.cellsX,
+			validated.wallFriction
 		);
 		assertGridNodeFinite(node);
 	}
@@ -804,6 +845,7 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 			: raw.bondStiffness;
 	const bondReferenceDt =
 		raw.bondReferenceDt === undefined ? dt : raw.bondReferenceDt;
+	const wallFriction = raw.wallFriction === undefined ? 0 : raw.wallFriction;
 	const fractureBonds =
 		raw.fractureBonds === undefined
 			? undefined
@@ -820,6 +862,7 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 	assertFiniteNumber(particleVolume, 'particleVolume');
 	assertFiniteNumber(bondStiffness, 'bondStiffness');
 	assertFiniteNumber(bondReferenceDt, 'bondReferenceDt');
+	assertFiniteNumber(wallFriction, 'wallFriction');
 	assertFiniteNumber(lambda, 'material.lambda');
 	assertFiniteNumber(mu, 'material.mu');
 	assertVector(gravity, 'gravity');
@@ -853,6 +896,9 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 	}
 	if (bondStiffness <= 0 || bondStiffness > 1) {
 		throw new RangeError('bondStiffness must be greater than zero and at most one');
+	}
+	if (wallFriction < 0 || wallFriction > 1) {
+		throw new RangeError('wallFriction must be between zero and one');
 	}
 	const domainWidth = cellsX * cellSize;
 	const domainHeight = cellsY * cellSize;
@@ -891,6 +937,7 @@ function validateConfig(config: MpmStepConfig): ValidatedConfig {
 		fractureBonds,
 		material,
 		gravity: { x: gravity.x, y: gravity.y },
+		wallFriction,
 		domainWidth,
 		domainHeight,
 		gradientScale,
@@ -2025,6 +2072,10 @@ function validateMaterial(value: unknown, name: string): MpmMaterialParameters {
 	}
 	if (model === 'water' || model === 'oil') {
 		const density = value.density;
+		const equationOfState = normalizeMpmTaitEquationOfState(
+			value.equationOfState,
+			`${name}.equationOfState`
+		);
 		assertFiniteNumber(density, `${name}.density`);
 		if (lambda <= 0) throw new RangeError(`${name}.lambda must be greater than zero`);
 		if (mu !== 0) throw new RangeError(`${name}.mu must be zero for a liquid material`);
@@ -2032,7 +2083,13 @@ function validateMaterial(value: unknown, name: string): MpmMaterialParameters {
 			throw new RangeError(`${name}.frictionCoefficient is only valid for powder`);
 		}
 		if (density <= 0) throw new RangeError(`${name}.density must be greater than zero`);
-		return { lambda, mu: 0, model, density };
+		return {
+			lambda,
+			mu: 0,
+			model,
+			density,
+			...(equationOfState === undefined ? {} : { equationOfState })
+		};
 	}
 	if (model === 'powder') {
 		const frictionCoefficient = value.frictionCoefficient;
@@ -2042,12 +2099,18 @@ function validateMaterial(value: unknown, name: string): MpmMaterialParameters {
 		if (frictionCoefficient < 0) {
 			throw new RangeError(`${name}.frictionCoefficient must be non-negative`);
 		}
-		if (value.density !== undefined) {
-			throw new RangeError(`${name}.density is only valid for water or oil`);
+		if (value.density !== undefined || value.equationOfState !== undefined) {
+			throw new RangeError(
+				`${name}.density and ${name}.equationOfState are only valid for liquids`
+			);
 		}
 		return { lambda, mu, model, frictionCoefficient };
 	}
-	if (value.density !== undefined || value.frictionCoefficient !== undefined) {
+	if (
+		value.density !== undefined ||
+		value.frictionCoefficient !== undefined ||
+		value.equationOfState !== undefined
+	) {
 		throw new RangeError(`${name} has parameters that do not match its constitutive model`);
 	}
 	if (lambda < 0) throw new RangeError(`${name}.lambda must be non-negative`);
@@ -2089,8 +2152,19 @@ function constitutiveStressTimesFt(
 	damage = 0
 ): MpmMatrix2 {
 	if (material.model === 'water' || material.model === 'oil') {
-		const pressure = material.lambda * Math.min(determinant(F) - 1, 0);
-		const stressTimesFt = { m00: pressure, m01: 0, m10: 0, m11: pressure };
+		const jacobian = determinant(F);
+		const pressureStress =
+			material.equationOfState?.model === 'tait'
+				? -jacobian *
+					material.lambda *
+					((1 / jacobian) ** material.equationOfState.exponent - 1)
+				: material.lambda * Math.min(jacobian - 1, 0);
+		const stressTimesFt = {
+			m00: pressureStress,
+			m01: 0,
+			m10: 0,
+			m11: pressureStress
+		};
 		assertComputedMatrixFinite(stressTimesFt, `${material.model} stress`);
 		return stressTimesFt;
 	}
@@ -2469,6 +2543,19 @@ function applyWallCushion(velocity: number, coordinate: number, extent: number):
 	const distance = velocity < 0 ? coordinate : extent - coordinate;
 	const cushionCells = Math.min(WALL_CUSHION_CELLS, extent / 4);
 	return velocity * Math.max(0, Math.min(1, distance / cushionCells));
+}
+
+function applyWallTangentialFriction(
+	velocity: number,
+	coordinate: number,
+	extent: number,
+	friction: number
+): number {
+	if (friction === 0) return velocity;
+	const distance = Math.max(0, Math.min(coordinate, extent - coordinate));
+	const cushionCells = Math.min(WALL_CUSHION_CELLS, extent / 4);
+	const wallInfluence = 1 - Math.max(0, Math.min(1, distance / cushionCells));
+	return velocity * (1 - friction * wallInfluence);
 }
 
 function updateDeformationGradient(

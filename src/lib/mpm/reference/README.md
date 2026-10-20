@@ -1,8 +1,11 @@
 # CPU MLS-MPM reference
 
 This directory contains a deterministic, double-precision CPU reference for a
-single explicit 2D MLS-MPM step. It is a correctness oracle for planned GPU
-kernels; it is not a GPU MLS-MPM implementation or the Gate-0 interaction demo.
+single explicit 2D MLS-MPM step. The GPU MLS-MPM implementation is in
+`../kernels/`. `tait-eos.ts` provides the analytical SI equation-of-state
+reference and a conversion to the fixed-depth 2D liquid material used by the
+GPU and CPU steps. The SI lab is an experimental profile, not an accepted
+physical-validation gate.
 
 ## State and units
 
@@ -16,11 +19,14 @@ multiplied by reference volume; other models use the configured particle mass.
 `position`, `grid.cellSize`, and the domain extents use the same length unit;
 velocity is length/time, `dt` is time, gravity is length/time², mass is mass,
 and `particleVolume` is a reference area; a particle's `volume` overrides it.
-Water/oil `density` is reference surface mass density, and their `lambda` is a
-bulk modulus with `mu` fixed at zero. For elastic and powder models, the 2D
-Lamé parameters `lambda` and `mu` are force/length (2D stress-resultant) units,
-so `particleMass / particleVolume` is surface mass density. A consistently
-nondimensional system is also valid. `F` maps reference-space column vectors
+Water/oil `density` is reference surface mass density, and `mu` is fixed at
+zero. Without an `equationOfState` profile, `lambda` is the legacy linear
+pressure coefficient. With `{ model: 'tait', exponent: n }`, `density` stores
+`rho0 * d` and `lambda` stores `B * d`, where `d` is the extrusion depth;
+the pressure resultant is `B * d * (J^-n - 1)`. For elastic and powder models,
+the 2D Lamé parameters `lambda` and `mu` are force/length (2D stress-resultant)
+units, so `particleMass / particleVolume` is surface mass density. A
+consistently nondimensional system is also valid. `F` maps reference-space column vectors
 to current space; the row-major matrix entries are `m00`, `m01`, `m10`, `m11`,
 and matrix-vector products use column vectors.
 
@@ -29,7 +35,9 @@ The physical grid domain is the closed rectangle
 complete 3×3 quadratic B-spline support, including ghost grid nodes beyond the
 domain edges. Grid walls at the domain edge remove only outward normal velocity;
 after G2P, any particle crossing is clipped to the edge and its outward normal
-velocity is set to zero. Tangential velocity is unchanged.
+velocity is set to zero. `wallFriction` defaults to zero; values from zero to
+one damp tangential velocity near walls over the existing wall-cushion width.
+One is a no-slip approximation, not a calibrated Coulomb-friction coefficient.
 
 ## Equations and model
 
@@ -111,19 +119,27 @@ After each G2P update, the two principal stretches are clamped to
 `[1 - 0.025, 1 + 0.0075]`. The plastic-volume history is updated by the ratio
 of trial to projected deformation determinant and clamped to `[0.6, 20]`.
 
-Water and oil are separate, tension-free weakly-compressible fluid models. For
-their deformation determinant `J`, the stress-times-transpose used by P2G is
+Water and oil remain separate fluid phases. The legacy profile is
+tension-free and uses the linear stress-times-transpose
 
 ```text
 P * F^T = lambda * min(J - 1, 0) * I
 ```
 
-They have no shear stress. Their reference density changes particle mass; the
-local mixture-density correction and density-aware contact bias above promote
-buoyant ordering, but do not provide surface tension or guarantee a clean
-water/oil interface. After each G2P update, the liquid polar projection clamps
-`det(F)` to `[0.5, 2]`; this prevents the tension-free equation of state from
-accumulating unbounded area expansion or collapse.
+For a Tait profile, with areal `lambda = B * d`, the stress-times-transpose used
+by P2G is
+
+```text
+P * F^T = -J * lambda * (J^-n - 1) * I
+```
+
+Neither profile has shear stress. Their reference areal density changes
+particle mass; the local mixture-density correction and density-aware contact
+bias above promote buoyant ordering, but do not provide surface tension or
+guarantee a clean water/oil interface. After each G2P update, the liquid polar
+projection clamps `det(F)` to `[0.5, 2]`. The Tait profile derives the reference
+sound speed from `n * lambda / density` and increases its CFL bound with current
+compression.
 
 Powder uses a simplified Drucker-Prager-like shear cap in log-stretch space.
 With principal log stretches `ell_i = log(sigma_i)`, the volumetric log strain

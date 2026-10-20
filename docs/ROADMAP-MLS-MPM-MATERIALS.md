@@ -21,6 +21,11 @@ lab routeは材料由来の波速・速度上限、GPU guard、失敗microstep�
 2026-10-13の既存benchmark／fixture値はこの変更より前のsourceに対する結果なので、
 現行treeでM2を受け入れる前に再計測する。
 
+追記（2026-10-20）: Tait液体profile、現状態に応じたCFL波速、面外厚さを反映した2D材料換算、
+壁の接線no-slip近似、および単一水相の `/labs/mpm/si` 試作を追加した。
+20 m/sは計算量を抑えるための暫定数値近似であり、実水の物性ではない。
+実GPU表示・物理誤差・120 fpsの受け入れ評価が完了するまでは、M2の合格とは扱わない。
+
 ## 1. 到達点と設計境界
 
 最初の到達点は、GPU 上で「柔らかいゼリーの復元、自由表面、
@@ -29,7 +34,7 @@ lab routeは材料由来の波速・速度上限、GPU guard、失敗microstep�
 
 | 論点 | 最初の実装 | 後段の分岐 |
 |---|---|---|
-| 圧力・体積 | 構成則の計測、物理 step 全体の細分化、パラメータ校正 | 等容・体積分離、必要なら圧力 projection |
+| 圧力・体積 | 弱圧縮性液体には Tait EOS を採用し、物理 step 全体の細分化と物性・体積応答を校正 | Tait EOS で誤差・性能目標を満たせない場合に限り、圧力 projection／体積分離を比較 |
 | 自由表面 | 現在面積の場、等値線描画、境界・閾値校正 | 曲率、表面張力、非混和界面 |
 | 材料間接触 | 少数の格子速度場、接近時の法線拘束、滑り・離脱 | 材料対摩擦、多点接触、流体–固体荷重 |
 | 変形・復元 | 現行 Neo-Hookean、回転・圧縮解放の基準試験 | 粘性、別構成則の比較 |
@@ -46,6 +51,137 @@ lab routeは材料由来の波速・速度上限、GPU guard、失敗microstep�
 - 実験は `/labs/mpm/kernels` 周辺に隔離する。通常画面 `/` と既存 β は維持する。
 - 新しい物理経路はラボの明示的な実験設定として選び、旧経路と A/B 比較できるようにする。
   旧モデルを無告知で置き換えない。
+
+### 1.1 将来拡張のデータ契約・空間・単位（枠組みのみ）
+
+**状態**: 以下は将来の実装が共有する設計契約であり、拡張機能や新しいデータ
+buffer が実装済みであることを意味しない。2026-10-20 時点の目標は、内寸
+200 mm × 200 mm の 2D 空間、混ざらない液体、この PC での 120 fps である。
+流体領域を viewport に合わせ、壁の厚さ 50 mm は内寸の外かつ viewport の外に置く。
+初期状態は開放端のない四方閉鎖とし、壁面には強い接線方向抵抗を持たせる。
+将来開放端を作る場合の外気圧は 101,325 Pa absolute（大気圧基準で 0 Pa gauge）
+を既定値とする。これは閉鎖境界への圧力指定ではない。現行 Gate 4 の座標・構成則・
+性能値はこの目標を実装・達成したものではない。
+
+物理座標は縮尺を挟まず SI を直接使う。長さは m（1 座標単位 = 1 m）、時間は s、
+質量は kg とし、流体領域の各辺は 0.2 m とする。派生量も一貫して m/s、m/s²、
+kg/m³、Pa、Pa·s、N、J などの SI 単位に揃える。温度を追加する場合は内部を K とし、
+表示時だけ °C へ変換する。120 fps は約 8.33 ms/frame の実時間予算であり、物理の
+時間刻みを 1/120 s に固定する意味ではない。CFL 等の安全制約に応じた内部 microstep
+を許し、描画・物理・readback・入力応答を含めて目標達成を判定する。
+
+この単位系は現行 Gate 4 の任意 world units を自動でメートルへ読み替えない。
+既存 scene を移す場合は、位置だけでなく速度、加速度、格子幅、質量・体積、材料係数、
+固定時間刻みなどを一貫して換算し、別途回帰確認する。
+
+2D 断面は面外へ一様に押し出したスライスとして扱い、初期の面外厚さを
+`d = 0.02 m`（2 cm）とする。有限厚さを使う場合は
+`volume = inPlaneArea * d`、`mass = density * volume` とし、固体・流体・膜・熱の
+モデルで同じ奥行き規約を共有する。これはシミュレーション上の初期仮定で、対象物すべての
+実際の奥行きが2 cmであるという主張ではない。面外厚さの変更は質量・熱容量等に反映する。
+平面応力／平面ひずみ等の構成則規約は別途決める。
+
+初期の剛体小石シーンでは、沈む物体と浮く物体を同数ずつ配置する。
+両群の形状・大きさは揃え、浮沈を分ける主な条件を平均密度とする。
+浮く群は液体より低い平均密度、沈む群は液体より高い平均密度を与え、
+形状差と密度差の効果を混同しない。総個数と具体的な密度値は未決定とし、
+浮力・流体反力の検証と描画込み性能測定後に決める。
+
+境界の数値処理は用途別に定義する。外壁の 50 mm は流体内寸を減らさない外側の形状・
+余裕であり、計算境界は内壁面に置く。高摩擦は濡れ・付着とは別の性質とし、流体の
+no-slip / partial-slip 条件と剛体接触の摩擦則を混同しない。摩擦の係数や境界モデルは
+未決定で、物質・壁の組み合わせごとに校正する。圧力は絶対圧と大気圧基準のゲージ圧を
+区別する。将来の open-boundary default は上記の大気圧とし、ゲージ圧を解く場合は境界
+値 0 Pa、気体の状態方程式では必要に応じ絶対圧を使う。
+
+材料の種類、応力を計算する構成則、材料間の関係、粒子ごとに蓄積する履歴を
+一つの `MpmMaterialParameters` や粒子 record にまとめない。
+
+初期液体の圧力・体積応答には、**弱圧縮性 Tait 型状態方程式を採用する**。
+等温・材料ごとの初期モデルでは、大気圧時の基準密度 `rho0`（kg/m³）、
+無次元指数 `n`、圧力係数 `B`（Pa）を持ち、次で圧力を計算する。
+
+```text
+p_gauge = B * ((rho / rho0)^n - 1)
+p_absolute = p_atmosphere + p_gauge
+c0 = sqrt(n * B / rho0)
+K0 = n * B
+```
+
+ここで `p_atmosphere = 101325 Pa`、`rho = mass / currentVolume`、
+`c0` は基準密度での音速、`K0` は基準体積弾性率である。solver の力学計算は大気圧を
+基準とする `p_gauge` を用い、将来の開放境界は外圧 `p_gauge = 0 Pa` とする。
+気体との連成や絶対圧を要する計算では `p_absolute` を使う。`B` は Tait 係数であり、
+体積弾性率そのものではない。
+
+**有効音速 `c_eff` を実物より下げる設定は、物理物性値ではなく、明示的な計算量削減用の
+数値近似とする。** 実水の圧縮性を再現する profile は、実材料の `rho0`、`n`、`B` から
+音速を導く。一方、120 fps 向けの性能試験では、意図的に選んだ `c_eff` から
+`B = rho0 * c_eff^2 / n` を設定してもよい。この低い `B` は流体を現実より圧縮しやすくし、
+圧力波の伝播速度も変える。目的は陽解法の CFL microstep 数と計算負荷を抑えることであり、
+実際の水・油の音速や圧縮率の測定値、物理的な材料校正値として扱わない。
+
+たとえば水の参照値 `rho0 = 998.2 kg/m^3`、`n = 7.15`、音速約 `1482 m/s` からは
+`B ≈ 307 MPa` が得られる。`c_eff = 20 m/s` の試験候補なら同じ `rho0` と `n` に対して
+`B ≈ 55.8 kPa` となるが、これは実水の Tait 係数ではない。20 m/s は比較用の仮候補であり、
+採用確定値ではない。実物性 profile と緩和 profile は名前・UI・benchmark 結果で区別し、
+緩和 profile では `c_eff`、対応する `B`、基準圧力に対する密度／体積誤差、microstep 数を
+明示する。両 profile の挙動・コストを比べ、緩和を使った結果を実物の再現と報告しない。
+現行 Gate 4 の任意 world unit の EOS 係数を Pa とみなしたり、そのまま Tait 係数へ
+読み替えたりしない。
+
+Tait EOS は液体の圧力–密度関係だけを与える。Newtonian 粘度、液体間の非混和性、
+表面張力、壁の濡れ・付着、キャビテーションや沸騰は別のモデルとする。膨張時の引張圧、
+低圧での絶対圧下限、キャビテーションへの遷移は明示的な設計・試験項目とし、
+EOS の負圧を暗黙に clamp して成功扱いしない。
+
+気体は液体の Tait EOS や、液体向けの緩和有効音速を流用しない。初期の密閉容器では、
+頭上の空気を単一の一様・等温 lumped compartment とし、`p_abs * V = m * R_specific * T`
+で圧力を求める。基準は 20°C (`293.15 K`)、`101325 Pa absolute`、乾燥空気の
+`R_specific ≈ 287 J/(kg·K)`（`rho_air ≈ 1.20 kg/m³`）。質量は密閉中保存し、
+界面に加える圧力は大気圧との差で扱う。初期モデルは空間的な空気速度・音響波を解かず、
+開放端の流出、真空、気泡のmerge/splitも扱わない。open-boundary gas fluxは別ゲートとする。
+空気の流れ・送風機・雲状の可視化は後段のlow-Mach air fieldを必要とし、物理的な雲には
+さらに温度・湿度・凝結水・潜熱の連成が要る。詳細と受け入れ順は
+[Stage 5–6ロードマップ](./ROADMAP-MLS-MPM-STAGES-5-6.md)に記載する。
+
+| 契約 | 所有する情報 | 区別するもの |
+|---|---|---|
+| constitutive model | 応力・復元力の計算則 | 水・油などの物質名や、粘度の種類 |
+| `materialId` | 密度、基準体積、液体 Tait EOS／気体 EOS、選択した rheology / thermal profile などの物質定義 | `objectId`、粒子のconstitutive model code |
+| `phaseId` | 非混和性や相の分布を追跡する相の識別 | 同じ相に属する個々の材料定義 |
+| `contactFieldId` | 独立した格子速度・接触を計算する場 | UI の選択単位や物質 ID |
+| material-pair interaction | miscibility、界面張力、法線接触、接線 slip などの材料対の関係 | 単一材料の粘度 |
+| boundary interaction | 壁材と相の組み合わせごとの wetting / adhesion | 流体内部の凝集性 |
+| particle / field history | yield、viscoelastic stress、temperature / phase fraction などの時間発展状態 | 静的な material descriptor |
+
+目標となるデータ経路は、scene が `materialId` を参照し、検証済み descriptor と
+material-pair / boundary interaction table を GPU へ渡し、粒子の動的状態は GPU を
+正本として更新する形とする。選択・複製の `objectId` と、格子速度場を分ける
+`contactFieldId` は引き続き独立させる。現在の `MpmConstitutiveModel` には水・油の
+名前も含まれ、一般の material registry / `materialId` はまだないため、これは
+将来の整理方針であり、今回の変更では layout や solver input を変更しない。
+
+粒子 layout へ機能ごとの任意係数を足し続けず、共通粒子 state と小さな
+material descriptor を分ける。yield や viscoelasticity の履歴、熱・相変化の状態は、
+必要な機能が選ばれた段階で専用 sidecar buffer / field として容量を見積もり、
+feature が無効な profile では確保しない。descriptor は step の途中で書き換えず、
+変更を適用する境界と履歴 state の初期化規則を明示する。新しい値を指定したのに
+solver が使わない場合、既定値で黙って処理せず、未対応として拒否する。
+
+液体の初期圧力モデルは上記の Tait EOS とし、第一 rheology 候補は変形速度への抵抗を
+与える Newtonian モデルとする。両者の役割を分ける。yield-stress は流動開始閾値と塑性流動則、viscoelastic / cohesive は時間履歴と
+回復・破断則を持つ独立 profile とし、高粘度の増加だけで代用しない。表面張力、
+濡れ性、壁への付着、材料内部の凝集も別の interaction として扱う。熱・沸騰・凍結は
+温度と潜熱を含む energy / mass accounting、気体の膨張や低圧は gas equation of
+state と exterior pressure / open-boundary condition の組として追加し、粘性設定に
+押し込まない。
+
+上記の SI 単位系を採用する。面外厚みと構成則の規約、および粘度・壁摩擦など各モデルの
+校正値が確定するまでは、実材料のパラメータセットを確定値として共通 API に公開しない。
+この単位契約と extension descriptor の packing を先に設計し、実装は機能ごとに
+小規模 reference、GPU state / 保存量試験、描画込みの性能比較を通して追加する。
+120 fps はこの PC の目標であり、現時点で性能保証や対象粒子数の根拠にはしない。
 
 ## 2. 現行実装からの差分
 
@@ -90,9 +226,20 @@ scratch は step 間で使い回せるが、次の P2G より前に GPU pass 境
 
 ### 3.2 Contact field
 
-`contactFieldId` を粒子の構成則・UI の `objectId` と別に定義する。
-最初は２場、次に最大４場。水・油は相ごと、独立ゼリーは物体ごとに場を割り当てる。
-場の descriptor に `phaseId`、材料対の接触係数、境界方針を持つ。
+以下の識別子は互いに別の責務を持つ。現行コードに存在しない `materialId` と
+`phaseId` は将来 descriptor 用の提案であり、`contactFieldId` も設計上の ID である。
+
+| ID | 所有する意味 |
+|---|---|
+| `materialId` | 物性・rheology / thermal profile をまとめる material catalog entry |
+| constitutive model | 粒子の stress 計算則 |
+| `phaseId` | 非混和性・界面輸送で追跡する相 |
+| `objectId` | 選択・複製などの UI / geometry 上の物体 |
+| `contactFieldId` | 独立した格子速度を持つ接触場 |
+
+最初は２場、次に最大４場を目安とし、水・油の相と独立ゼリーの接触場を割り当てる。
+field descriptor は phase、材料対 interaction、境界方針への参照を持つ。同じ相の
+粒子を物質ごとに接触場へ複製せず、必要な格子 state と相互作用だけを持つ。
 
 現在の粒子 layout は word 19 が padding なので、ここへ `u32 contactFieldId` を
 正式に追加し、80 byte stride を維持する案を先に検証する。
@@ -255,6 +402,21 @@ M2受け入れ後に現行source hashのM0を更新する。M1が採用されれ
 これは本節の一部を実装したものだが、M2の解析応力・圧力・収束・保存量gateを通過した意味ではない。
 回帰と実GPUの結果が揃うまでは実験的な作業状態として扱う。
 
+**実装済みの単位・空間契約**: [`si-domain.ts`](../src/lib/mpm/si-domain.ts) の内寸
+200 mm × 200 mm、面外厚さ20 mm、viewport外の壁厚50 mm、初期四辺閉鎖を
+[`si-fluid.ts`](../src/lib/mpm/scenes/si-fluid.ts) のGPU sceneへ接続した。
+面外厚さは液体の面密度・圧力係数へ換算する。壁厚はviewport外に置く設計値で、
+現段階では粒子の壁solidとしては解かない。接線摩擦は速度減衰によるno-slip近似である。
+
+**Tait実装**: [`tait-eos.ts`](../src/lib/mpm/reference/tait-eos.ts) に Tait 圧力、
+基準・現在音速、現在体積弾性率、および音速から `B` を導く関数を追加した。
+さらに面外厚さを反映した液体材料profileを生成する。CPU参照とGPU shaderは、
+旧linear profileを保ったままTait stressと変形依存の波速boundを扱う。
+[`/labs/mpm/si`](../src/routes/labs/mpm/si/+page.svelte) は水1相の最初の可視試作である。
+解析oracle・材料pack・CFLの回帰は追加したが、液柱の静水圧・収束・誤差予算・
+持続性能の合格試験はまだ行っていない。絶対圧が非正になる解析oracleの入力は
+クランプせず、低圧／キャビテーション処理が必要として明示的に拒否する。
+
 - 1/240 秒を UI の macrostep として維持する場合、内部で
   `k = ceil(macroDt / safeDt)`、`microDt = macroDt/k` に分割する。
   各 microstep で全数値 pass を実行し、macrostep と microstep を別表示する。
@@ -267,6 +429,11 @@ M2受け入れ後に現行source hashのM0を更新する。M1が採用されれ
   最大4回まで細分化retryする。512 microstep/frameの予算はretryにも共有する。
   fixed conservative planとadaptive retryのどちらを採用するかは、細かいstepのreference、
   実行時間会計、rollback回数を比較して決める。直前batchの非同期最大速度だけを安全保証にしない。
+- 液体の目標圧力モデルは、上記 Tait EOS とする。各材料の `rho0`、`n`、`B` から
+  pressure と音速 bound を導き、初期密度、圧縮・膨張、自由表面、静置液柱で検証する。
+  現行 Gate 4 の線形・tension-free EOS は比較用の旧経路として区別し、Tait と同一視しない。
+- Tait EOS の係数が実材料の音速に基づく profile と、性能用に有効音速を落とした profile を
+  区別して benchmark する。音速を下げた場合の圧縮率・体積誤差を記録し、CFL work を隠さない。
 - Neo-Hookean の大変形、Snow の硬化を含む接線剛性 bound を CPU で検証する。
   `sqrt((lambda+2*mu)/rho0)` は微小ひずみの目安であり、全状態の bound としない。
 - [scheduler](../src/lib/mpm/kernels/step-scheduler.ts) の仕事上限は microstep 数で制限する。
@@ -278,6 +445,8 @@ M2受け入れ後に現行source hashのM0を更新する。M1が採用されれ
 **合格条件**:
 
 - `F = R`、一様圧縮、単純せん断の解析応力と CPU/GPU が一致する。
+- Tait EOS の基準状態で `p_gauge = 0`、圧縮・膨張時の圧力と導出音速が解析式に一致する。
+  静置液柱では圧力勾配・密度分布を水頭の reference と比較し、密度 drift と自由表面挙動も記録する。
 - 小振幅ゼリーの振動周期は細かい `dt` の reference と 5% 以内、
   解放後の面積 drift は基準面積の 2% 以内を初期目標とする。
   減衰時間と拘束条件を固定し、形状は並進・回転を除いて比較する。
@@ -430,11 +599,11 @@ raw 最大絶対差は `1.9063e-2`。Gate 4 全体の複数 batch benchmark は 
   許容帯幅は初期案 `2*h`。解像度変更で比較する。
 
 <a id="m6"></a>
-### M6 — 条件付き分岐: 圧力 projection／陰的体積応答
+### M6 — 条件付き比較: 圧力 projection／陰的体積応答
 
-**着手条件**: M2 の測定で、要求する体積誤差と持続性能を
-明示的 microstep の範囲では同時に満たせないことが確認された場合。
-近非圧縮性の見た目を得るだけのために、最初から導入しない。
+**着手条件**: Tait EOS を用いた M2 の測定で、要求する体積誤差と持続性能を
+明示的 microstep の範囲では同時に満たせないことが確認された場合に、圧力 projection を
+比較する。近非圧縮性の見た目だけのために初期モデルへ重ねて導入しない。
 
 - [調査資料の S3](./RESEARCH-MLS-MPM-MATERIALS.md#sources) を出発点に、
   deviatoric/volumetric splitting と離散化を設計する。
@@ -445,7 +614,7 @@ raw 最大絶対差は `1.9063e-2`。Gate 4 全体の複数 batch benchmark は 
 - 水–油へ広げる場合は密度差を持つ界面で圧力／法線流量を結合する。
   相ごとの独立 solve で界面条件が満たされるとはしない。
 - まずゼリーは圧縮性のまま残す。固体の近非圧縮体積応答への拡張は別レビューを行う。
-- explicit EOS の体積力と projection を二重適用しない。
+- projection 比較では同一相に explicit Tait EOS の体積力を二重適用しない。
   粘性、移流、せん断弾性、毛管波の時間制約は残る。
 
 **合格条件**:
@@ -481,7 +650,7 @@ M0: 現行再現・計測・容量
   ├─ M1: prepare 最適化 ──────── 採否を決めて後続に使用
   └─ M2: 全物理 substep・圧力／復元
        ├─ M3: 自由表面幾何 ── M4: 少数場接触 ── M5: 粘性・界面
-       └─ M6: 圧力 projection（必要な場合のみ。複数相は M3/M4 に依存）
+       └─ M6: Tait EOS で目標未達の場合の圧力 projection 比較（複数相は M3/M4 に依存）
                                       └──────── M7: 実機・採用判断
 ```
 
