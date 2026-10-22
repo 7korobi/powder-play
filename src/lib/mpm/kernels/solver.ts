@@ -173,7 +173,8 @@ export class MpmMlsGpuNumericalError extends Error {
 			[4096, 'invalid triangle contact field or reaction'],
 			[8192, 'invalid bonded triangle state'],
 			[16384, 'particle exceeded the enforced CFL wave-speed or velocity bound'],
-			[32768, 'invalid persistent solid-fracture bond state']
+			[32768, 'invalid persistent solid-fracture bond state'],
+			[65536, 'experimental fixed-point P2G contribution or accumulator overflow']
 		] as const;
 		const message = details
 			.filter(([flag]) => (flags & flag) !== 0)
@@ -392,6 +393,25 @@ export async function createMpmMlsGpuSolver(
 	config: MpmMlsGpuConfig,
 	cflBounds?: MpmMlsGpuCflBounds
 ): Promise<MpmMlsGpuSolver> {
+	return createGpuSolver(canvas, particles, config, cflBounds, false);
+}
+
+export async function createExperimentalMpmMlsAtomicGpuSolver(
+	canvas: HTMLCanvasElement,
+	particles: readonly MpmParticle[],
+	config: MpmMlsGpuConfig,
+	cflBounds?: MpmMlsGpuCflBounds
+): Promise<MpmMlsGpuSolver> {
+	return createGpuSolver(canvas, particles, config, cflBounds, true);
+}
+
+async function createGpuSolver(
+	canvas: HTMLCanvasElement,
+	particles: readonly MpmParticle[],
+	config: MpmMlsGpuConfig,
+	cflBounds: MpmMlsGpuCflBounds | undefined,
+	atomicP2g: boolean
+): Promise<MpmMlsGpuSolver> {
 	if (canvas === null || typeof canvas?.getContext !== 'function') {
 		throw new TypeError('canvas must be an HTML canvas with getContext()');
 	}
@@ -416,7 +436,8 @@ export async function createMpmMlsGpuSolver(
 					session.format,
 					initialState,
 					layout,
-					ownedBuffers
+					ownedBuffers,
+					atomicP2g
 				)
 		);
 		return createSolver(
@@ -586,7 +607,8 @@ async function createRuntime(
 	format: GPUTextureFormat,
 	state: ValidatedMpmMlsGpuInput,
 	layout: MpmMlsGpuBufferLayout,
-	ownedBuffers: Set<GPUBuffer>
+	ownedBuffers: Set<GPUBuffer>,
+	atomicP2g: boolean
 ): Promise<MpmMlsGpuRuntime> {
 	const computeModule = device.createShaderModule({
 		label: 'MLS-MPM compute shaders',
@@ -600,13 +622,15 @@ async function createRuntime(
 	await assertShaderModuleCompiles(renderModule, 'MLS-MPM particle renderer');
 
 	const pipelines: MpmMlsGpuPipelines = {
-		clearGrid: await createComputePipeline(device, computeModule, 'clearGrid'),
+		clearGrid: await createComputePipeline(device, computeModule, atomicP2g ? 'clearGridAtomic' : 'clearGrid'),
 		clearSurfaceOccupancy: await createComputePipeline(
 			device,
 			computeModule,
 			'clearSurfaceOccupancy'
 		),
-		prepareParticles: await createComputePipeline(device, computeModule, 'prepareParticles'),
+		prepareParticles: await createComputePipeline(
+			device, computeModule, atomicP2g ? 'prepareAndScatterParticles' : 'prepareAndBuildBuckets'
+		),
 		buildBuckets: await createComputePipeline(device, computeModule, 'buildBuckets'),
 		buildTriangleFieldCandidates: await createComputePipeline(
 			device,
@@ -623,7 +647,7 @@ async function createRuntime(
 			computeModule,
 			'gatherSurfaceOccupancy'
 		),
-		p2g: await createComputePipeline(device, computeModule, 'p2g'),
+		p2g: await createComputePipeline(device, computeModule, atomicP2g ? 'gatherAtomicGrid' : 'p2g'),
 		updateGrid: await createComputePipeline(device, computeModule, 'updateGrid'),
 		g2p: await createComputePipeline(device, computeModule, 'g2p'),
 		validateCflParticles: await createComputePipeline(
@@ -708,6 +732,9 @@ async function createRuntime(
 		1,
 		Math.ceil(layout.particleCapacity / COMPUTE_WORKGROUP_SIZE)
 	);
+	const atomicGrid = atomicP2g
+		? createBuffer('MLS-MPM experimental fixed-point grid', layout.nodeCount * 44, BUFFER_USAGE.STORAGE)
+		: null;
 
 	const buffers = {
 		simulationParams: createBuffer(
@@ -912,7 +939,8 @@ async function createRuntime(
 		bufferEntry(0, buffers.simulationParams),
 		bufferEntry(3, buffers.bucketHeads),
 		bufferEntry(5, buffers.gridNodes),
-		bufferEntry(16, buffers.triangleFieldNodes)
+		bufferEntry(16, buffers.triangleFieldNodes),
+		...(atomicGrid ? [bufferEntry(29, atomicGrid)] : [])
 	]);
 	const clearSurfaceOccupancy = createBindGroup(
 		device,
@@ -934,6 +962,9 @@ async function createRuntime(
 		const prepareParticles = createBindGroup(device, pipelines.prepareParticles, [
 			bufferEntry(0, buffers.simulationParams),
 			bufferEntry(1, input),
+			...(atomicGrid
+				? [bufferEntry(29, atomicGrid)]
+				: [bufferEntry(3, buffers.bucketHeads), bufferEntry(4, buffers.bucketNext)]),
 			bufferEntry(6, buffers.stateError),
 			bufferEntry(14, buffers.preparedAffines)
 		]);
@@ -966,14 +997,22 @@ async function createRuntime(
 				bufferEntry(15, buffers.surfaceFields)
 			]
 		);
-		const p2g = createBindGroup(device, pipelines.p2g, [
+		const p2g = createBindGroup(device, pipelines.p2g, atomicGrid ? [
+			bufferEntry(0, buffers.simulationParams),
+			bufferEntry(3, buffers.bucketHeads),
+			bufferEntry(5, buffers.gridNodes),
+			bufferEntry(6, buffers.stateError),
+			bufferEntry(16, buffers.triangleFieldNodes),
+			bufferEntry(29, atomicGrid)
+		] : [
 			bufferEntry(0, buffers.simulationParams),
 			bufferEntry(1, input),
 			bufferEntry(3, buffers.bucketHeads),
 			bufferEntry(4, buffers.bucketNext),
 			bufferEntry(5, buffers.gridNodes),
 			bufferEntry(6, buffers.stateError),
-			bufferEntry(14, buffers.preparedAffines)
+			bufferEntry(14, buffers.preparedAffines),
+			bufferEntry(16, buffers.triangleFieldNodes)
 		]);
 		const updateGrid = createBindGroup(device, pipelines.updateGrid, [
 			bufferEntry(0, buffers.simulationParams),
@@ -1417,24 +1456,18 @@ function createSolver(
 						: `MLS-MPM simulation batch (${stepCount} steps)`
 			});
 			const pass = encoder.beginComputePass({ label: 'MLS-MPM simulation batch' });
+			dispatchCompute(
+				pass,
+				runtime.pipelines.clearGrid,
+				runtime.clearGrid,
+				layout.nodeCount
+			);
 			for (let stepIndex = 0; stepIndex < stepCount; stepIndex += 1) {
 				const groups = runtime.bindings[inputIndex];
 				dispatchCompute(
 					pass,
-					runtime.pipelines.clearGrid,
-					runtime.clearGrid,
-					layout.nodeCount
-				);
-				dispatchCompute(
-					pass,
 					runtime.pipelines.prepareParticles,
 					groups.prepareParticles,
-					particleSlotCount
-				);
-				dispatchCompute(
-					pass,
-					runtime.pipelines.buildBuckets,
-					groups.buildBuckets,
 					particleSlotCount
 				);
 				dispatchCompute(pass, runtime.pipelines.p2g, groups.p2g, layout.nodeCount);
@@ -1505,7 +1538,7 @@ function createSolver(
 						bondedBodyCount
 					);
 				}
-				if (cflGuard !== null) {
+				if (cflGuard !== null && bondedBodyCount > 0) {
 					dispatchCompute(
 						pass,
 						runtime.pipelines.validateCflParticles,

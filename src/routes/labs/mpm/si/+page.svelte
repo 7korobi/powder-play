@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { projectDeviceOrientationGravity, STANDARD_GRAVITY } from '#lib/input/sensors.js';
 	import {
+		createExperimentalMpmMlsAtomicGpuSolver,
 		createMpmMlsGpuSolver,
 		type MpmMlsGpuSolver
 	} from '#lib/mpm/kernels/solver.js';
@@ -26,6 +27,9 @@
 	let errorMessage = $state('');
 	let particleCount = $state(0);
 	let measuredFps = $state(0);
+	let effectiveSpeed = $state(0);
+	let unprocessedSeconds = $state(0);
+	let atomicP2g = $state(false);
 	let simulatedSeconds = $state(0);
 	let lastBatchMicrosteps = $state(0);
 	let lastBatchMilliseconds = $state(0);
@@ -131,9 +135,12 @@
 		let lastFrameTimestamp: number | null = null;
 		let renderWindowStartedAt = 0;
 		let submittedRenderCount = 0;
+		let simulationWindowStartedAt = 0;
 		let simulationAccumulatorSeconds = 0;
+		let inFlightSeconds = 0;
 		let latestVelocityBound = 0;
 		let batchPending = false;
+		let renderRequested = false;
 
 		const resizeCanvas = (): void => {
 			const bounds = canvas.getBoundingClientRect();
@@ -166,9 +173,17 @@
 
 		const start = async (): Promise<void> => {
 			statusMessage = 'WebGPU パイプラインを作成しています。';
+			const transfer = new URL(window.location.href).searchParams.get('p2g');
+			if (transfer !== null && transfer !== 'gather' && transfer !== 'atomic') {
+				throw new RangeError('P2G 方式は gather または atomic を指定してください。');
+			}
+			atomicP2g = transfer === 'atomic';
 			const scene = createSiFluidScene();
 			particleCount = scene.particles.length;
-			const createdSolver = await createMpmMlsGpuSolver(
+			const createSolver = atomicP2g
+				? createExperimentalMpmMlsAtomicGpuSolver
+				: createMpmMlsGpuSolver;
+			const createdSolver = await createSolver(
 				canvas,
 				scene.particles,
 				scene.config
@@ -203,6 +218,86 @@
 			}
 		};
 
+		const pumpSimulation = (): void => {
+			const activeSolver = solver;
+			if (
+				disposed || paused || errorMessage || batchPending || !activeSolver ||
+				simulationAccumulatorSeconds < SI_FLUID_FIXED_STEP_SECONDS
+			) return;
+			try {
+				const bounds = activeSolver.cflBounds;
+				if (bounds === null) {
+					throw new Error('この材料から安全な CFL 上限を導出できませんでした。');
+				}
+				const gravity = effectiveGravity();
+				const { batch, velocityBound } = calculateMpmCflStepBatch({
+					accumulatorSeconds: SI_FLUID_FIXED_STEP_SECONDS,
+					elapsedSeconds: 0,
+					simulationSpeed: 1,
+					fixedStepSeconds: SI_FLUID_FIXED_STEP_SECONDS,
+					cellSize: SI_FLUID_GRID.cellSize,
+					waveSpeedBound: bounds.waveSpeedBound,
+					currentVelocityBound: Math.max(bounds.velocityBound, latestVelocityBound),
+					courantLimit: bounds.courantLimit ?? SI_FLUID_COURANT_LIMIT,
+					maxMicrosteps: SI_FLUID_MAX_MICROSTEPS_PER_BATCH,
+					allowPartialBatch: true,
+					gravityMagnitude: Math.hypot(gravity.x, gravity.y),
+					oscillationAmplitude: 0,
+					dragRadius: 0,
+					dragStiffness: 0,
+					dragDamping: 0
+				});
+				if (batch.macroStepCount === 0) return;
+				simulationAccumulatorSeconds = Math.max(
+					0, simulationAccumulatorSeconds - batch.simulatedSeconds
+				);
+				inFlightSeconds = batch.simulatedSeconds;
+				batchPending = true;
+				const startedAt = performance.now();
+				void activeSolver
+					.stepCflBatchAdaptive(
+						batch.macroStepCount,
+						batch.macroDt,
+						batch.microstepPlan,
+						velocityBound,
+						SI_FLUID_MAX_MICROSTEPS_PER_BATCH,
+						gravity
+					)
+					.then((measurement) => {
+						if (disposed) return;
+						simulatedSeconds += measurement.simulatedDuration;
+						simulationAccumulatorSeconds += measurement.remainingDuration;
+						if (measurement.remainingDuration > 0 && measurement.simulatedDuration <= 0) {
+							throw new Error(
+								`CFL 回復が進行できず、${measurement.remainingDuration} 秒が未処理です。`
+							);
+						}
+						latestVelocityBound = measurement.recommendedVelocityBound;
+						lastBatchMicrosteps = measurement.attemptedMicroStepCount;
+						lastBatchMilliseconds = performance.now() - startedAt;
+					})
+					.catch((cause: unknown) => {
+						if (!disposed) fail(cause);
+					})
+					.finally(() => {
+						inFlightSeconds = 0;
+						batchPending = false;
+						if (disposed || solver !== activeSolver || errorMessage) return;
+						if (renderRequested) {
+							try {
+								submitRender(activeSolver, performance.now());
+								renderRequested = false;
+							} catch (cause) {
+								fail(cause);
+							}
+						}
+						pumpSimulation();
+					});
+			} catch (cause) {
+				fail(cause);
+			}
+		};
+
 		const renderFrame = (timestamp: number): void => {
 			if (disposed) return;
 			if (lastFrameTimestamp !== null && !paused && solver) {
@@ -217,97 +312,29 @@
 			if (timestamp - renderWindowStartedAt >= 500) {
 				measuredFps =
 					(submittedRenderCount * 1000) / (timestamp - renderWindowStartedAt);
+				effectiveSpeed =
+					((simulatedSeconds - simulationWindowStartedAt) * 1000) /
+					(timestamp - renderWindowStartedAt);
+				simulationWindowStartedAt = simulatedSeconds;
 				submittedRenderCount = 0;
 				renderWindowStartedAt = timestamp;
 			}
 
 			const activeSolver = solver;
-			if (activeSolver && !errorMessage && !batchPending) {
-				if (paused) {
+			if (activeSolver && !errorMessage) {
+				renderRequested = true;
+				if (!batchPending) {
 					try {
 						submitRender(activeSolver, timestamp);
-					} catch (cause) {
-						fail(cause);
-					}
-				} else {
-					try {
-						const bounds = activeSolver.cflBounds;
-						if (bounds === null) {
-							throw new Error('この材料から安全な CFL 上限を導出できませんでした。');
-						}
-						const gravity = effectiveGravity();
-						const scheduled = calculateMpmCflStepBatch({
-							accumulatorSeconds: simulationAccumulatorSeconds,
-							elapsedSeconds: 0,
-							simulationSpeed: 1,
-							fixedStepSeconds: SI_FLUID_FIXED_STEP_SECONDS,
-							cellSize: SI_FLUID_GRID.cellSize,
-							waveSpeedBound: bounds.waveSpeedBound,
-							currentVelocityBound: Math.max(
-								bounds.velocityBound,
-								latestVelocityBound
-							),
-							courantLimit: bounds.courantLimit ?? SI_FLUID_COURANT_LIMIT,
-							maxMicrosteps: SI_FLUID_MAX_MICROSTEPS_PER_BATCH,
-							allowPartialBatch: true,
-							gravityMagnitude: Math.hypot(gravity.x, gravity.y),
-							oscillationAmplitude: 0,
-							dragRadius: 0,
-							dragStiffness: 0,
-							dragDamping: 0
-						});
-						const { batch, velocityBound } = scheduled;
-						if (batch.macroStepCount > 0) {
-							simulationAccumulatorSeconds = batch.remainderSeconds;
-							batchPending = true;
-							const startedAt = performance.now();
-							void activeSolver
-								.stepCflBatchAdaptive(
-									batch.macroStepCount,
-									batch.macroDt,
-									batch.microstepPlan,
-									velocityBound,
-									SI_FLUID_MAX_MICROSTEPS_PER_BATCH,
-									gravity
-								)
-								.then((measurement) => {
-									if (disposed) return;
-									simulatedSeconds += measurement.simulatedDuration;
-									simulationAccumulatorSeconds += measurement.remainingDuration;
-									if (
-										measurement.remainingDuration > 0 &&
-										measurement.simulatedDuration <= 0
-									) {
-										throw new Error(
-											`CFL 回復が進行できず、${measurement.remainingDuration} 秒が未処理です。`
-										);
-									}
-									latestVelocityBound = measurement.recommendedVelocityBound;
-									lastBatchMicrosteps = measurement.attemptedMicroStepCount;
-									lastBatchMilliseconds = performance.now() - startedAt;
-								})
-								.catch((cause: unknown) => {
-									if (!disposed) fail(cause);
-								})
-								.finally(() => {
-									batchPending = false;
-									if (!disposed && solver === activeSolver && !errorMessage) {
-										try {
-											submitRender(activeSolver, performance.now());
-										} catch (cause) {
-											fail(cause);
-										}
-									}
-								});
-						} else {
-							submitRender(activeSolver, timestamp);
-						}
+						renderRequested = false;
 					} catch (cause) {
 						fail(cause);
 					}
 				}
+				pumpSimulation();
 			}
 
+			unprocessedSeconds = simulationAccumulatorSeconds + inFlightSeconds;
 			frameHandle = requestAnimationFrame(renderFrame);
 		};
 
@@ -382,6 +409,14 @@
 					<span>シミュレーション時刻</span>
 					<strong>{simulatedSeconds.toFixed(2)} <small>s</small></strong>
 				</div>
+				<div class="metric">
+					<span>実効時間倍率</span>
+					<strong>{effectiveSpeed.toFixed(2)} <small>×</small></strong>
+				</div>
+				<div class="metric">
+					<span>未処理時間</span>
+					<strong>{unprocessedSeconds.toFixed(3)} <small>s</small></strong>
+				</div>
 			</div>
 		</section>
 
@@ -420,6 +455,26 @@
 					最初から
 				</button>
 			</div>
+
+			<fieldset class="control-group">
+				<legend>P2G 方式の性能比較</legend>
+				<p class="control-description">
+					現在: {atomicP2g ? '整数 atomic scatter（実験）' : '連結リスト gather（標準）'}。
+					切り替えると初期状態から再開します。
+				</p>
+				<div class="button-row">
+					<a href="?p2g=gather" data-sveltekit-reload aria-current={!atomicP2g ? 'page' : undefined}>
+						標準 gather
+					</a>
+					<a href="?p2g=atomic" data-sveltekit-reload aria-current={atomicP2g ? 'page' : undefined}>
+						実験 atomic
+					</a>
+				</div>
+				<p class="caution">
+					実験方式は整数への丸めを伴います。範囲超過では巻き戻して停止します。
+					EOS・有効音速・CFL は標準と同じです。120 fps 達成を保証するものではありません。
+				</p>
+			</fieldset>
 
 			<fieldset class="control-group gravity-controls">
 				<legend>重力・端末の傾き</legend>
@@ -694,6 +749,19 @@
 		display: grid;
 		grid-template-columns: 1fr 1fr;
 		gap: 0.65rem;
+	}
+
+	.button-row a {
+		color: #a9d4ff;
+		padding: 0.65rem;
+		border: 1px solid #36506c;
+		border-radius: 0.55rem;
+		text-align: center;
+	}
+
+	.button-row a[aria-current='page'] {
+		background: #1d3650;
+		font-weight: 700;
 	}
 
 	button {

@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MpmParticle } from '../reference/solver.js';
 import { createMpmWebGpuSession } from '../platform/webgpu.js';
-import { createMpmMlsGpuSolver } from './solver.js';
+import {
+	createExperimentalMpmMlsAtomicGpuSolver,
+	createMpmMlsGpuSolver,
+	MpmMlsGpuNumericalError
+} from './solver.js';
 import { calculateMpmCflMicrosteps } from './cfl.js';
 import { MLS_MPM_COMPUTE_WGSL, MLS_MPM_RENDER_WGSL } from './shaders.js';
 
@@ -274,25 +278,58 @@ describe('float32 deformation integration', () => {
 });
 
 describe('GPU MLS-MPM batch encoding', () => {
+	it('keeps fixed-point P2G opt-in and allocates and disposes its grid scratch', async () => {
+		const gpu = setupDevice();
+		const solver = await createExperimentalMpmMlsAtomicGpuSolver(CANVAS, [PARTICLE], CONFIG);
+		solver.stepBatch(2, 0.001, { x: 0, y: 0 });
+		expect(gpu.dispatches.map(({ pipeline }) => pipeline)).toEqual([
+			'MLS-MPM clearGridAtomic pipeline',
+			...Array.from({ length: 2 }, () => [
+				'prepareAndScatterParticles', 'gatherAtomicGrid', 'updateGrid', 'g2p', 'commitParticles'
+			].map((name) => `MLS-MPM ${name} pipeline`)).flat()
+		]);
+		const scratch = gpu.buffers.find(({ label }) => label.includes('fixed-point grid'));
+		expect(scratch?.size).toBe(209 * 44);
+		const scatter = gpu.device.createBindGroup.mock.calls.find(
+			([descriptor]) =>
+				descriptor.entries.some((entry: GPUBindGroupEntry) => entry.binding === 29) &&
+				descriptor.entries.some((entry: GPUBindGroupEntry) => entry.binding === 14)
+		)?.[0];
+		expect(scatter?.entries.map((entry: GPUBindGroupEntry) => entry.binding))
+			.toEqual([0, 1, 29, 6, 14]);
+		solver.dispose();
+		expect(scratch?.destroy).toHaveBeenCalledOnce();
+		expect(new MpmMlsGpuNumericalError(65536).message).toContain('overflow');
+	});
+
 	it('uses one pass with ordered prepare and physics dispatches and correct ping-pong inputs', async () => {
 		const gpu = setupDevice();
 		const solver = await createMpmMlsGpuSolver(CANVAS, [PARTICLE], CONFIG);
 		solver.stepBatch(3, 0.001, { x: 0, y: 0 });
 
-		const names = ['clearGrid', 'prepareParticles', 'buildBuckets', 'p2g', 'updateGrid', 'g2p', 'commitParticles'];
+		const names = ['prepareAndBuildBuckets', 'p2g', 'updateGrid', 'g2p', 'commitParticles'];
 		expect(gpu.dispatches.map(({ pipeline }) => pipeline)).toEqual(
-			Array.from({ length: 3 }, () => names.map((name) => `MLS-MPM ${name} pipeline`)).flat()
+			[
+				'MLS-MPM clearGrid pipeline',
+				...Array.from({ length: 3 }, () => names.map((name) => `MLS-MPM ${name} pipeline`)).flat()
+			]
 		);
-		expect(gpu.dispatches.filter(({ pipeline }) => pipeline.includes('prepareParticles')).map(({ input }) => input))
+		expect(gpu.dispatches.filter(({ pipeline }) => pipeline.includes('prepareAndBuildBuckets')).map(({ input }) => input))
 			.toEqual(['MLS-MPM particle state A', 'MLS-MPM particle state B', 'MLS-MPM particle state A']);
 		expect(gpu.encoder.beginComputePass).toHaveBeenCalledOnce();
 		expect(gpu.pass.end).toHaveBeenCalledOnce();
 		expect(gpu.queue.submit).toHaveBeenCalledOnce();
 
 		solver.step(0.001, { x: 0, y: 0 });
-		expect(gpu.dispatches.at(22)?.input).toBe('MLS-MPM particle state B');
+		expect(gpu.dispatches.at(17)?.input).toBe('MLS-MPM particle state B');
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			'let firstEntry = atomicLoad(&bucketHeads[nodeIndex]);'
+		);
+		expect(MLS_MPM_COMPUTE_WGSL).toContain('clearGridNode(nodeIndex);');
+		expect(MLS_MPM_COMPUTE_WGSL).toContain('var entry = firstEntry;');
 		solver.dispose();
 		expect(gpu.buffers.find(({ label }) => label.includes('prepared affine'))?.size).toBe(64);
+		expect(gpu.buffers.some(({ label }) => label.includes('fixed-point grid'))).toBe(false);
 		for (const buffer of gpu.buffers) expect(buffer.destroy).toHaveBeenCalledOnce();
 		expect(gpu.dispose).toHaveBeenCalledOnce();
 	});
@@ -312,17 +349,15 @@ describe('GPU MLS-MPM batch encoding', () => {
 		solver.stepCflBatch(2, 0.025, plan, 1, 6, { x: 0, y: 0 });
 
 		const stageNames = [
-			'clearGrid',
-			'prepareParticles',
-			'buildBuckets',
+			'prepareAndBuildBuckets',
 			'p2g',
 			'updateGrid',
 			'g2p',
-			'validateCflParticles',
 			'commitParticles'
 		];
 		expect(gpu.dispatches.map(({ pipeline }) => pipeline)).toEqual(
 			[
+				'MLS-MPM clearGrid pipeline',
 				...Array.from({ length: 6 }, () =>
 					stageNames.map((name) => `MLS-MPM ${name} pipeline`)
 				).flat(),
@@ -331,6 +366,9 @@ describe('GPU MLS-MPM batch encoding', () => {
 			]
 		);
 		expect(gpu.encoder.beginComputePass).toHaveBeenCalledOnce();
+		expect(MLS_MPM_COMPUTE_WGSL).toContain(
+			'validateCflParticle(updatedParticle, particleIndex);'
+		);
 		expect(gpu.queue.submit).toHaveBeenCalledOnce();
 		expect(solver.cflBounds).toEqual(cflBounds);
 		const simulationParameters = gpu.queue.writeBuffer.mock.calls.findLast(
@@ -372,8 +410,7 @@ describe('GPU MLS-MPM batch encoding', () => {
 		expect(gpu.dispatches.map(({ pipeline }) => pipeline)).toEqual(
 			[
 				'clearGrid',
-				'prepareParticles',
-				'buildBuckets',
+				'prepareAndBuildBuckets',
 				'p2g',
 				'buildTriangleFieldCandidates',
 				'buildTriangleField',
@@ -811,8 +848,7 @@ describe('GPU MLS-MPM batch encoding', () => {
 
 		expect(gpu.dispatches.map(({ pipeline }) => pipeline)).toEqual([
 			'MLS-MPM clearGrid pipeline',
-			'MLS-MPM prepareParticles pipeline',
-			'MLS-MPM buildBuckets pipeline',
+			'MLS-MPM prepareAndBuildBuckets pipeline',
 			'MLS-MPM p2g pipeline',
 			'MLS-MPM buildTriangleFieldCandidates pipeline',
 			'MLS-MPM buildTriangleField pipeline',
@@ -1237,7 +1273,7 @@ describe('GPU MLS-MPM batch encoding', () => {
 			solver.stepBatch(1, 0.001, { x: 0, y: 0 });
 
 			const physicsBucket = gpu.dispatches.find(
-				({ pipeline }) => pipeline === 'MLS-MPM buildBuckets pipeline'
+				({ pipeline }) => pipeline === 'MLS-MPM prepareAndBuildBuckets pipeline'
 			);
 			expect(physicsBucket?.input).toBe('MLS-MPM particle state A');
 
@@ -1273,11 +1309,13 @@ describe('GPU MLS-MPM batch encoding', () => {
 		const solver = await createMpmMlsGpuSolver(CANVAS, [], { ...CONFIG, capacity: undefined });
 		solver.stepBatch(2, 0.001, { x: 0, y: 0 });
 		expect(gpu.dispatches.map(({ pipeline, workgroups }) => [pipeline, workgroups])).toEqual(
-			Array.from({ length: 2 }, () => [
+			[
 				['MLS-MPM clearGrid pipeline', 4],
-				['MLS-MPM p2g pipeline', 4],
-				['MLS-MPM updateGrid pipeline', 4]
-			]).flat()
+				...Array.from({ length: 2 }, () => [
+					['MLS-MPM p2g pipeline', 4],
+					['MLS-MPM updateGrid pipeline', 4]
+				]).flat()
+			]
 		);
 		expect(gpu.buffers.find(({ label }) => label.includes('prepared affine'))?.size).toBe(16);
 		solver.dispose();

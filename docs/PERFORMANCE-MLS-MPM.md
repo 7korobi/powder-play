@@ -794,6 +794,242 @@ the non-workspace path and 19.66 MB with the retained workspace, an increase of
 about 8.24 MB. After `dispose()`, the heap returned to 11.43 MB. This is the
 Gate 4 solver's Node/Vitest heap measurement, not total browser or GPU memory.
 
+### 2026-10-21: SI Tait water interactive tuning exploration
+
+The source was clean at `824a18c`. Measurements used the local
+[SI lab](../src/routes/labs/mpm/si/+page.svelte) in visible Headless Chrome 155
+on macOS with a non-fallback Apple Metal 3 adapter. The canvas was 724×724;
+the scene had 1,600 water particles, a 40×40 grid with 5 mm cells, 2.5 mm
+particle spacing, the provisional 20 m/s Tait sound-speed profile, and a
+1/120 s macrostep.
+
+In a six-second live-page sample, the UI reported 30–31 render submissions/s,
+423 attempted microsteps in the latest batch, and 27.0–27.6 ms for that batch.
+Simulation time advanced at about 0.75× wall time. The page counter is render
+submissions, not confirmed presented FPS; its microstep value is attempted
+work and can include retries.
+
+A no-render adaptive-CFL comparison then used the same initial SI scene,
+horizontal gravity `(9.81, 0)` m/s², 3 seconds of simulated time, 30 Hz
+nominal batches (three 1/120 s macrosteps), and the production 512-microstep
+batch limit. Each variant started from the same particle state.
+
+| CFL limit | Wall time for 3 s simulated | Simulation / wall | Batch wall median / p95 | Planned / attempted microsteps | Retries | Final wave-speed bound |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.3 | 3.369 s | 0.89× | 27.9 / 28.3 ms | 51,198 / 51,370 | 1 | 25.00 m/s |
+| 0.4 | 2.575 s | 1.17× | 21.2 / 22.1 ms | 38,579 / 38,835 | 1 | 25.00 m/s |
+| 0.5 | 2.062 s | 1.46× | 17.0 / 17.6 ms | 30,849 / 31,156 | 1 | 25.00 m/s |
+
+On this short sloshing test, CFL 0.4 reduced wall time by 23.6% and CFL 0.5
+by 38.8% versus 0.3. The recovery path completed every run; each run had one
+retry. After three seconds, per-particle positions differed from the 0.3
+reference by 3.18 mm RMS / 15.53 mm max at 0.4 and 5.37 mm RMS / 30.10 mm max
+at 0.5. These differences are trajectory divergence, not a physical-accuracy
+score. The test does not establish long-duration stability or visual quality.
+
+A separate temporary experiment changed the solver-wide
+`CFL_RECOVERY_BOUND_SAFETY_FACTOR` from 1.25 to 1.05, then restored it. At CFL
+0.3 in the same sloshing workload, the final wave-speed bound fell from
+25.00 to 23.15 m/s and wall time fell from 3.369 to 3.151 s (6.5%), but retries
+increased from one to three. Because this factor affects all MPM scenes and the
+smaller margin caused more retries, it is not adopted.
+
+A fixed-workload timestamp profile found that CPU batch submission was about
+0.1–0.2 ms, while the 423-step synthetic batch took 24.90 ms on the GPU and
+27.6 ms including maximum-speed readback. Surface and particle render queue
+wait medians were about 0.4 and 0.3 ms. Per-dispatch timestamp values in this
+browser were quantized in 0.065536 ms increments, too coarse to attribute
+individual short kernels; batch-level timings are more reliable.
+
+The grid-size comparison used a deliberately artificial 56 m/s velocity
+envelope to produce 423 steps in one 1/120 s batch; it is not a measured
+particle speed. With the same 1,600 particles and CFL 0.3, changing the grid
+from 5 mm to 10 mm reduced the plan from 423 to 212 steps but increased GPU
+batch median from 24.90 to 29.16 ms and reduced measured throughput from
+23.89M to 10.28M particle-steps/s. Coarsening the grid is therefore not a
+useful optimization for this workload; increased bucket/list density is a
+plausible cause, but the stage profile could not resolve individual kernels.
+
+**Decision:** retain the 5 mm grid and CFL 0.3 defaults for now. CFL 0.4 is the
+first candidate for a longer visual and numerical A/B test; 0.5 offers more
+throughput but shows greater trajectory divergence. The 120 FPS target,
+particle-count scaling above 1,600, mobile GPUs, and rendered performance at
+either candidate CFL remain unverified. No solver source change or push was
+made for this exploration.
+
+### 2026-10-21: SI CFL recovery, backlog, and grid-cost diagnosis
+
+The follow-up used Headless Chrome 155 on Apple Metal 3 with the same 1,600
+particle SI scene. The scheduler and solver source confirm a 512-microstep
+batch cap, a 1/120 s macrostep, and a 1.25 wave-speed recovery multiplier.
+The SI page retains elapsed simulation time when a batch cannot fit all
+requested macrosteps.
+
+**The 30 Hz backlog is explained by the batch cap.** A 1/30 s input interval
+requests four 1/120 s macrosteps. The first CFL guard reported 20.000074 m/s
+against an initial 20.000017 m/s wave-speed bound: a 2.86 ppm excess. The
+flagged particle's speed was 0.000520 m/s against a 0.339982 m/s limit, so this
+was a wave-speed-bound violation, not a fast-moving particle. The first
+attempted step failed before any microstep was counted as complete. The initial
+plan had four macrosteps / 452 microsteps; recovery multiplied the observed
+wave speed by 1.25 and raised the bound to about 25.00009 m/s.
+
+At that bound the observed plan needed 141 microsteps per macrostep, so four
+macrosteps required 564 steps and could not fit under the 512-step cap. The
+scheduler therefore submitted three macrosteps (423 steps; later samples
+reached 426 as the velocity bound changed), advancing 25 ms of simulation for
+each 33.33 ms input interval. That 0.75 theoretical ratio matches the
+12-second no-render run: 12.014 s simulated in 16.055 s wall time (0.748x),
+482 batches, 33.3 / 34.2 ms batch-wall median / p95, and 4.052 s maximum
+backlog. The 423/426 counter is scheduled work across three macrosteps, not
+evidence of a retry on every batch; there were three retries total.
+
+A temporary, solver-wide 1.05 recovery multiplier was compared against the
+1.25 baseline with the same 12-second test: three seconds each of downward,
+rightward, leftward, then downward gravity; 30 Hz input; same initial state.
+The source was restored to 1.25 after the experiment.
+
+| Recovery multiplier | Wall time for 12 s simulated | Simulation / wall | Batch wall median / p95 | Planned / attempted microsteps | Retries | Maximum backlog | Final wave-speed bound |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1.25 (baseline) | 16.055 s | 0.748x | 33.3 / 34.2 ms | 204,776 / 204,987 | 3 | 4.052 s | 25.00008 m/s |
+| 1.05 (temporary) | 14.948 s | 0.803x | 33.3 / 34.1 ms | 192,286 / 192,442 | 4 | 3.061 s | 24.31164 m/s |
+
+With 1.05, the initial recovered bound was 21.00002 m/s; the plan fit four
+macrosteps (476 microsteps) and stayed close to real time for the first three
+seconds. During the first horizontal-gravity phase, a retry raised the bound
+to 24.31164 m/s; the resulting 131–138 microsteps per macrostep again limited
+the batch to three macrosteps. Across the complete run, the real-time ratio
+improved by 7.3% relative to the baseline and maximum backlog fell by 24.5%,
+but the run still did not keep up, and retries increased from three to four.
+Its particle state also diverged from the baseline, so this is a throughput
+observation, not evidence that 1.05 is numerically or visually preferable.
+Because this multiplier affects all MPM scenes, it is not adopted.
+
+**Grid cost was compared per simulated second, not per microstep.** The
+timestamp-query probe kept 1,600 particles in the same 200 mm domain, used
+CFL 0.3, a 25 m/s wave-speed bound and 0.5 m/s velocity bound, and ran 64
+fixed microsteps at 0.999999 of each grid's calculated safe timestep. Gravity
+and rendering were disabled to keep the particle state fixed. Each row is the
+median of seven batches after two warmups; GPU time is from the normal
+whole-batch timestamp, excluding CPU submission and readback.
+
+| Cell size | Grid | GPU ms / 64 steps | Simulated ms / 64 steps | GPU ms / simulated second | Bucket entries p95 / max |
+|---:|---:|---:|---:|---:|---:|
+| 2.5 mm | 80x80 | 3.670 | 1.882 | 1,950 | 9 / 12 |
+| 4 mm | 50x50 | 4.653 | 3.012 | 1,545 | 25 / 25 |
+| 5 mm | 40x40 | 4.063 | 3.765 | 1,079 | 36 / 36 |
+| 6.25 mm | 32x32 | 4.784 | 4.706 | 1,017 | 64 / 64 |
+| 8 mm | 25x25 | 6.554 | 6.024 | 1,088 | 90 / 100 |
+| 10 mm | 20x20 | 8.651 | 7.529 | 1,149 | 144 / 144 |
+
+The measured cost is lowest around 5–6.25 mm: the fixed-state run put 6.25 mm
+about 5.8% below 5 mm per simulated second, while the earlier gravity-on
+0.8-safe-timestep probe found those two settings within 0.6%. The result is
+workload-dependent and does not establish a meaningful visual-quality trade.
+Coarsening from 5 to 6.25 mm raises the p95 bucket traversal from 36 to 64
+entries; at 10 mm it reaches 144 and the whole-batch cost per simulated second
+is about 6.5% higher than 5 mm. This supports longer particle-bucket walks as
+one cost of coarse grids, while also showing that timestep growth can offset
+some of that cost. The per-dispatch attribution pass is less reliable than the
+whole-batch timestamp and was not used to rank grid sizes.
+
+**Current diagnosis:** the observed 0.75x behavior has a concrete scheduler
+mechanism: the early wave-speed guard recovery raises the planned work enough
+that the 512-step cap drops a 30 Hz request from four macrosteps to three.
+A narrower recovery factor improved this one SI run, but did not remove the
+later cap and has not passed a visual/accuracy comparison. The 5 mm default
+also remains unchanged; the 5–6.25 mm throughput difference is too small and
+device-specific to choose a coarser grid without a quality test. These results
+are from Apple Metal 3, exclude rendered work in the dedicated probes, and do
+not establish mobile performance or the 120 FPS target. Browser console checks
+reported no errors during the probes. No solver change, commit, or push was
+made.
+
+### 2026-10-21: Focused literature review
+
+The closest MPM stability reference is Fang et al.'s regional time-stepping
+MPM: it recomputes sound speed as material state changes and adapts timestep
+by region. Its cited CFL range of 0.5–0.9 comes secondhand from an MPM
+textbook, and its regional method differs from this solver's global bound.
+It does not describe a multiplicative recovery margin. Thus neither that
+range nor this paper validates changing the current CFL or recovery factor.
+
+The Tait/weakly-compressible lineage is established, but starts in SPH:
+Becker and Teschner describe choosing an artificial sound speed to limit
+density variation, and Tampubolon et al. explicitly carry that model into MPM
+water. For their 1% density-variation convention, the relation
+`v_f / c_s < 0.1` would imply `v_f < 2 m/s` at the prototype's provisional
+20 m/s effective sound speed. This is a cross-check derived from the SPH
+paper, not validation of the prototype's EOS or stability settings.
+
+For GPU P2G, Gao et al. compare scatter/gather strategies and sweep
+particles-per-cell at roughly 3.5 million particles; Taichi describes
+hierarchical particle buckets that avoid a full radix sort. These inform
+algorithm choices but are far above this prototype's 1,600-particle scale.
+Their results do not prove that sorting, coloring, or another bucket layout
+would be faster here. Wang et al.'s reported benefit from fusing MPM kernels
+supports testing dispatch overhead, but is CUDA evidence rather than a
+WebGPU/Metal prediction.
+
+Timing granularity is a material limitation on this Apple GPU. The WebGPU
+standards discussion and gpuweb issue/PR record that per-dispatch timestamp
+writes were removed and that splitting every dispatch into separate passes
+can itself be very expensive on Apple Silicon (95–97% in one deliberately
+extreme 100-pass test). Treat the diagnostic split-pass timings as attribution
+experiments only; use whole-pass/whole-batch measurements for comparisons.
+
+For bounded catch-up, Gaffer On Games explains that a maximum-substep cap
+intentionally lets simulation slow under load. Bullet's official implementation
+provides a contrasting policy: it clamps executed substeps and discards the
+excess accumulated time, whereas this SI page carries the remainder forward.
+These are practitioner/engine references, not peer-reviewed results for
+CFL-adaptive GPU fluids; they identify a policy choice, not a correct default.
+
+**Evidence gaps:** no located MPM or SPH source validates a multiplier applied
+to an exceeded wave-speed bound; GPU MPM papers do not measure the low-thousands
+particle regime here; and no formal source was found for the combination of a
+CFL-adaptive microstep count, a per-batch cap, and carried backlog. The single
+1.05 run therefore remains inconclusive rather than evidence for changing the
+1.25 default.
+
+**Next experiments, in order:** (1) log wave speed and deformation before and
+after the first attempted step and over repeated gravity/initial-state trials;
+(2) compare 1.05 and 1.25 across repeated runs with retry, overshoot, and
+state-error metrics; (3) isolate readback/synchronization from whole-batch GPU
+time without splitting every dispatch into a pass; and (4) compare carried
+versus discarded backlog as an explicit UX policy experiment. Keep all current
+defaults until those tests include numerical and visual acceptance checks.
+
+### 2026-10-21 evening: 120 Hz budget, fused dispatches, and atomic P2G
+
+The follow-up implemented and measured an opt-in fixed-point atomic P2G,
+alongside dispatch fusion with unchanged SI EOS/CFL settings.
+The [prototype comparison report](./REPORT-FLUID-SOLVER-PROTOTYPES.md#7-2026-10-21-実装と実測)
+contains the conditions, two interleaved baseline/fused/atomic comparisons,
+12-second volume/density probes, 6,400/25,600-particle scaling, rollback tests,
+live-page scheduler correction, reproduction commands and limitations.
+
+At 1,600 particles, 1/120 s/batch, CFL 0.3, 724×724 surface rendering on
+Apple Metal 3 / Chrome 155, the two genuine frozen-baseline runs measured
+GPU median 8.45–8.52 ms and readback/render-inclusive p95 11.5–11.6 ms.
+Fusion plus atomic P2G measured GPU median 4.72–4.85 ms and inclusive p95
+7.5–7.6 ms. This is a synthetic per-macrostep processing budget, not a
+demonstration of 120 presented FPS. The 12-second atomic run had inclusive
+p95 7.9 ms but max 10.3 ms; 6,400 particles reached p95 9.0 ms and 25,600
+reached 19.2 ms. Acoustic-CFL microstep counts remain a scaling limit.
+
+The normal constructor retains gather; the SI page explicitly offers the
+experimental atomic constructor. It adds 81,356 bytes of scratch at 40×40,
+rounds normalized contributions at `2^24`, and reports status `65536` with
+whole-step rollback on contribution or accumulator overflow. No EOS, sound
+speed, CFL default, particle count or grid default was changed.
+The SI page now pumps one macrostep at a time without waiting for another
+rAF when simulation time remains, while presenting only validated state
+for coalesced rAF requests. A short four-direction test sustained 60
+render submissions/s and 1.00× simulation on the approximately 60 Hz
+browser, with observed pending time at most 0.025 s. Neither that test nor
+the GPU budget establishes 120 Hz or mobile sustained acceptance.
+
 ## 6. 参照
 
 - [WebGPU: usage scopes](https://www.w3.org/TR/webgpu/#usage-scopes) —
@@ -803,3 +1039,11 @@ Gate 4 solver's Node/Vitest heap measurement, not total browser or GPU memory.
 - [WebGPU: timestamp writes](https://www.w3.org/TR/webgpu/#dictdef-gpucomputepasstimestampwrites) —
   対応 feature が必要。非対応時は queue 時間を GPU 時間と偽装しない。
 - [kernel の現在の制約](../src/lib/mpm/kernels/README.md)。
+- [Becker & Teschner (2007), “Weakly Compressible SPH for Free Surface Flows”](https://cg.informatik.uni-freiburg.de/publications/2007_SCA_SPH.pdf) — Tait EOS / artificial sound speed; SPH, not MPM.
+- [Tampubolon et al. (2017), “Multi-species simulation of porous sand and water mixtures”](https://doi.org/10.1145/3072959.3073651) — Tait-style MPM water model.
+- [Fang et al. (2018), “A Temporally Adaptive Material Point Method with Regional Time Stepping”](https://doi.org/10.1111/cgf.13524) — regional timestep adaptation and state-dependent wave speed.
+- [Gao et al. (2018), “GPU Optimization of Material Point Methods”](https://pages.cs.wisc.edu/~sifakis/papers/GPU_MPM.pdf) — GPU P2G strategies and particles-per-cell benchmark.
+- [Hu et al. (2019), “Taichi: A Language for High-Performance Computation on Spatially Sparse Data Structures”](https://doi.org/10.1145/3355089.3356506) — hierarchical particle buckets and MLS-MPM.
+- [Wang et al. (2020), “A Massively Parallel and Scalable Multi-GPU Material Point Method”](https://doi.org/10.1145/3386569.3392442) — kernel fusion and multi-GPU MPM; CUDA results.
+- [gpuweb issue #2046](https://github.com/gpuweb/gpuweb/issues/2046) and [PR #2190](https://github.com/gpuweb/gpuweb/pull/2190) — timestamp granularity and Apple TBDR pass-splitting measurements.
+- [Fiedler, “Fix Your Timestep!”](https://gafferongames.com/post/fix_your_timestep/) and [Bullet `btDiscreteDynamicsWorld.cpp`](https://github.com/bulletphysics/bullet3/blob/master/src/BulletDynamics/Dynamics/btDiscreteDynamicsWorld.cpp) — bounded catch-up and backlog policy examples.

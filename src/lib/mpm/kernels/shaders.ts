@@ -145,6 +145,7 @@ const WALL_CUSHION_CELLS: f32 = 8.0;
 @group(0) @binding(26) var<storage, read_write> trianglePairContactCache: array<vec4<f32>>;
 @group(0) @binding(27) var<storage, read_write> trianglePairContactCandidates: array<atomic<u32>>;
 @group(0) @binding(28) var<storage, read_write> triangleFieldCandidates: array<u32>;
+@group(0) @binding(29) var<storage, read_write> atomicGrid: array<atomic<i32>>;
 
 var<workgroup> cflSpeedReduction: array<f32, 64>;
 var<workgroup> triangleFieldBodyCache: array<TriangleFieldBody, 64>;
@@ -168,6 +169,9 @@ const ERROR_TRIANGLE_CONTACT: u32 = 4096u;
 const ERROR_TRIANGLE_BOND: u32 = 8192u;
 const ERROR_CFL_BOUND: u32 = 16384u;
 const ERROR_FRACTURE_BOND: u32 = 32768u;
+const ERROR_FIXED_POINT_RANGE: u32 = 65536u;
+const FIXED_POINT_SCALE: f32 = 16777216.0;
+const ATOMIC_GRID_WORDS: u32 = 11u;
 const BONDED_TRIANGLE_SOLVER_ITERATIONS: u32 = 2u;
 const TRIANGLE_CONTACT_SKIN_CELLS: f32 = 0.1;
 const TRIANGLE_CONTACT_IMPULSE_RELAXATION: f32 = 0.25;
@@ -611,12 +615,7 @@ fn triangleDistanceSample(
 	);
 }
 
-@compute @workgroup_size(64)
-fn clearGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
-	let index = invocation.x;
-	if (index >= params.counts.y) {
-		return;
-	}
+fn clearGridNode(index: u32) {
 	atomicStore(&bucketHeads[index], -1);
 	gridNodes[index].mass = 0.0;
 	gridNodes[index].momentum = vec2<f32>(0.0, 0.0);
@@ -637,8 +636,25 @@ fn clearGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
 }
 
 @compute @workgroup_size(64)
-fn buildBuckets(@builtin(global_invocation_id) invocation: vec3<u32>) {
-	let particleIndex = invocation.x;
+fn clearGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	if (invocation.x < params.counts.y) {
+		clearGridNode(invocation.x);
+	}
+}
+
+@compute @workgroup_size(64)
+fn clearGridAtomic(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let nodeIndex = invocation.x;
+	if (nodeIndex >= params.counts.y) {
+		return;
+	}
+	clearGridNode(nodeIndex);
+	for (var field = 0u; field < ATOMIC_GRID_WORDS; field = field + 1u) {
+		atomicStore(&atomicGrid[nodeIndex * ATOMIC_GRID_WORDS + field], 0);
+	}
+}
+
+fn insertParticleBucket(particleIndex: u32) {
 	if (particleIndex >= params.counts.x) {
 		return;
 	}
@@ -674,6 +690,11 @@ fn buildBuckets(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			bucketNext[pairIndex] = previousHead;
 		}
 	}
+}
+
+@compute @workgroup_size(64)
+fn buildBuckets(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	insertParticleBucket(invocation.x);
 }
 
 @compute @workgroup_size(64)
@@ -784,9 +805,7 @@ fn gatherSurfaceOccupancy(@builtin(global_invocation_id) invocation: vec3<u32>) 
 	surfaceFields[nodeIndex] = vec2<f32>(waterArea, oilArea);
 }
 
-@compute @workgroup_size(64)
-fn prepareParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
-	let particleIndex = invocation.x;
+fn prepareParticle(particleIndex: u32) {
 	if (particleIndex >= params.counts.x) {
 		return;
 	}
@@ -944,11 +963,121 @@ fn prepareParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 }
 
 @compute @workgroup_size(64)
+fn prepareAndBuildBuckets(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	prepareParticle(invocation.x);
+	insertParticleBucket(invocation.x);
+}
+
+fn addFixedPoint(index: u32, value: f32) {
+	let scaled = round(value * FIXED_POINT_SCALE);
+	if (!finiteFloat(scaled) || abs(scaled) > 2147483520.0) {
+		atomicOr(&stateError[0], ERROR_FIXED_POINT_RANGE);
+		return;
+	}
+	let increment = i32(scaled);
+	let preceding = atomicAdd(&atomicGrid[index], increment);
+	if (
+		(increment > 0 && preceding > 2147483647 - increment) ||
+		(increment < 0 && preceding < (-2147483647 - 1) - increment)
+	) {
+		atomicOr(&stateError[0], ERROR_FIXED_POINT_RANGE);
+	}
+}
+
+@compute @workgroup_size(64)
+fn prepareAndScatterParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let particleIndex = invocation.x;
+	prepareParticle(particleIndex);
+	if (particleIndex >= params.counts.x || atomicLoad(&stateError[0]) != 0u) {
+		return;
+	}
+	let particle = particlesIn[particleIndex];
+	if (particle.materialModel == MODEL_REMOVED) {
+		return;
+	}
+	let gridPosition = particle.position / params.physical.x;
+	if (!finiteVec2(gridPosition)) {
+		atomicOr(&stateError[0], ERROR_STENCIL);
+		return;
+	}
+	let base = vec2<i32>(floor(gridPosition - vec2<f32>(0.5)));
+	if (!stencilFitsHalo(base)) {
+		atomicOr(&stateError[0], ERROR_STENCIL);
+		return;
+	}
+	let fraction = gridPosition - vec2<f32>(base);
+	let weightsX = quadraticWeights(fraction.x);
+	let weightsY = quadraticWeights(fraction.y);
+	let affine = preparedAffines[particleIndex];
+	let isLiquid = particle.materialModel == MODEL_WATER || particle.materialModel == MODEL_OIL;
+	let mass = select(params.physical.y, particle.density * particle.volume, isLiquid);
+	let volume = particle.volume * determinant2x2(particle.f);
+	for (var oy = 0u; oy < 3u; oy = oy + 1u) {
+		for (var ox = 0u; ox < 3u; ox = ox + 1u) {
+			let weight = weightsX[ox] * weightsY[oy];
+			let dpos = (vec2<f32>(f32(ox), f32(oy)) - fraction) * params.physical.x;
+			let momentum = vec2<f32>(
+				mass * particle.velocity.x + affine.x * dpos.x + affine.y * dpos.y,
+				mass * particle.velocity.y + affine.z * dpos.x + affine.w * dpos.y,
+			);
+			if (!finiteFloat(weight) || weight < 0.0 || !finiteVec2(momentum)) {
+				atomicMin(&stateError[1], particleIndex);
+				atomicOr(&stateError[0], ERROR_P2G | ERROR_P2G_NONFINITE_PARTICLE);
+				return;
+			}
+			let node = gridIndex(base + vec2<i32>(i32(ox), i32(oy)));
+			var field = node * ATOMIC_GRID_WORDS;
+			if (particle.materialModel == MODEL_WATER) {
+				field = field + 3u;
+			} else if (particle.materialModel == MODEL_OIL) {
+				field = field + 7u;
+			}
+			addFixedPoint(field, weight * mass / params.physical.y);
+			addFixedPoint(field + 1u, weight * momentum.x / params.physical.y);
+			addFixedPoint(field + 2u, weight * momentum.y / params.physical.y);
+			if (isLiquid) {
+				addFixedPoint(field + 3u, weight * volume / params.physical.z);
+			}
+		}
+	}
+}
+
+@compute @workgroup_size(64)
+fn gatherAtomicGrid(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	let nodeIndex = invocation.x;
+	if (nodeIndex >= params.counts.y) {
+		return;
+	}
+	clearGridNode(nodeIndex);
+	var values: array<f32, 11>;
+	for (var field = 0u; field < ATOMIC_GRID_WORDS; field = field + 1u) {
+		let index = nodeIndex * ATOMIC_GRID_WORDS + field;
+		let value = atomicLoad(&atomicGrid[index]);
+		atomicStore(&atomicGrid[index], 0);
+		values[field] = f32(value) / FIXED_POINT_SCALE;
+	}
+	if (atomicLoad(&stateError[0]) != 0u) {
+		return;
+	}
+	gridNodes[nodeIndex].mass = values[0] * params.physical.y;
+	gridNodes[nodeIndex].momentum = vec2<f32>(values[1], values[2]) * params.physical.y;
+	gridNodes[nodeIndex].waterMass = values[3] * params.physical.y;
+	gridNodes[nodeIndex].waterMomentum = vec2<f32>(values[4], values[5]) * params.physical.y;
+	gridNodes[nodeIndex].waterVolume = values[6] * params.physical.z;
+	gridNodes[nodeIndex].oilMass = values[7] * params.physical.y;
+	gridNodes[nodeIndex].oilMomentum = vec2<f32>(values[8], values[9]) * params.physical.y;
+	gridNodes[nodeIndex].oilVolume = values[10] * params.physical.z;
+}
+
+@compute @workgroup_size(64)
 fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	let nodeIndex = invocation.x;
 	if (nodeIndex >= params.counts.y) {
 		return;
 	}
+	let firstEntry = atomicLoad(&bucketHeads[nodeIndex]);
+	// This node owns its list; recycle its head after insertion has finished.
+	clearGridNode(nodeIndex);
 	if (atomicLoad(&stateError[0]) != 0u) {
 		return;
 	}
@@ -961,7 +1090,7 @@ fn p2g(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	var oilMass = 0.0;
 	var oilMomentum = vec2<f32>(0.0, 0.0);
 	var oilVolume = 0.0;
-	var entry = atomicLoad(&bucketHeads[nodeIndex]);
+	var entry = firstEntry;
 	var visited = 0u;
 
 	loop {
@@ -2286,11 +2415,12 @@ fn g2p(@builtin(global_invocation_id) invocation: vec3<u32>) {
 	updatedParticle.f = updatedF;
 	updatedParticle.plasticVolume = updatedPlasticVolume;
 	particlesOut[particleIndex] = updatedParticle;
+	if (params.counts.w == 0u) {
+		validateCflParticle(updatedParticle, particleIndex);
+	}
 }
 
-@compute @workgroup_size(64)
-fn validateCflParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
-	let particleIndex = invocation.x;
+fn validateCflParticle(particle: Particle, particleIndex: u32) {
 	if (
 		particleIndex >= params.counts.x ||
 		params.cflBounds.z < 0.5 ||
@@ -2299,7 +2429,6 @@ fn validateCflParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 		return;
 	}
 
-	let particle = particlesIn[particleIndex];
 	if (particle.materialModel == MODEL_REMOVED) {
 		return;
 	}
@@ -2321,6 +2450,13 @@ fn validateCflParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
 			atomicStore(&stateError[5], bitcast<u32>(params.cflBounds.x));
 		}
 		atomicOr(&stateError[0], ERROR_CFL_BOUND);
+	}
+}
+
+@compute @workgroup_size(64)
+fn validateCflParticles(@builtin(global_invocation_id) invocation: vec3<u32>) {
+	if (invocation.x < params.counts.x) {
+		validateCflParticle(particlesIn[invocation.x], invocation.x);
 	}
 }
 

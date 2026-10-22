@@ -277,13 +277,18 @@ available only through explicit `readParticles()` calls. Compute dispatches
 use the allocated/used slot count (including removed tombstones) rather than
 the full reserved capacity.
 
-The compute path has ordered clear, particle-prepare, linked-list insertion,
-P2G gather, grid update, G2P, and particle-commit dispatches. A simulation batch
-encodes them in one compute pass, with dispatch ordering and particle-buffer
-ping-pong preserved. Constitutive stress and affine momentum are evaluated once
-per active particle in `prepareParticles`, rather than up to nine times in P2G.
+The compute path clears once at batch entry, then repeats combined particle
+preparation/bucket insertion, P2G gather, grid update, G2P, and particle commit.
+P2G saves each node's bucket head before clearing that node and recycling its
+head for the next step. A simulation batch encodes these ordered dispatches in
+one compute pass, with particle-buffer ping-pong preserved. Without bonded
+triangles, G2P also validates the updated particle's CFL bounds; bonded scenes
+retain the separate validation after contact/constraint dispatches. Commit
+remains a separate dispatch so a failure rolls back every particle.
+Constitutive stress and affine momentum are evaluated once per active particle
+in `prepareAndBuildBuckets`, rather than up to nine times in P2G.
 A 16-byte-per-capacity affine scratch buffer is recomputed each step; cached
-values never survive into the next step without preparation. P2G requires six
+values never survive into the next step without preparation. P2G requires seven
 storage bindings, checked against device limits. Every particle inserts its nine
 quadratic B-spline stencil entries into per-node linked lists using integer
 atomics; one invocation gathers each node's list, so no floating-point atomics
@@ -292,6 +297,22 @@ each side of the physical `[0, cellsX] × [0, cellsY]` node range. Outward grid
 velocity tapers across up to eight cells at each wall (scaled down on small
 grids) before post-G2P particle clipping; this cushions impacts and matches the
 CPU reference.
+
+`createExperimentalMpmMlsAtomicGpuSolver` is an opt-in P2G comparison path, not
+the default solver. It prepares each particle and scatters 11 solid/water/oil
+mass, momentum and liquid-area components using signed integer atomics.
+Contributions are normalized by the configured reference particle mass/area
+and rounded at scale `2^24`; momentum normalization retains world-units/second.
+Both each rounded contribution and every integer sum are range-checked.
+Overflow sets persistent status bit `65536` and rolls back the complete step;
+there is no saturation or automatic fallback. The range is roughly ±128
+reference units per node/component, not an arbitrary-density/velocity guarantee.
+Gathering decodes and clears the accumulators for the next step.
+This adds 44 bytes per halo node (81,356 bytes for the SI 40×40 grid).
+Existing bucket buffers remain allocated for surface rendering. The EOS, CFL
+guard and timestep selection are unchanged, but quantization changes summation
+error. Performance, acceptance limits and reproduction commands are in the
+[prototype comparison report](../../../../docs/REPORT-FLUID-SOLVER-PROTOTYPES.md#7-2026-10-21-実装と実測).
 
 The solver supports per-particle compressible 2D Neo-Hookean elasticity,
 Snow-style corotated plasticity, and separate water, oil, and powder models.
